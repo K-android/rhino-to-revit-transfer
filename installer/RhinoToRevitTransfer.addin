@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>Rhino-to-Revit One-Click Transfer (RIR)</Name>
+    <Assembly>RhinoToRevitTransfer\RhinoToRevitTransfer.dll</Assembly>
+    <FullClassName>RhinoToRevitTransfer.R2RTransferApp</FullClassName>
+    <ClientId>B845C723-9D5F-4E38-B60F-F348C9E78201</ClientId>
+    <VendorId>AEC_R2R</VendorId>
+    <VendorDescription>AEC Computational Design Team</VendorDescription>
+  </AddIn>
+</RevitAddIns>
