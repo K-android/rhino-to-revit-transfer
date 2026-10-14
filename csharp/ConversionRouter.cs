@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Autodesk.Revit.DB;
+using Rhino;
 using Rhino.Geometry;
 using RhinoInside.Revit.Convert.Geometry;
 

@@ -162,11 +162,12 @@ namespace RhinoToRevitTransfer
             {
                 scanned.ObjectType = "Brep";
                 scanned.IsClosed = brep.IsSolid;
-                var mp = MassProperties.Compute(brep);
-                if (mp != null)
+                var amp = AreaMassProperties.Compute(brep);
+                if (amp != null) scanned.Area = Math.Round(amp.Area, 3);
+                if (brep.IsSolid)
                 {
-                    scanned.Area = Math.Round(mp.Area, 3);
-                    scanned.Volume = brep.IsSolid ? Math.Round(mp.Volume, 3) : 0.0;
+                    var vmp = VolumeMassProperties.Compute(brep);
+                    if (vmp != null) scanned.Volume = Math.Round(vmp.Volume, 3);
                 }
 
                 int horizCount = 0, vertCount = 0;

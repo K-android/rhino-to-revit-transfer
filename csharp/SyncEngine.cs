@@ -70,8 +70,11 @@ namespace RhinoToRevitTransfer
                     string hash = entity.Get<string>("R2R_GeoHash");
                     dict[guid] = new RevitSyncRecord
                     {
+#if NET8_0_OR_GREATER
+                        ElementId = (int)elem.Id.Value,
+#else
                         ElementId = elem.Id.IntegerValue,
-                        RhinoGuid = guid,
+#endif
                         GeoHash = hash,
                         LayerPath = entity.Get<string>("R2R_LayerPath"),
                         Timestamp = entity.Get<string>("R2R_Timestamp")

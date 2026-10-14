@@ -39,26 +39,37 @@ for /d %%D in ("%ADDINS_ROOT%\20*") do (
     
     copy /y "%MANIFEST_SRC%" "!TARGET_ADDIN!" >nul 2>&1
     
-    set "HAS_DLL=0"
-    if exist "%SCRIPT_DIR%..\csharp\bin\Release\net48\RhinoToRevitTransfer.dll" set "HAS_DLL=1"
-    
-    if "!HAS_DLL!"=="1" (
-        copy /y "%SCRIPT_DIR%..\csharp\bin\Release\net48\RhinoToRevitTransfer.dll" "!TARGET_DIR!\RhinoToRevitTransfer.dll" >nul 2>&1
+    set "DLL_SRC="
+    if !YEAR! GEQ 2025 (
+        if exist "%SCRIPT_DIR%..\csharp\bin\Release\net8.0-windows\RhinoToRevitTransfer.dll" set "DLL_SRC=%SCRIPT_DIR%..\csharp\bin\Release\net8.0-windows\RhinoToRevitTransfer.dll"
+    )
+    if not defined DLL_SRC (
+        if exist "%SCRIPT_DIR%..\csharp\bin\Release\net48\RhinoToRevitTransfer.dll" set "DLL_SRC=%SCRIPT_DIR%..\csharp\bin\Release\net48\RhinoToRevitTransfer.dll"
+    )
+    if not defined DLL_SRC (
+        if exist "%SCRIPT_DIR%RhinoToRevitTransfer\RhinoToRevitTransfer.dll" set "DLL_SRC=%SCRIPT_DIR%RhinoToRevitTransfer\RhinoToRevitTransfer.dll"
+    )
+
+    if defined DLL_SRC (
+        copy /y "!DLL_SRC!" "!TARGET_DIR!\RhinoToRevitTransfer.dll" >nul 2>&1
         echo   -^> Revit !YEAR! : [SUCCESS] Installed DLL and registered manifest [.addin]
     )
-    if "!HAS_DLL!"=="0" (
+    if not defined DLL_SRC (
         echo   -^> Revit !YEAR! : [SUCCESS] Registered manifest [.addin]
     )
 )
 
 if "!FOUND!"=="0" (
     echo [WARNING] No existing Revit year directories found in %ADDINS_ROOT%.
-    echo Creating default deployment folders for Revit 2024 and 2025...
+    echo Creating default deployment folders for Revit 2024, 2025, 2026...
     
-    for %%Y in (2024 2025) do (
+    for %%Y in (2024 2025 2026) do (
         mkdir "%ADDINS_ROOT%\%%Y\RhinoToRevitTransfer" >nul 2>&1
         copy /y "%MANIFEST_SRC%" "%ADDINS_ROOT%\%%Y\RhinoToRevitTransfer.addin" >nul 2>&1
-        echo   -^> Revit %%Y : [SUCCESS] Registered manifest [.addin]
+        if exist "%SCRIPT_DIR%RhinoToRevitTransfer\RhinoToRevitTransfer.dll" (
+            copy /y "%SCRIPT_DIR%RhinoToRevitTransfer\RhinoToRevitTransfer.dll" "%ADDINS_ROOT%\%%Y\RhinoToRevitTransfer\RhinoToRevitTransfer.dll" >nul 2>&1
+        )
+        echo   -^> Revit %%Y : [SUCCESS] Registered manifest and deployed DLL [.addin]
     )
 )
 

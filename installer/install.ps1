@@ -94,9 +94,21 @@ foreach ($ver in $InstallVersions) {
     $TargetManifestPath = "$TargetAddinFolder\RhinoToRevitTransfer.addin"
     Set-Content -Path $TargetManifestPath -Value $ManifestContent -Encoding UTF8
 
-    # Copy binary if available
-    if (Test-Path $BuiltDllPath) {
-        Copy-Item -Path $BuiltDllPath -Destination "$TargetPluginFolder\RhinoToRevitTransfer.dll" -Force
+    # Copy binary matching target framework
+    $YearInt = 0
+    [int]::TryParse($ver, [ref]$YearInt) | Out-Null
+    $DllSrc = if ($YearInt -ge 2025 -and (Test-Path "$CsharpDir\bin\Release\net8.0-windows\RhinoToRevitTransfer.dll")) {
+        "$CsharpDir\bin\Release\net8.0-windows\RhinoToRevitTransfer.dll"
+    } elseif (Test-Path "$CsharpDir\bin\Release\net48\RhinoToRevitTransfer.dll") {
+        "$CsharpDir\bin\Release\net48\RhinoToRevitTransfer.dll"
+    } elseif (Test-Path "$ScriptDir\RhinoToRevitTransfer\RhinoToRevitTransfer.dll") {
+        "$ScriptDir\RhinoToRevitTransfer\RhinoToRevitTransfer.dll"
+    } else {
+        $null
+    }
+
+    if ($DllSrc) {
+        Copy-Item -Path $DllSrc -Destination "$TargetPluginFolder\RhinoToRevitTransfer.dll" -Force
         Write-Host "  -> Revit $ver : Installed DLL & registered manifest (.addin)" -ForegroundColor Green
     } else {
         Write-Host "  -> Revit $ver : Registered manifest ($TargetManifestPath)" -ForegroundColor Green
