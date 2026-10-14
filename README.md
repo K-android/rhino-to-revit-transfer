@@ -14,21 +14,37 @@ It infers architectural design intent via deterministic geometry fingerprinting 
 ## 1. Directory Structure
 
 ```
-r2r_transfer/
-├── __init__.py                # Package root & exports
-├── main_launcher.py          # Unified entry-point launcher (RIR / pyRevit / Script Editor)
-├── scanner.py                # Module 1: Rhino Scanner & Geometry Fingerprinter (SHA-256)
-├── classifier.py             # Module 2: Evidence-Based Classification & Confidence Engine
-├── ai_assistant.py           # Module 3: LLM Semantic Interpreter (Catalan / Spanish architectural terms)
-├── profile_manager.py        # Module 4: Persistent JSON Mapping Profile Manager
-├── conversion_router.py      # Module 5: RIR Element Creation Engines (10-Pipeline Dispatcher)
-├── graphics_validator.py     # Module 6: Dual-Status BIM & View Graphics Validator
-├── sync_engine.py            # Module 7: Persistent Identity (GUID + GeoHash) & Revision Tracker
-├── reporting.py              # Module 8: Preflight, BUA/GFA Area Check & QA Exporter (HTML/CSV/JSON)
-├── ui_dialog.py              # Module 9: Eto.Forms 5-Stage Multi-Step Wizard Dashboard UI
-├── Transfer_Profile.json     # Preconfigured mapping profile
-├── test_pipeline.py          # Verification test suite
-└── README.md                 # System architecture & deployment documentation
+rhino-to-revit-transfer/
+├── installer/                   # 1-Click Revit Add-in Installer & Setup
+│   ├── install.bat             # Double-click Windows batch installer
+│   ├── install.ps1             # PowerShell automated version detector & deployer
+│   ├── uninstall.bat           # 1-click uninstaller batch file
+│   ├── uninstall.ps1           # PowerShell clean removal script
+│   └── README.md               # Installer usage guide
+├── csharp/                      # Native C# .NET Revit Add-in Solution
+│   ├── RhinoToRevitTransfer.csproj  # Multi-targeted .NET SDK project (net48 / net8.0-windows)
+│   ├── RhinoToRevitTransfer.addin   # Revit application manifest file
+│   ├── R2RTransferApp.cs            # Ribbon Tab ("R2R Transfer") & PushButton registration
+│   ├── R2RTransferCommand.cs        # External command & Rhino.Inside binding
+│   ├── TransferDashboardWindow.cs   # Native WPF interactive transfer dashboard
+│   ├── Scanner.cs                   # C# geometry scanner & SHA-256 fingerprinting
+│   ├── Classifier.cs                # C# 5-criteria architectural heuristic engine
+│   ├── ConversionRouter.cs          # C# 10-pipeline transaction dispatcher
+│   └── SyncEngine.cs                # C# ExtensibleStorage schema & sync tracker
+├── __init__.py                  # Package root & exports
+├── main_launcher.py            # Unified entry-point launcher (RIR / pyRevit / Script Editor)
+├── scanner.py                  # Module 1: Rhino Scanner & Geometry Fingerprinter (SHA-256)
+├── classifier.py               # Module 2: Evidence-Based Classification & Confidence Engine
+├── ai_assistant.py             # Module 3: LLM Semantic Interpreter (Catalan / Spanish architectural terms)
+├── profile_manager.py          # Module 4: Persistent JSON Mapping Profile Manager
+├── conversion_router.py        # Module 5: RIR Element Creation Engines (10-Pipeline Dispatcher)
+├── graphics_validator.py       # Module 6: Dual-Status BIM & View Graphics Validator
+├── sync_engine.py              # Module 7: Persistent Identity (GUID + GeoHash) & Revision Tracker
+├── reporting.py                # Module 8: Preflight, BUA/GFA Area Check & QA Exporter (HTML/CSV/JSON)
+├── ui_dialog.py                # Module 9: Eto.Forms 5-Stage Multi-Step Wizard Dashboard UI
+├── Transfer_Profile.json       # Preconfigured mapping profile
+├── test_pipeline.py            # Verification test suite
+└── README.md                   # System architecture & deployment documentation
 ```
 
 ---
@@ -112,29 +128,60 @@ Uses Revit `ExtensibleStorage` (`Schema GUID: 7B89A3E4-4321-4F29-9EBA-D0F568C8B1
 
 ---
 
-## 3. Installation & Usage
+## 3. Installation & Setup
 
-### Method A: Direct Execution in Rhino.Inside.Revit Script Editor
+### Method 1: 1-Click C# Revit Add-in Installer (Recommended)
+This method installs the native compiled Revit add-in, adding a dedicated **"R2R Transfer"** tab and **"One-Click Transfer"** push button directly to your Revit ribbon.
+
+1. **Close Revit** if currently open.
+2. Navigate to the `installer/` directory and run **`install.bat`** (or right-click and run with PowerShell `install.ps1`).
+3. The installer automatically:
+   - Scans your system for all installed Autodesk Revit versions (`2020` through `2026`).
+   - Copies and registers `RhinoToRevitTransfer.addin` into `%APPDATA%\Autodesk\Revit\Addins\<Year>\`.
+   - Creates and sets up the plugin deployment directory.
+4. Open **Autodesk Revit**.
+5. Start **Rhino.Inside** from the `Rhino.Inside` ribbon tab.
+6. Click the new **R2R Transfer** ribbon tab and click **One-Click Transfer** to open the dashboard!
+
+> **To Uninstall:** Simply double-click `installer/uninstall.bat` at any time to cleanly remove the add-in and manifest from all Revit versions.
+
+---
+
+### Method 2: Python / Rhino.Inside.Revit Script Editor (Zero-Compilation)
+If you prefer running the Python 3 / IronPython version directly without compiling C#:
 1. Open your Revit project and start Rhino from the **Rhino.Inside** ribbon tab.
-2. In Rhino, open the architectural CAD/Rhino model.
+2. In Rhino, open your architectural model.
 3. Open the Rhino Python Script Editor (`EditPythonScript` or `ScriptEditor` in Rhino 8).
-4. Open and run:
+4. Run:
    ```python
-   # main_launcher.py
    import main_launcher as launcher
    launcher.launch_transfer()
    ```
 
-### Method B: pyRevit Push-Button
+---
+
+### Method 3: pyRevit Extension Push-Button
+To add a pyRevit ribbon button:
 1. Create a push-button bundle in your pyRevit extension directory:
    `R2R.extension/R2R.tab/Transfer.panel/OneClick.pushbutton/script.py`
 2. Add the following lines to `script.py`:
    ```python
    import sys
-   sys.path.append(r"C:\Path\To\RhinoToRevitTransfer")
+   sys.path.append(r"C:\Path\To\rhino-to-revit-transfer")
    import main_launcher
    main_launcher.launch_transfer()
    ```
+
+---
+
+### Developer Setup: Compiling the C# Solution from Source
+To compile custom modifications to the C# codebase in `csharp/`:
+1. Ensure you have the **.NET SDK** (.NET 8.0 or .NET Framework 4.8) installed.
+2. Open terminal in the `csharp/` folder:
+   ```shell
+   dotnet build RhinoToRevitTransfer.csproj -c Release
+   ```
+3. Run `installer/install.bat` to deploy your newly compiled binary to Revit.
 
 ---
 
