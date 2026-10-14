@@ -1,0 +1,49 @@
+{
+  "project_name": "Architectural Project",
+  "timestamp": "2026-10-14 15:30:45",
+  "execution_mode": "Hybrid",
+  "unit_system": "Meters",
+  "preflight": {
+    "total_scanned": 0,
+    "duplicates_found": 0,
+    "far_origin_count": 0,
+    "open_loops_count": 0,
+    "warnings": []
+  },
+  "transfer_stats": {
+    "created": 0,
+    "updated": 0,
+    "skipped": 0,
+    "failed": 0,
+    "missing_in_rhino": 0
+  },
+  "bua_stats": {
+    "rhino_slab_area_sqm": 250.0,
+    "revit_floor_area_sqm": 250.0,
+    "discrepancy_sqm": 0.0,
+    "discrepancy_pct": 0.0
+  },
+  "elements": [
+    {
+      "rhino_guid": "11111111-2222-3333-4444-555555555555",
+      "revit_element_id": 99901,
+      "layer_name": "PB_FORJAT",
+      "category": "Floors",
+      "strategy": "FloorNative",
+      "sync_state": "CREATE",
+      "confidence_pct": 95.0,
+      "bim_status": "PASS",
+      "graphics_status": "PASS",
+      "overall_status": "COMPLETE",
+      "view_matrix": {
+        "Plan": "PASS",
+        "Section": "PASS",
+        "Elevation": "PASS",
+        "3D": "PASS"
+      },
+      "rhino_area": 250.0,
+      "bua_area": 250.0,
+      "issues": []
+    }
+  ]
+}

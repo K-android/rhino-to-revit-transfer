@@ -1,0 +1,2 @@
+rhino_guid,revit_element_id,layer_name,category,strategy,sync_state,confidence_pct,bim_status,graphics_status,overall_status,plan_view,section_view,elevation_view,3d_view,rhino_area_sqm,revit_bua_sqm,issues
+11111111-2222-3333-4444-555555555555,99901,PB_FORJAT,Floors,FloorNative,CREATE,95.0,PASS,PASS,COMPLETE,PASS,PASS,PASS,PASS,250.0,250.0,

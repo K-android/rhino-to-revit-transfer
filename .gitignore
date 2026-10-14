@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# C# / .NET / Visual Studio
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+[Dd]ebug/
+[Rr]elease/
+
+# Revit & Rhino temp files
+*.backup.*
+*.rfa.backup.*
+*.rvt.backup.*
+*.3dm.bak
+*.3dm.tmp
+
+# OS generated
+.DS_Store
+Thumbs.db

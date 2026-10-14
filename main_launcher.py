@@ -1,0 +1,98 @@
+"""
+One-Click Rhino-to-Revit Transfer (RIR)
+main_launcher.py — Main Entry Point Launcher Script
+
+Executes inside Rhino.Inside.Revit (RIR) Python Script Editor, Grasshopper Python,
+or as a pyRevit ribbon push-button command.
+
+Initializes Revit and Rhino contexts, checks API dependencies, and launches
+the TransferDashboardDialog Eto.Forms dashboard.
+"""
+
+import sys
+import os
+
+# Ensure current directory and package root are in sys.path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+for p in [current_dir, parent_dir]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+# Environment and CLR Assembly Resolution
+REVIT_DOC = None
+REVIT_UIDOC = None
+IS_RIR = False
+
+try:
+    import clr
+    clr.AddReference("System")
+
+    # Try RhinoCommon
+    try:
+        clr.AddReference("RhinoCommon")
+        import Rhino
+        import Rhino.UI as rui
+    except Exception:
+        Rhino = None
+
+    # Try Rhino.Inside.Revit
+    try:
+        clr.AddReference("RhinoInside.Revit")
+        import RhinoInside.Revit as RIR
+        from RhinoInside.Revit import Revit
+        REVIT_DOC = Revit.ActiveDBDocument
+        REVIT_UIDOC = Revit.ActiveUIDocument
+        IS_RIR = True
+    except Exception:
+        pass
+
+    # Try pyRevit / Standard Revit UI environment fallback
+    if not REVIT_DOC and "__revit__" in globals():
+        try:
+            REVIT_UIDOC = __revit__.ActiveUIDocument
+            REVIT_DOC = REVIT_UIDOC.Document if REVIT_UIDOC else None
+            IS_RIR = True
+        except Exception:
+            pass
+
+except Exception as ex:
+    print("[R2R Transfer] CLR Initialization Notice: {}".format(ex))
+
+# Import Transfer Dialog from local package
+try:
+    from ui_dialog import TransferDashboardDialog
+except ImportError:
+    try:
+        from .ui_dialog import TransferDashboardDialog
+    except Exception:
+        TransferDashboardDialog = None
+
+
+def launch_transfer(revit_doc=None, revit_uidoc=None):
+    """Launches the interactive One-Click Rhino-to-Revit Transfer Dashboard."""
+    doc = revit_doc or REVIT_DOC
+    uidoc = revit_uidoc or REVIT_UIDOC
+
+    if not doc:
+        print("[R2R Transfer] WARNING: Running outside active Revit document.")
+        print("[R2R Transfer] Launching in offline geometry inspection mode.")
+
+    dialog = TransferDashboardDialog(revit_doc=doc, revit_uidoc=uidoc)
+
+    # Show modal anchored to Rhino Main Window if available
+    try:
+        import Rhino.UI as rui
+        dialog.ShowModal(rui.RhinoEtoApp.MainWindow)
+    except Exception:
+        try:
+            dialog.ShowModal()
+        except Exception:
+            # Fallback to modeless show
+            dialog.Show()
+
+    return dialog
+
+
+if __name__ == "__main__":
+    launch_transfer()
