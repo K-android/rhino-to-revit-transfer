@@ -2,32 +2,41 @@
 setlocal enabledelayedexpansion
 title Rhino-to-Revit Transfer (R2R) - Add-in Uninstaller
 echo ==========================================================
-echo    Rhino-to-Revit Transfer (R2R) - Add-in Uninstaller
+echo    Rhino-to-Revit Transfer (R2R) - Full Add-in Cleaner
 echo ==========================================================
 echo.
 
-set "ADDINS_ROOT=%APPDATA%\Autodesk\Revit\Addins"
+set "USER_ADDINS=%APPDATA%\Autodesk\Revit\Addins"
+set "PROGRAM_ADDINS=%ProgramData%\Autodesk\Revit\Addins"
 
-if not exist "%ADDINS_ROOT%" (
-    echo [ERROR] Revit Addins directory not found.
-    pause
-    exit /b 0
+echo Removing Rhino-to-Revit Transfer add-in from User AppData...
+if exist "%USER_ADDINS%" (
+    for /d %%D in ("%USER_ADDINS%\20*") do (
+        set "YEAR=%%~nxD"
+        if exist "%%D\RhinoToRevitTransfer.addin" (
+            del /f /q "%%D\RhinoToRevitTransfer.addin" >nul 2>&1
+            echo   -^> Removed AppData manifest from Revit !YEAR!
+        )
+        if exist "%%D\RhinoToRevitTransfer" (
+            rd /s /q "%%D\RhinoToRevitTransfer" >nul 2>&1
+            echo   -^> Removed AppData plugin folder from Revit !YEAR!
+        )
+    )
 )
 
-echo Removing Rhino-to-Revit Transfer add-in from all Revit versions...
-
-for /d %%D in ("%ADDINS_ROOT%\20*") do (
-    set "YEAR=%%~nxD"
-    set "TARGET_DIR=%%D\RhinoToRevitTransfer"
-    set "TARGET_ADDIN=%%D\RhinoToRevitTransfer.addin"
-    
-    if exist "!TARGET_ADDIN!" (
-        del /f /q "!TARGET_ADDIN!" >nul 2>&1
-        echo   -^> Removed manifest from Revit !YEAR!
-    )
-    if exist "!TARGET_DIR!" (
-        rd /s /q "!TARGET_DIR!" >nul 2>&1
-        echo   -^> Removed plugin folder from Revit !YEAR!
+echo.
+echo Removing Rhino-to-Revit Transfer add-in from ProgramData (All Users)...
+if exist "%PROGRAM_ADDINS%" (
+    for /d %%D in ("%PROGRAM_ADDINS%\20*") do (
+        set "YEAR=%%~nxD"
+        if exist "%%D\RhinoToRevitTransfer.addin" (
+            del /f /q "%%D\RhinoToRevitTransfer.addin" >nul 2>&1
+            echo   -^> Removed ProgramData manifest from Revit !YEAR!
+        )
+        if exist "%%D\RhinoToRevitTransfer" (
+            rd /s /q "%%D\RhinoToRevitTransfer" >nul 2>&1
+            echo   -^> Removed ProgramData plugin folder from Revit !YEAR!
+        )
     )
 )
 
@@ -35,7 +44,10 @@ echo.
 echo ==========================================================
 echo              UNINSTALLATION COMPLETE!
 echo ==========================================================
-echo RhinoToRevitTransfer has been cleanly removed from Revit.
+echo RhinoToRevitTransfer has been cleanly removed from all
+echo AppData and ProgramData Revit add-in directories.
+echo.
+echo When you launch Revit, no startup error will appear.
 echo.
 echo Press any key to exit...
 pause >nul
