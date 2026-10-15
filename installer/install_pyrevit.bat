@@ -11,7 +11,7 @@ set "PYREVIT_EXT_ROOT=%APPDATA%\pyRevit\Extensions"
 set "BUTTON_DIR=%PYREVIT_EXT_ROOT%\R2R.extension\R2R.tab\Transfer.panel\OneClick.pushbutton"
 set "SCRIPT_FILE=%BUTTON_DIR%\script.py"
 set "BUNDLE_YAML=%BUTTON_DIR%\bundle.yaml"
-set "PKG_DIR=%~dp0.."
+pushd "%~dp0.." && set "PKG_DIR=%CD%" && popd
 
 if not exist "%APPDATA%\pyRevit" (
     echo [ERROR] pyRevit installation not found at %APPDATA%\pyRevit
@@ -31,8 +31,19 @@ echo Generating pyRevit script launcher...
     echo pkg_path = r"%PKG_DIR%"
     echo if pkg_path not in sys.path:
     echo     sys.path.insert^(0, pkg_path^)
+    echo for _mod in ['scanner', 'classifier', 'ai_assistant', 'profile_manager', 'conversion_router', 'graphics_validator', 'sync_engine', 'reporting', 'ui_dialog', 'main_launcher']:
+    echo     if _mod in sys.modules:
+    echo         del sys.modules[_mod]
     echo import main_launcher
-    echo main_launcher.launch_transfer^(^)
+    echo doc = None
+    echo uidoc = None
+    echo try:
+    echo     if '__revit__' in globals^(^):
+    echo         uidoc = __revit__.ActiveUIDocument
+    echo         doc = uidoc.Document if uidoc else None
+    echo except Exception:
+    echo     pass
+    echo main_launcher.launch_transfer^(revit_doc=doc, revit_uidoc=uidoc^)
 ) > "%SCRIPT_FILE%"
 
 echo Generating button configuration...

@@ -36,15 +36,25 @@ try:
 except Exception:
     REVIT_AVAILABLE = False
 
-# Import sibling modules
-from .scanner import RhinoScanner
-from .classifier import AecClassifier
-from .ai_assistant import AISemanticInterpreter
-from .profile_manager import ProfileManager, MappingRule
-from .conversion_router import ConversionRouter
-from .graphics_validator import GraphicsValidator
-from .sync_engine import SyncEngine
-from .reporting import TransferQAReport, ReportExporter
+# Import sibling modules (supports both standalone module and package-relative modes)
+try:
+    from scanner import RhinoScanner
+    from classifier import AecClassifier
+    from ai_assistant import AISemanticInterpreter
+    from profile_manager import ProfileManager, MappingRule
+    from conversion_router import ConversionRouter
+    from graphics_validator import GraphicsValidator
+    from sync_engine import SyncEngine
+    from reporting import TransferQAReport, ReportExporter
+except (ImportError, ValueError):
+    from .scanner import RhinoScanner
+    from .classifier import AecClassifier
+    from .ai_assistant import AISemanticInterpreter
+    from .profile_manager import ProfileManager, MappingRule
+    from .conversion_router import ConversionRouter
+    from .graphics_validator import GraphicsValidator
+    from .sync_engine import SyncEngine
+    from .reporting import TransferQAReport, ReportExporter
 
 
 class LayerRowItem(object):
