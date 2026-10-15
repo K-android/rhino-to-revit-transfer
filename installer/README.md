@@ -47,6 +47,26 @@ If you run `install.ps1` directly in PowerShell and receive the error:
 
 ---
 
+## 🛡️ Revit Error: Operation is not supported (HRESULT: 0x80131515)
+
+If Revit displays an error dialog stating:
+> *"Could not load file or assembly ... RhinoToRevitTransfer.dll or one of its dependencies. Operation is not supported. (Exception from HRESULT: 0x80131515)"*
+
+This occurs because Windows security attaches a **Mark-of-the-Web (ZoneId=3)** attribute to any `.dll` downloaded from the internet/GitHub.
+
+### How to Fix in 1 Click:
+1. Double-click **`installer\unblock.bat`**.
+2. Or in PowerShell:
+   ```powershell
+   Get-ChildItem -Path "$env:APPDATA\Autodesk\Revit\Addins" -Filter "*RhinoToRevitTransfer*" -Recurse | Unblock-File
+   ```
+3. Or manually in Windows Explorer:
+   - Navigate to `%APPDATA%\Autodesk\Revit\Addins\<Revit_Year>\RhinoToRevitTransfer\RhinoToRevitTransfer.dll`
+   - Right-click `RhinoToRevitTransfer.dll` ➔ **Properties** ➔ check **Unblock** ➔ click **OK**.
+4. Restart Revit.
+
+---
+
 ## 🛠️ Files in this Directory
 
 | File | Description |

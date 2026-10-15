@@ -116,6 +116,10 @@ foreach ($ver in $InstallVersions) {
     }
 }
 
+# Unblock files to prevent Windows 0x80131515 security block
+Write-Host "`nUnblocking deployed files (preventing 0x80131515 security block)..." -ForegroundColor Cyan
+Get-ChildItem -Path $RevitAddinsRoot -Filter "*RhinoToRevitTransfer*" -Recurse | Unblock-File
+
 Write-Host ""
 Write-Host "==========================================================" -ForegroundColor Green
 Write-Host "                INSTALLATION COMPLETE!                    " -ForegroundColor Green

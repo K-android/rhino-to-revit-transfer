@@ -74,6 +74,10 @@ if "!FOUND!"=="0" (
 )
 
 echo.
+echo Unblocking deployed add-in files (preventing 0x80131515 security block)...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -Path '%ADDINS_ROOT%' -Filter '*RhinoToRevitTransfer*' -Recurse | Unblock-File" >nul 2>&1
+
+echo.
 echo ==========================================================
 echo                INSTALLATION COMPLETE!
 echo ==========================================================
