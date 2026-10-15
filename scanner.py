@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 """
 One-Click Rhino-to-Revit Transfer (RIR): Module 1
-scanner.py — Rhino Scanner & Geometry Fingerprinter
+scanner.py - Rhino Scanner & Geometry Fingerprinter
 
 Scans Rhino.RhinoDoc.ActiveDoc objects, extracts deep metadata, computes
 deterministic geometry fingerprints (including SHA-256 geo_hash), evaluates

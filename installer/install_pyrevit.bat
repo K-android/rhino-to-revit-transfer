@@ -24,6 +24,7 @@ if not exist "%BUTTON_DIR%" mkdir "%BUTTON_DIR%" >nul 2>&1
 
 echo Generating pyRevit script launcher...
 (
+    echo # -*- coding: utf-8 -*-
     echo """Rhino-to-Revit One-Click Transfer Launcher"""
     echo import sys
     echo import os

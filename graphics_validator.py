@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 """
 One-Click Rhino-to-Revit Transfer (RIR): Module 6
-graphics_validator.py — Dual-Status BIM & View Graphics Validator
+graphics_validator.py - Dual-Status BIM & View Graphics Validator
 
 Evaluates every transferred Revit element across two distinct criteria:
   1. BIM STATUS (PASS | FAIL):

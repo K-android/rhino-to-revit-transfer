@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 One-Click Rhino-to-Revit Transfer (RIR)
 Production-grade 6-stage pipeline: SCAN -> CLASSIFY -> REVIEW -> TRANSFER -> VALIDATE -> SYNC

@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 """
 One-Click Rhino-to-Revit Transfer (RIR): Module 3
-ai_assistant.py — Optional LLM Semantic Interpreter
+ai_assistant.py - Optional LLM Semantic Interpreter
 
 Interprets ambiguous architectural naming conventions, with specialized heuristics
 and optional LLM translation for Spanish and Catalan terms commonly used in

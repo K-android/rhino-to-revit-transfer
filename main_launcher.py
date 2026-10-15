@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 """
 One-Click Rhino-to-Revit Transfer (RIR)
-main_launcher.py — Main Entry Point Launcher Script
+main_launcher.py - Main Entry Point Launcher Script
 
 Executes inside Rhino.Inside.Revit (RIR) Python Script Editor, Grasshopper Python,
 or as a pyRevit ribbon push-button command.

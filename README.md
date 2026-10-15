@@ -136,9 +136,9 @@ This method installs the native compiled Revit add-in, adding a dedicated **"R2R
 1. **Close Revit** if currently open.
 2. Navigate to the `installer/` directory and run **`install.bat`** (or right-click and run with PowerShell `install.ps1`).
 3. The installer automatically:
-   - Scans your system for all installed Autodesk Revit versions (`2020` through `2026`).
+   - Deploys to Autodesk Revit versions 2024, 2025, 2026, and 2027 (automatically matching .NET Framework 4.8 for Revit 2024 and modern .NET 8.0 for Revit 2025, 2026, and 2027).
    - Copies and registers `RhinoToRevitTransfer.addin` into `%APPDATA%\Autodesk\Revit\Addins\<Year>\`.
-   - Creates and sets up the plugin deployment directory.
+   - Automatically unblocks all assemblies to prevent Windows Mark-of-the-Web security blocks (0x80131515).
 4. Open **Autodesk Revit**.
 5. Start **Rhino.Inside** from the `Rhino.Inside` ribbon tab.
 6. Click the new **R2R Transfer** ribbon tab and click **One-Click Transfer** to open the dashboard!

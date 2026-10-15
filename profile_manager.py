@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 """
 One-Click Rhino-to-Revit Transfer (RIR): Module 4
-profile_manager.py — Persistent JSON Mapping Profile
+profile_manager.py - Persistent JSON Mapping Profile
 
 Manages serialization, loading, and auto-matching of mapping profiles (Transfer_Profile.json).
 Caches user-approved mappings between Rhino layers/wildcards and Revit Target Categories,

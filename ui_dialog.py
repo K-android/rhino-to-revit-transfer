@@ -1,13 +1,14 @@
+# -*- coding: utf-8 -*-
 """
 One-Click Rhino-to-Revit Transfer (RIR): Module 9
-ui_dialog.py — Eto.Forms Multi-Step Wizard & Dashboard UI
+ui_dialog.py - Eto.Forms Multi-Step Wizard & Dashboard UI
 
 Provides a 5-stage interactive workflow dashboard:
-  1. SCAN — Rhino model scanning & preflight metrics
-  2. REVIEW & CONFIGURE — Filtering, classification overrides, profile rules, AI assist
-  3. PREVIEW — Transaction count KPIs & pre-execution validation
-  4. EXECUTE — Controlled Revit API TransactionGroup execution with real-time logging
-  5. VALIDATE & QA REPORT — Dual-Status BIM & Graphics grid, Isolate in Revit, HTML/CSV export
+  1. SCAN - Rhino model scanning & preflight metrics
+  2. REVIEW & CONFIGURE - Filtering, classification overrides, profile rules, AI assist
+  3. PREVIEW - Transaction count KPIs & pre-execution validation
+  4. EXECUTE - Controlled Revit API TransactionGroup execution with real-time logging
+  5. VALIDATE & QA REPORT - Dual-Status BIM & Graphics grid, Isolate in Revit, HTML/CSV export
 """
 
 import sys

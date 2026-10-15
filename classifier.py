@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 """
 One-Click Rhino-to-Revit Transfer (RIR): Module 2
-classifier.py — Evidence-Based Classification & Confidence Scoring Engine
+classifier.py - Evidence-Based Classification & Confidence Scoring Engine
 
 Calculates an evidence-based classification score (0% to 100%) for each object
 or layer group using exact weighted scoring criteria:
@@ -281,7 +282,7 @@ class AecClassifier(object):
         # Base offset to nearest level
         dz = abs(obj.dz_to_level)
 
-        # Floor slabs usually sit directly on or within ±300mm (0.3m) of a Level
+        # Floor slabs usually sit directly on or within +/-300mm (0.3m) of a Level
         if dz <= 0.3:
             scores["Floors"] = 1.0
             scores["Walls"] = 0.9  # Walls also spring from a level base

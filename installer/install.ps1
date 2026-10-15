@@ -29,20 +29,13 @@ if (-not (Test-Path $RevitAddinsRoot)) {
     exit 1
 }
 
-# 1. Detect Installed Revit Versions
-$DetectedVersions = Get-ChildItem -Path $RevitAddinsRoot -Directory | Where-Object { $_.Name -match "^\d{4}$" } | Select-Object -ExpandProperty Name
+# 1. Detect and ensure target Revit Versions (2024 to 2027)
+$DetectedVersions = Get-ChildItem -Path $RevitAddinsRoot -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "^\d{4}$" } | Select-Object -ExpandProperty Name
+$TargetYears = @("2024", "2025", "2026", "2027")
+$AllVersions = ($TargetYears + $DetectedVersions) | Select-Object -Unique
 
-if (-not $DetectedVersions -or $DetectedVersions.Count -eq 0) {
-    Write-Host "[WARNING] No Revit year folders (e.g. 2024, 2025) found in:" -ForegroundColor Yellow
-    Write-Host "  $RevitAddinsRoot" -ForegroundColor Yellow
-    $DetectedVersions = @("2024", "2025")
-    Write-Host "Defaulting to Revit 2024 and 2025 targets." -ForegroundColor Cyan
-} else {
-    Write-Host "[INFO] Detected Revit Add-in directories: $($DetectedVersions -join ', ')" -ForegroundColor Green
-}
-
-# Filter target versions if specified
-$InstallVersions = if ($TargetVersion -eq "all") { $DetectedVersions } else { @($TargetVersion) }
+Write-Host "[INFO] Target Revit Add-in versions: $($AllVersions -join ', ')" -ForegroundColor Green
+$InstallVersions = if ($TargetVersion -eq "all") { $AllVersions } else { @($TargetVersion) }
 
 # 2. Build C# Project if .NET SDK / dotnet is available
 $BuiltDllPath = "$CsharpDir\bin\Release\net48\RhinoToRevitTransfer.dll"

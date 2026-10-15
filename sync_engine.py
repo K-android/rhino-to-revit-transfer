@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 """
 One-Click Rhino-to-Revit Transfer (RIR): Module 7
-sync_engine.py — Persistent Identity (GUID + Geometry Hash) & Revision Tracker
+sync_engine.py - Persistent Identity (GUID + Geometry Hash) & Revision Tracker
 
 Implements bidirectional revision tracking between Rhino and Revit using Revit ExtensibleStorage.
 Attaches tamper-proof metadata entities to every transferred Revit element:

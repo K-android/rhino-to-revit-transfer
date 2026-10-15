@@ -10,9 +10,10 @@ This directory contains automated setup and uninstall utilities for registering 
 2. Simply double-click **`install.bat`**.
    > **Note:** `install.bat` runs pure native Windows commands and does **NOT** require PowerShell, administrative privileges, or any digital code-signing certificate.
 3. The installer will:
-   - Scan your system for all installed Autodesk Revit versions (`2018` through `2026`).
+   - Configure Autodesk Revit versions (`2024`, `2025`, `2026`, and `2027`).
+   - Automatically deploy matching binaries: .NET Framework 4.8 for Revit 2024 and .NET 8.0 for Revit 2025–2027.
    - Register `RhinoToRevitTransfer.addin` into `%APPDATA%\Autodesk\Revit\Addins\<Year>\`.
-   - Prepare the add-in subfolder and deploy necessary files.
+   - Automatically unblock all files so they run without 0x80131515 errors.
 4. Launch **Autodesk Revit**.
 5. Start **Rhino.Inside** from the `Rhino.Inside` ribbon tab.
 6. Switch to the newly created **R2R Transfer** ribbon tab and click **One-Click Transfer**.

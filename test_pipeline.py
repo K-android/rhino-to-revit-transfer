@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 """
 One-Click Rhino-to-Revit Transfer: Test Suite
-test_pipeline.py — End-to-end verification of scanner, classifier, AI assistant,
+test_pipeline.py - End-to-end verification of scanner, classifier, AI assistant,
 profile manager, sync engine, graphics validator, and QA reporting.
 """
 

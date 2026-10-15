@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 """
 One-Click Rhino-to-Revit Transfer (RIR): Module 5
-conversion_router.py — RIR Element Creation Engines (10-Pipeline Dispatcher)
+conversion_router.py - RIR Element Creation Engines (10-Pipeline Dispatcher)
 
 Executes native Revit element generation and DirectShape fallback using Rhino.Inside.Revit (RIR).
 Supports 3 Global Execution Modes:

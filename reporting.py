@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 """
 One-Click Rhino-to-Revit Transfer (RIR): Module 8
-reporting.py — Preflight, Exception, BUA/GFA Area Check & Post-Transfer QA Exporter
+reporting.py - Preflight, Exception, BUA/GFA Area Check & Post-Transfer QA Exporter
 
 Aggregates all pipeline metrics and outputs production-grade QA reports in:
   - Interactive Responsive HTML Report (with executive summary KPI cards, Dual-Status badges, tables)
@@ -153,7 +154,7 @@ class ReportExporter(object):
             </tr>
             """.format(
                 guid=r.get("rhino_guid", "")[:8] + "...",
-                revit_id=r.get("revit_element_id", "—"),
+                revit_id=r.get("revit_element_id", "-"),
                 layer=r.get("layer_name", ""),
                 cat=r.get("category", ""),
                 strat=r.get("strategy", ""),
@@ -242,7 +243,7 @@ class ReportExporter(object):
 <body>
   <div class="header">
     <div>
-      <h1>R2R ONE-CLICK TRANSFER — QA & VALIDATION REPORT</h1>
+      <h1>R2R ONE-CLICK TRANSFER - QA & VALIDATION REPORT</h1>
       <div class="meta">Project: __PROJECT__ | Mode: __MODE__ | Generated: __TIMESTAMP__</div>
     </div>
     <div>
