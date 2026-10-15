@@ -160,17 +160,14 @@ If you prefer running the Python 3 / IronPython version directly without compili
 
 ---
 
-### Method 3: pyRevit Extension Push-Button
-To add a pyRevit ribbon button:
-1. Create a push-button bundle in your pyRevit extension directory:
-   `R2R.extension/R2R.tab/Transfer.panel/OneClick.pushbutton/script.py`
-2. Add the following lines to `script.py`:
-   ```python
-   import sys
-   sys.path.append(r"C:\Path\To\rhino-to-revit-transfer")
-   import main_launcher
-   main_launcher.launch_transfer()
-   ```
+### Method 3: pyRevit Extension Push-Button (1-Click Automated Setup)
+To install the tool as a permanent button on your Revit ribbon via pyRevit:
+1. Double-click `installer/install_pyrevit.bat` to automatically register the `R2R` tab and `One-Click Transfer` pushbutton.
+2. In Revit, click the **Rhino.Inside** tab to launch Rhino.
+3. Switch to the **R2R** tab and click **One-Click Transfer** to launch the dashboard!
+
+*(Manual alternative)*:
+Create `R2R.extension/R2R.tab/Transfer.panel/OneClick.pushbutton/script.py` in `%APPDATA%\pyRevit\Extensions\` and import `main_launcher`.
 
 ---
 
