@@ -161,8 +161,9 @@ class ConversionRouter(object):
         self.default_roof_type = self.doc.GetDefaultElementTypeId(DB.ElementTypeGroup.RoofType)
         self.default_ceiling_type = self.doc.GetDefaultElementTypeId(DB.ElementTypeGroup.CeilingType)
 
-        # Caches for repetitive definitions and adaptive families
+        # Caches for repetitive definitions, orientation baselines, and adaptive families
         self.repetitive_type_cache = {}
+        self.canonical_repetition_cache = {}
         self.adaptive_family_cache = {}
 
     def convert_object(self, scanned_obj, classification_result, profile_rule=None):
@@ -489,8 +490,70 @@ class ConversionRouter(object):
     # =========================================================================
     # PIPELINE 8A: Adaptive Component Placement (Multi-Point Facade Panels / Struts)
     # =========================================================================
+    def _find_adaptive_symbol_with_point_count(self, num_pts, requested_name=None):
+        """Finds a loaded Adaptive FamilySymbol that has exactly num_pts placement points."""
+        if not hasattr(DB, "AdaptiveComponentInstanceUtils"):
+            return None
+
+        requested_clean = (requested_name or "").strip().lower()
+
+        # Check cache if not searching for an explicitly requested type
+        if not requested_clean and num_pts in self.adaptive_family_cache:
+            cached_id = self.adaptive_family_cache[num_pts]
+            if cached_id:
+                try:
+                    elem = self.doc.GetElement(cached_id)
+                    if elem and isinstance(elem, DB.FamilySymbol):
+                        return elem
+                except Exception:
+                    pass
+
+        collector = DB.FilteredElementCollector(self.doc).OfClass(DB.FamilySymbol)
+        candidates = []
+        for s in collector:
+            try:
+                if not DB.AdaptiveComponentInstanceUtils.IsAdaptiveFamily(s.Family):
+                    continue
+                s_name = (s.Name or "").lower()
+                f_name = (s.FamilyName or "").lower()
+                if requested_clean:
+                    if requested_clean in s_name or requested_clean in f_name:
+                        candidates.insert(0, s)
+                    else:
+                        candidates.append(s)
+                else:
+                    candidates.append(s)
+            except Exception:
+                continue
+
+        # Test candidate symbols to verify exact placement point count
+        for sym in candidates:
+            test_inst = None
+            try:
+                if not sym.IsActive:
+                    sym.Activate()
+                test_inst = DB.AdaptiveComponentInstanceUtils.CreateAdaptiveComponentInstance(self.doc, sym)
+                pt_elem_ids = DB.AdaptiveComponentInstanceUtils.GetPlacementPointElementIds(test_inst)
+                pt_count = len(pt_elem_ids) if pt_elem_ids else 0
+                self.doc.Delete(test_inst.Id)
+                test_inst = None
+
+                if pt_count == num_pts:
+                    if not requested_clean:
+                        self.adaptive_family_cache[num_pts] = sym.Id
+                    return sym
+            except Exception:
+                if test_inst:
+                    try:
+                        self.doc.Delete(test_inst.Id)
+                    except Exception:
+                        pass
+                continue
+
+        return None
+
     def _pipeline_8a_adaptive_component(self, scanned_obj, geom_feet, level_id, profile_rule, res):
-        """Places multi-point Adaptive Component instances (panels, space frames, diagrids)."""
+        """Places multi-point Adaptive Component instances with strict point count validation."""
         pts_rhino = getattr(scanned_obj, "adaptive_points", [])
         num_pts = len(pts_rhino)
         if num_pts not in (2, 3, 4):
@@ -501,60 +564,58 @@ class ConversionRouter(object):
         scale = self.unit_scale
         pts_feet = [DB.XYZ(p[0] * scale, p[1] * scale, p[2] * scale) for p in pts_rhino]
 
-        # Locate matching loaded Adaptive FamilySymbol
-        target_sym = None
         requested_type = profile_rule.revit_type if (profile_rule and profile_rule.revit_type) else ""
+        target_sym = self._find_adaptive_symbol_with_point_count(num_pts, requested_type)
 
-        if requested_type:
-            collector = DB.FilteredElementCollector(self.doc).OfClass(DB.FamilySymbol)
-            for s in collector:
-                try:
-                    if s.Name == requested_type or s.FamilyName == requested_type:
-                        if hasattr(DB, "AdaptiveComponentInstanceUtils") and DB.AdaptiveComponentInstanceUtils.IsAdaptiveFamily(s.Family):
-                            target_sym = s
-                            break
-                except Exception:
-                    continue
-
-        if not target_sym and num_pts in self.adaptive_family_cache:
-            target_sym = self.adaptive_family_cache[num_pts]
-
-        if not target_sym and hasattr(DB, "AdaptiveComponentInstanceUtils"):
-            collector = DB.FilteredElementCollector(self.doc).OfClass(DB.FamilySymbol)
-            for s in collector:
-                try:
-                    if DB.AdaptiveComponentInstanceUtils.IsAdaptiveFamily(s.Family):
-                        target_sym = s
-                        self.adaptive_family_cache[num_pts] = s
-                        break
-                except Exception:
-                    continue
-
-        # If adaptive family found, instantiate and set placement point positions
         if target_sym and hasattr(DB, "AdaptiveComponentInstanceUtils"):
             try:
                 if not target_sym.IsActive:
                     target_sym.Activate()
                 inst = DB.AdaptiveComponentInstanceUtils.CreateAdaptiveComponentInstance(self.doc, target_sym)
                 pt_elem_ids = DB.AdaptiveComponentInstanceUtils.GetPlacementPointElementIds(inst)
-                for idx, pid in enumerate(pt_elem_ids):
-                    if idx < len(pts_feet):
+
+                if len(pt_elem_ids) == num_pts:
+                    for idx, pid in enumerate(pt_elem_ids):
                         pt_elem = self.doc.GetElement(pid)
                         if pt_elem and hasattr(pt_elem, "Position"):
                             pt_elem.Position = pts_feet[idx]
-                return inst
+                    return inst
+                else:
+                    self.doc.Delete(inst.Id)
+                    res.warnings.append("Adaptive Family '{}' point count mismatch ({} in family vs {} required).".format(
+                        target_sym.Name, len(pt_elem_ids), num_pts
+                    ))
             except Exception as ex:
-                res.warnings.append("AdaptiveComponentInstance placement notice: {}. Falling back to shared DirectShape.".format(ex))
+                res.warnings.append("AdaptiveComponentInstance placement notice: {}. Falling back to DirectShape.".format(ex))
 
-        # Safe fallback if no adaptive family is loaded: place as lightweight repetitive DirectShape
+        # Safe fallback if no matching adaptive family is loaded
         res.warnings.append("No {}-point Adaptive Family loaded in project. Transferred via DirectShape.".format(num_pts))
-        return self._pipeline_8b_repetitive_family(scanned_obj, geom_feet, level_id, profile_rule, res)
+        return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=DB.ElementId(DB.BuiltInCategory.OST_GenericModel))
 
     # =========================================================================
     # PIPELINE 8B: Repetitive Family Instancing (Blocks & Repeated Signatures)
     # =========================================================================
+    def _rhino_xform_to_revit_transform(self, xform):
+        """Converts a Rhino.Geometry.Transform into an Autodesk.Revit.DB.Transform."""
+        if not REVIT_AVAILABLE or not xform:
+            return None
+        try:
+            scale = self.unit_scale
+            tf = DB.Transform.Identity
+            tf.Origin = DB.XYZ(xform.M03 * scale, xform.M13 * scale, xform.M23 * scale)
+            tf.BasisX = DB.XYZ(xform.M00, xform.M10, xform.M20)
+            tf.BasisY = DB.XYZ(xform.M01, xform.M11, xform.M21)
+            tf.BasisZ = DB.XYZ(xform.M02, xform.M12, xform.M22)
+            return tf
+        except Exception:
+            return None
+
     def _pipeline_8b_repetitive_family(self, scanned_obj, geom_feet, level_id, profile_rule, res):
-        """Creates a shared reusable DirectShapeType definition and places transformed instances."""
+        """Creates a shared reusable DirectShapeType definition and places transformed instances.
+        
+        Guarantees that rotated loose copies preserve their exact world-space orientation by
+        routing to standard DirectShape whenever orientation differs from canonical definition.
+        """
         cat_id = DB.ElementId(DB.BuiltInCategory.OST_GenericModel)
         if profile_rule and profile_rule.revit_category:
             cat_id = self._category_str_to_id(profile_rule.revit_category)
@@ -564,6 +625,7 @@ class ConversionRouter(object):
             return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=cat_id)
 
         type_key = "R2R_" + re.sub(r'[^a-zA-Z0-9_]+', '_', sig)[:45]
+        is_block = (scanned_obj.object_type == "InstanceReference")
 
         # Try Revit DirectShapeType + DirectShapeLibrary instancing
         try:
@@ -576,7 +638,7 @@ class ConversionRouter(object):
                     type_id = self.repetitive_type_cache[type_key]
 
                 if not type_id:
-                    # Canonical geometry: translate object to local origin (0, 0, 0)
+                    # Canonical definition: local origin (0, 0, 0)
                     cx = scanned_obj.centroid[0] * self.unit_scale
                     cy = scanned_obj.centroid[1] * self.unit_scale
                     cz = scanned_obj.centroid[2] * self.unit_scale
@@ -590,8 +652,38 @@ class ConversionRouter(object):
                         lib.AddDefinitionType(type_key, dst.Id)
                         type_id = dst.Id
                         self.repetitive_type_cache[type_key] = type_id
+                        self.canonical_repetition_cache[type_key] = (scanned_obj.dx, scanned_obj.dy, scanned_obj.dz)
 
                 if type_id:
+                    # Case 1: Block Instance with full 3D Transform
+                    if is_block and getattr(scanned_obj, "instance_transform", None):
+                        tf = self._rhino_xform_to_revit_transform(scanned_obj.instance_transform)
+                        if tf:
+                            inst = DB.DirectShape.CreateElementInstance(self.doc, type_id, cat_id, type_key, tf)
+                            return inst
+
+                    # Case 2: Loose geometry - verify that orientation matches canonical baseline
+                    canon_dims = self.canonical_repetition_cache.get(type_key)
+                    if canon_dims:
+                        # Check if bounding dimensions match within tolerance (pure translation)
+                        is_pure_translation = (
+                            abs(scanned_obj.dx - canon_dims[0]) < 0.05 and
+                            abs(scanned_obj.dy - canon_dims[1]) < 0.05 and
+                            abs(scanned_obj.dz - canon_dims[2]) < 0.05
+                        )
+                        if is_pure_translation:
+                            cx = scanned_obj.centroid[0] * self.unit_scale
+                            cy = scanned_obj.centroid[1] * self.unit_scale
+                            cz = scanned_obj.centroid[2] * self.unit_scale
+                            tf = DB.Transform.CreateTranslation(DB.XYZ(cx, cy, cz))
+                            inst = DB.DirectShape.CreateElementInstance(self.doc, type_id, cat_id, type_key, tf)
+                            return inst
+                        else:
+                            # Orientation differs: fall back to DirectShape to guarantee exact world rotation
+                            res.warnings.append("Loose copy has distinct spatial orientation. Placed via DirectShape to preserve rotation.")
+                            return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=cat_id)
+
+                    # Default translation placement if no baseline check was needed
                     cx = scanned_obj.centroid[0] * self.unit_scale
                     cy = scanned_obj.centroid[1] * self.unit_scale
                     cz = scanned_obj.centroid[2] * self.unit_scale
@@ -601,10 +693,11 @@ class ConversionRouter(object):
                         tf = tf.Multiply(rot)
                     inst = DB.DirectShape.CreateElementInstance(self.doc, type_id, cat_id, type_key, tf)
                     return inst
+
         except Exception as ex:
             res.warnings.append("Repetitive DirectShapeType notice: {}. Using standard DirectShape.".format(ex))
 
-        # DirectShape fallback
+        # DirectShape fallback (preserves exact world-space geometry and rotation)
         return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=cat_id)
 
     # =========================================================================
@@ -614,6 +707,7 @@ class ConversionRouter(object):
         """Places a loadable FamilyInstance and sets dimensional parameters (Width, Depth, Height)."""
         cat_str = profile_rule.revit_category if (profile_rule and profile_rule.revit_category) else "OST_GenericModel"
         requested_type = profile_rule.revit_type if (profile_rule and profile_rule.revit_type) else ""
+        target_cat_id = self._category_str_to_id(cat_str)
 
         target_sym = None
         collector = DB.FilteredElementCollector(self.doc).OfClass(DB.FamilySymbol)
@@ -622,7 +716,7 @@ class ConversionRouter(object):
                 if requested_type and (s.Name == requested_type or s.FamilyName == requested_type):
                     target_sym = s
                     break
-                if not requested_type and s.Category and s.Category.Name and cat_str.replace("OST_", "").lower() in s.Category.Name.lower():
+                if not requested_type and s.Category and s.Category.Id == target_cat_id:
                     target_sym = s
                     break
             except Exception:
@@ -644,12 +738,22 @@ class ConversionRouter(object):
                     axis = DB.Line.CreateBound(pt, DB.XYZ(pt.X, pt.Y, pt.Z + 1.0))
                     DB.ElementTransformUtils.RotateElement(self.doc, inst.Id, axis, scanned_obj.rotation_angle)
 
-                # Drive instance dimensional parameters
+                # Drive instance/type dimensional parameters with multilingual aliases
                 dims = getattr(scanned_obj, "parametric_dims", {})
-                for p_name, p_val in dims.items():
+                param_aliases = {
+                    "Width": ["Width", "b", "w", "Ancho", "Anchura", "Amplada"],
+                    "Depth": ["Depth", "d", "Largo", "Profundidad", "Profunditat", "Length"],
+                    "Height": ["Height", "h", "H", "Altura", "Alto", "Alçada"],
+                    "Length": ["Length", "Longitud", "L"],
+                    "Thickness": ["Thickness", "Espesor", "Grosor", "Gruix", "t"]
+                }
+                for dim_key, p_val in dims.items():
                     val_feet = p_val * self.unit_scale
-                    for alias in [p_name, p_name.lower(), p_name.capitalize()]:
+                    aliases = param_aliases.get(dim_key, [dim_key])
+                    for alias in aliases:
                         param = inst.LookupParameter(alias)
+                        if not param:
+                            param = target_sym.LookupParameter(alias)
                         if param and not param.IsReadOnly and param.StorageType == DB.StorageType.Double:
                             try:
                                 param.Set(val_feet)
@@ -658,10 +762,10 @@ class ConversionRouter(object):
                                 pass
                 return inst
             except Exception as ex:
-                res.warnings.append("ParametricFamily placement notice: {}. Falling back to repetitive family.".format(ex))
+                res.warnings.append("ParametricFamily placement notice: {}. Falling back to DirectShape.".format(ex))
 
-        # Fallback to repetitive or direct shape
-        return self._pipeline_8b_repetitive_family(scanned_obj, geom_feet, level_id, profile_rule, res)
+        # Fallback to direct shape if no suitable family is loaded
+        return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=target_cat_id)
 
     # =========================================================================
     # PIPELINE 8: Generic Family Delegator
