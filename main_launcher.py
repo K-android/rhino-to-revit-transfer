@@ -123,12 +123,8 @@ def launch_transfer(revit_doc=None, revit_uidoc=None):
         try:
             dialog.ShowModal()
         except Exception:
-            try:
-                # Fallback to modeless show
-                dialog.Show()
-            except Exception:
-                import traceback
-                print("[R2R Transfer] Dialog presentation notice: {}".format(traceback.format_exc()))
+            import traceback
+            print("[R2R Transfer] Dialog presentation notice:\n{}".format(traceback.format_exc()))
 
     return dialog
 

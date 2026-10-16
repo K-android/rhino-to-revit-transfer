@@ -13,33 +13,50 @@ set "LIB_DIR=%EXT_DIR%\lib"
 set "BUTTON_DIR=%EXT_DIR%\R2R.tab\Transfer.panel\OneClick.pushbutton"
 set "SCRIPT_FILE=%BUTTON_DIR%\script.py"
 set "BUNDLE_YAML=%BUTTON_DIR%\bundle.yaml"
-pushd "%~dp0.." && set "PKG_DIR=%CD%" && popd
 
-if not exist "%APPDATA%\pyRevit" (
-    echo [ERROR] pyRevit installation not found at %APPDATA%\pyRevit
+rem Canonical package directory resolution
+for %%I in ("%~dp0..") do set "PKG_DIR=%%~fI"
+if not exist "%PKG_DIR%\main_launcher.py" (
+    for %%I in ("%~dp0.") do set "PKG_DIR=%%~fI"
+)
+
+if not exist "%PKG_DIR%\main_launcher.py" (
+    echo [ERROR] Could not locate R2R source files in:
+    echo   %PKG_DIR%
+    echo Please make sure install_pyrevit.bat is inside the 'installer' subfolder
+    echo of the rhino-to-revit-transfer repository.
     pause
     exit /b 1
 )
 
-echo Creating pyRevit extension and lib directories...
+if not exist "%APPDATA%\pyRevit" (
+    echo [ERROR] pyRevit installation not found at %APPDATA%\pyRevit
+    echo Please ensure pyRevit is installed before running this installer.
+    pause
+    exit /b 1
+)
+
+echo Source Directory: "%PKG_DIR%"
+echo Target Extension: "%EXT_DIR%"
+echo Target Library:   "%LIB_DIR%"
+echo.
+
+echo Creating pyRevit extension directories...
+if not exist "%EXT_DIR%" mkdir "%EXT_DIR%" >nul 2>&1
 if not exist "%LIB_DIR%" mkdir "%LIB_DIR%" >nul 2>&1
 if not exist "%BUTTON_DIR%" mkdir "%BUTTON_DIR%" >nul 2>&1
 
-echo Copying R2R core library and profile data into %LIB_DIR%...
-copy /Y "%PKG_DIR%\__init__.py" "%LIB_DIR%\" >nul 2>&1
-copy /Y "%PKG_DIR%\scanner.py" "%LIB_DIR%\" >nul 2>&1
-copy /Y "%PKG_DIR%\classifier.py" "%LIB_DIR%\" >nul 2>&1
-copy /Y "%PKG_DIR%\ai_assistant.py" "%LIB_DIR%\" >nul 2>&1
-copy /Y "%PKG_DIR%\profile_manager.py" "%LIB_DIR%\" >nul 2>&1
-copy /Y "%PKG_DIR%\conversion_router.py" "%LIB_DIR%\" >nul 2>&1
-copy /Y "%PKG_DIR%\graphics_validator.py" "%LIB_DIR%\" >nul 2>&1
-copy /Y "%PKG_DIR%\sync_engine.py" "%LIB_DIR%\" >nul 2>&1
-copy /Y "%PKG_DIR%\reporting.py" "%LIB_DIR%\" >nul 2>&1
-copy /Y "%PKG_DIR%\ui_dialog.py" "%LIB_DIR%\" >nul 2>&1
-copy /Y "%PKG_DIR%\main_launcher.py" "%LIB_DIR%\" >nul 2>&1
+echo.
+echo Copying R2R Python modules and profile data into lib folder...
+copy /Y "%PKG_DIR%\*.py" "%LIB_DIR%\"
 if exist "%PKG_DIR%\Transfer_Profile.json" (
-    copy /Y "%PKG_DIR%\Transfer_Profile.json" "%LIB_DIR%\" >nul 2>&1
+    copy /Y "%PKG_DIR%\Transfer_Profile.json" "%LIB_DIR%\"
 )
+
+echo.
+echo Verifying installed files in %LIB_DIR%:
+dir /b "%LIB_DIR%\*.py"
+echo.
 
 echo Generating pyRevit script launcher...
 (
@@ -49,8 +66,12 @@ echo Generating pyRevit script launcher...
     echo import os
     echo _this_dir = os.path.dirname^(os.path.abspath^(__file__^)^)
     echo lib_dir = os.path.normpath^(os.path.join^(_this_dir, '..', '..', '..', 'lib'^)^)
-    echo if lib_dir not in sys.path:
+    echo if os.path.exists^(lib_dir^) and lib_dir not in sys.path:
     echo     sys.path.insert^(0, lib_dir^)
+    echo pkg_fallback = r"%PKG_DIR%"
+    echo if not os.path.exists^(os.path.join^(lib_dir, 'main_launcher.py'^)^) and os.path.exists^(pkg_fallback^):
+    echo     if pkg_fallback not in sys.path:
+    echo         sys.path.insert^(0, pkg_fallback^)
     echo for _mod in ['scanner', 'classifier', 'ai_assistant', 'profile_manager', 'conversion_router', 'graphics_validator', 'sync_engine', 'reporting', 'ui_dialog', 'main_launcher']:
     echo     if _mod in sys.modules:
     echo         del sys.modules[_mod]

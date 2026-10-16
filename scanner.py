@@ -245,8 +245,16 @@ class RhinoScanner(object):
         total_height = max(1.0, max_doc_z - min_doc_z) if valid_objs else 1.0
 
         for obj in valid_objs:
-            scanned = self._process_rhino_object(obj, scale_to_m, revit_levels, min_doc_z, total_height)
-            if not scanned:
+            try:
+                scanned = self._process_rhino_object(obj, scale_to_m, revit_levels, min_doc_z, total_height)
+                if not scanned:
+                    continue
+            except Exception as ex_obj:
+                try:
+                    obj_id = str(obj.Id) if hasattr(obj, 'Id') else "Unknown"
+                except Exception:
+                    obj_id = "Unknown"
+                self.preflight.warnings.append("Notice: Skipped object {}: {}".format(obj_id, ex_obj))
                 continue
 
             # Duplicate detection based on deterministic geometry hash
@@ -384,64 +392,91 @@ class RhinoScanner(object):
             working_brep = geom.ToBrep()
 
         if working_brep:
-            scanned.is_closed = working_brep.IsSolid
+            scanned.is_closed = bool(working_brep.IsSolid)
             # Approximate volume and area
-            mp = rg.MassProperties.Compute(working_brep)
-            if mp:
-                scanned.area = round(mp.Area, 3)
-                scanned.volume = round(mp.Volume, 3) if working_brep.IsSolid else 0.0
+            try:
+                mp = rg.MassProperties.Compute(working_brep)
+                if mp:
+                    scanned.area = round(mp.Area, 3)
+                    scanned.volume = round(mp.Volume, 3) if working_brep.IsSolid else 0.0
+            except Exception:
+                scanned.area = 0.0
+                scanned.volume = 0.0
 
             # Orientation analysis: inspect face normals
             horiz_face_count = 0
             vert_face_count = 0
-            face_count = working_brep.Faces.Count
+            face_count = 0
+            try:
+                face_count = working_brep.Faces.Count
+                for face in working_brep.Faces:
+                    # Sample center uv normal
+                    u_mid = 0.5 * (face.Domain(0).Min + face.Domain(0).Max)
+                    v_mid = 0.5 * (face.Domain(1).Min + face.Domain(1).Max)
+                    normal = face.NormalAt(u_mid, v_mid)
+                    normal.Unitize()
 
-            for face in working_brep.Faces:
-                # Sample center uv normal
-                u_mid = 0.5 * (face.Domain(0).Min + face.Domain(0).Max)
-                v_mid = 0.5 * (face.Domain(1).Min + face.Domain(1).Max)
-                normal = face.NormalAt(u_mid, v_mid)
-                normal.Unitize()
-
-                # Parallel to World Z (Horizontal plane)
-                if abs(normal.Z) > 0.95:
-                    horiz_face_count += 1
-                # Perpendicular to World Z (Vertical wall)
-                elif abs(normal.Z) < 0.05:
-                    vert_face_count += 1
+                    # Parallel to World Z (Horizontal plane)
+                    if abs(normal.Z) > 0.95:
+                        horiz_face_count += 1
+                    # Perpendicular to World Z (Vertical wall)
+                    elif abs(normal.Z) < 0.05:
+                        vert_face_count += 1
+            except Exception:
+                pass
 
             if face_count > 0:
                 scanned.is_horizontal = (horiz_face_count / float(face_count)) > 0.3 or (scanned.dz < min(scanned.dx, scanned.dy) * 0.4 and horiz_face_count >= 1)
                 scanned.is_vertical = (vert_face_count / float(face_count)) > 0.3 or (scanned.dz >= 1.5 and vert_face_count >= 1)
 
             # Planarity check
-            scanned.is_planar = working_brep.Faces.Count == 1 and working_brep.Faces[0].IsPlanar(0.01)
+            try:
+                scanned.is_planar = working_brep.Faces.Count == 1 and working_brep.Faces[0].IsPlanar(0.01)
+            except Exception:
+                scanned.is_planar = False
 
             # Loop count (outer + inner holes)
             total_loops = 0
-            for face in working_brep.Faces:
-                total_loops += face.Loops.Count
+            try:
+                for face in working_brep.Faces:
+                    total_loops += face.Loops.Count
+            except Exception:
+                pass
             scanned.loop_count = total_loops
 
             # Thickness estimate
             sorted_dims = sorted([scanned.dx, scanned.dy, scanned.dz])
             scanned.thickness = sorted_dims[0]
 
-            if not scanned.is_closed and (scanned.volume > 0 or working_brep.Faces.Count > 1):
+            if not scanned.is_closed and (scanned.volume > 0 or face_count > 1):
                 scanned.has_open_loops = True
                 scanned.preflight_warnings.append("Non-manifold or open Brep edges detected.")
 
         elif isinstance(geom, rg.Mesh):
-            scanned.is_closed = geom.IsClosed
+            scanned.is_closed = bool(geom.IsClosed)
             scanned.is_planar = False
-            scanned.area = round(rg.AreaMassProperties.Compute(geom).Area if rg.AreaMassProperties.Compute(geom) else 0.0, 3)
-            scanned.volume = round(rg.VolumeMassProperties.Compute(geom).Volume if (geom.IsClosed and rg.VolumeMassProperties.Compute(geom)) else 0.0, 3)
+            try:
+                amp = rg.AreaMassProperties.Compute(geom)
+                scanned.area = round(amp.Area, 3) if amp else 0.0
+            except Exception:
+                scanned.area = 0.0
+            try:
+                if geom.IsClosed:
+                    vmp = rg.VolumeMassProperties.Compute(geom)
+                    scanned.volume = round(vmp.Volume, 3) if vmp else 0.0
+                else:
+                    scanned.volume = 0.0
+            except Exception:
+                scanned.volume = 0.0
             scanned.thickness = min(scanned.dx, scanned.dy, scanned.dz)
             scanned.repetition_signature = "Mesh_V{}_F{}".format(geom.Vertices.Count, geom.Faces.Count)
 
         elif isinstance(geom, rg.Curve):
-            scanned.is_closed = geom.IsClosed
-            scanned.is_planar = geom.IsPlanar(0.001)
+            scanned.is_closed = bool(geom.IsClosed)
+            try:
+                scanned.is_planar = bool(geom.IsPlanar(0.001))
+            except Exception:
+                scanned.is_planar = False
             scanned.loop_count = 1 if geom.IsClosed else 0
             scanned.area = 0.0
             scanned.volume = 0.0

@@ -164,6 +164,22 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         except Exception:
             self.Close()
 
+    def Show(self, parent=None):
+        """Presents dialog modally across all Rhino / Revit environments."""
+        try:
+            if parent is not None:
+                return self.ShowModal(parent)
+            import Rhino.UI as rui
+            if hasattr(rui, 'RhinoEtoApp') and hasattr(rui.RhinoEtoApp, 'MainWindow') and rui.RhinoEtoApp.MainWindow:
+                return self.ShowModal(rui.RhinoEtoApp.MainWindow)
+        except Exception:
+            pass
+        return self.ShowModal()
+
+    def show(self, parent=None):
+        """Lowercase alias for Show / ShowModal compatibility."""
+        return self.Show(parent)
+
     def _init_ui(self):
         """Constructs layout, header tabs, and stage views."""
         layout = ef.DynamicLayout()
@@ -651,58 +667,78 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
     # =========================================================================
     def _on_scan_clicked(self, sender, e):
         """Executes full scan of active Rhino document and updates UI."""
-        self.lbl_global_status.Text = "Scanning Rhino document..."
+        try:
+            self.lbl_global_status.Text = "Scanning Rhino document..."
 
-        # Query Revit Levels if doc is available
-        revit_levels = []
-        if REVIT_AVAILABLE and self.revit_doc:
-            collector = DB.FilteredElementCollector(self.revit_doc).OfClass(DB.Level)
-            # Unit scale from feet to Rhino units
-            scale_from_ft = 1.0 / self.scanner.get_unit_scale_to_meters() * 0.3048
-            for lvl in collector:
-                revit_levels.append({
-                    "name": lvl.Name,
-                    "elevation": lvl.Elevation * scale_from_ft
-                })
+            # Query Revit Levels if doc is available
+            revit_levels = []
+            if REVIT_AVAILABLE and self.revit_doc:
+                try:
+                    collector = DB.FilteredElementCollector(self.revit_doc).OfClass(DB.Level)
+                    scale_to_m = self.scanner.get_unit_scale_to_meters()
+                    scale_from_ft = (1.0 / scale_to_m * 0.3048) if scale_to_m > 0 else 1.0
+                    for lvl in collector:
+                        try:
+                            revit_levels.append({
+                                "name": str(lvl.Name),
+                                "elevation": float(lvl.Elevation) * scale_from_ft
+                            })
+                        except Exception:
+                            continue
+                except Exception as ex_lvl:
+                    print("[R2R Scan] Level query notice: {}".format(ex_lvl))
 
-        include_hidden = self.chk_include_hidden.Checked or False
-        include_locked = self.chk_include_locked.Checked or False
+            include_hidden = self.chk_include_hidden.Checked or False
+            include_locked = self.chk_include_locked.Checked or False
 
-        self.scanned_objects = self.scanner.scan_all(
-            include_hidden=include_hidden,
-            include_locked=include_locked,
-            revit_levels=revit_levels
-        )
+            self.scanned_objects = self.scanner.scan_all(
+                include_hidden=include_hidden,
+                include_locked=include_locked,
+                revit_levels=revit_levels
+            )
 
-        pf = self.scanner.preflight
-        self.lbl_kpi_total.Text = "Total Scanned Objects: {}".format(pf.total_scanned)
-        self.lbl_kpi_units.Text = "Rhino Units: {} (Scale to m: {:.4f})".format(pf.rhino_unit_system, pf.unit_scale_to_meters)
-        self.lbl_kpi_origin.Text = "Far From Origin (>16km): {}".format(pf.total_far_from_origin)
-        self.lbl_kpi_duplicates.Text = "Duplicates Detected: {}".format(pf.total_duplicates)
-        self.lbl_kpi_loops.Text = "Non-Closed Boundary Loops: {}".format(pf.total_non_closed_loops)
+            pf = self.scanner.preflight
+            self.lbl_kpi_total.Text = "Total Scanned Objects: {}".format(pf.total_scanned)
+            self.lbl_kpi_units.Text = "Rhino Units: {} (Scale to m: {:.4f})".format(pf.rhino_unit_system, pf.unit_scale_to_meters)
+            self.lbl_kpi_origin.Text = "Far From Origin (>16km): {}".format(pf.total_far_from_origin)
+            self.lbl_kpi_duplicates.Text = "Duplicates Detected: {}".format(pf.total_duplicates)
+            self.lbl_kpi_loops.Text = "Non-Closed Boundary Loops: {}".format(pf.total_non_closed_loops)
 
-        # Warnings display
-        warn_text = []
-        if pf.total_duplicates > 0:
-            warn_text.append("[WARNING] Found {} duplicate objects with identical geometry hashes.".format(pf.total_duplicates))
-        if pf.total_far_from_origin > 0:
-            warn_text.append("[CAUTION] Found {} objects beyond Revit's 16km origin boundary limit.".format(pf.total_far_from_origin))
-        if pf.total_non_closed_loops > 0:
-            warn_text.append("[NOTICE] Found {} objects with non-closed boundary loops.".format(pf.total_non_closed_loops))
+            # Warnings display
+            warn_text = []
+            if pf.total_duplicates > 0:
+                warn_text.append("[WARNING] Found {} duplicate objects with identical geometry hashes.".format(pf.total_duplicates))
+            if pf.total_far_from_origin > 0:
+                warn_text.append("[CAUTION] Found {} objects beyond Revit's 16km origin boundary limit.".format(pf.total_far_from_origin))
+            if pf.total_non_closed_loops > 0:
+                warn_text.append("[NOTICE] Found {} objects with non-closed boundary loops.".format(pf.total_non_closed_loops))
+            if getattr(pf, 'warnings', None):
+                warn_text.extend(pf.warnings)
 
-        self.txt_scan_warnings.Text = "\n".join(warn_text) if warn_text else "Preflight clean. No geometric anomalies detected."
+            self.txt_scan_warnings.Text = "\n".join(warn_text) if warn_text else "Preflight clean. No geometric anomalies detected."
 
-        # Run Classification & Sync Evaluation
-        self._run_classification_and_sync()
+            # Run Classification & Sync Evaluation
+            self._run_classification_and_sync()
 
-        # Populate Review Grid
-        self._populate_review_grid()
+            # Populate Review Grid
+            self._populate_review_grid()
 
-        # Update Preview Tab KPIs
-        self._update_preview_kpis()
+            # Update Preview Tab KPIs
+            self._update_preview_kpis()
 
-        self.lbl_global_status.Text = "Scan complete. {} objects ready for review.".format(len(self.scanned_objects))
-        self.tabs.SelectedIndex = 1  # Move to Review tab
+            self.lbl_global_status.Text = "Scan complete. {} objects ready for review.".format(len(self.scanned_objects))
+            self.tabs.SelectedIndex = 1  # Move to Review tab
+
+        except Exception as ex:
+            import traceback
+            err_details = traceback.format_exc()
+            print("[R2R Scan Error]:\n" + err_details)
+            self.lbl_global_status.Text = "Scan error: {}".format(ex)
+            self.txt_scan_warnings.Text = "Scan Exception:\n{}\n{}".format(ex, err_details)
+            try:
+                ef.MessageBox.Show("Scan encountered an error:\n{}\n\nSee warnings tab for details.".format(ex), "R2R Scan Notice")
+            except Exception:
+                pass
 
     def _run_classification_and_sync(self):
         """Runs classifier and sync engine on scanned objects."""
