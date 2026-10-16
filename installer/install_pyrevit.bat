@@ -47,10 +47,17 @@ if not exist "%LIB_DIR%" mkdir "%LIB_DIR%" >nul 2>&1
 if not exist "%BUTTON_DIR%" mkdir "%BUTTON_DIR%" >nul 2>&1
 
 echo.
-echo Copying R2R Python modules and profile data into lib folder...
-copy /Y "%PKG_DIR%\*.py" "%LIB_DIR%\"
+echo Copying R2R Python modules into extension library...
+copy /Y "%PKG_DIR%\*.py" "%LIB_DIR%\" >nul
+if exist "%LIB_DIR%\test_pipeline.py" del /f /q "%LIB_DIR%\test_pipeline.py" >nul 2>&1
+if exist "%LIB_DIR%\Transfer_Profile.json" del /f /q "%LIB_DIR%\Transfer_Profile.json" >nul 2>&1
+
+set "USER_R2R_DATA=%APPDATA%\pyRevit\R2R"
+if not exist "%USER_R2R_DATA%" mkdir "%USER_R2R_DATA%" >nul 2>&1
 if exist "%PKG_DIR%\Transfer_Profile.json" (
-    copy /Y "%PKG_DIR%\Transfer_Profile.json" "%LIB_DIR%\"
+    if not exist "%USER_R2R_DATA%\Transfer_Profile.json" (
+        copy /Y "%PKG_DIR%\Transfer_Profile.json" "%USER_R2R_DATA%\" >nul
+    )
 )
 
 echo.

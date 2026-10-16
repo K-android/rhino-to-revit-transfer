@@ -79,8 +79,29 @@ class ProfileManager(object):
         if profile_path:
             self.profile_path = profile_path
         else:
+            # Dedicated user config path outside the .extension directory
+            # Prevents touching .extension files, keeping pyRevit binary cache 100% valid
+            appdata_root = os.environ.get("APPDATA") or os.path.expanduser("~")
+            user_config_dir = os.path.join(appdata_root, "pyRevit", "R2R")
+            user_profile = os.path.join(user_config_dir, self.DEFAULT_PROFILE_NAME)
+
+            # Bundled profile shipping with modules
             module_dir = os.path.dirname(os.path.abspath(__file__))
-            self.profile_path = os.path.join(module_dir, self.DEFAULT_PROFILE_NAME)
+            bundled_profile = os.path.join(module_dir, self.DEFAULT_PROFILE_NAME)
+
+            if os.path.exists(user_profile):
+                self.profile_path = user_profile
+            elif os.path.exists(bundled_profile):
+                self.profile_path = user_profile
+                try:
+                    if not os.path.exists(user_config_dir):
+                        os.makedirs(user_config_dir)
+                    import shutil
+                    shutil.copyfile(bundled_profile, user_profile)
+                except Exception:
+                    self.profile_path = bundled_profile
+            else:
+                self.profile_path = user_profile
 
         self.rules = []
         self.metadata = {
@@ -221,6 +242,9 @@ class ProfileManager(object):
             "rules": [r.to_dict() for r in self.rules]
         }
         try:
+            dest_dir = os.path.dirname(os.path.abspath(dest))
+            if not os.path.exists(dest_dir):
+                os.makedirs(dest_dir)
             with open(dest, "w") as f:
                 json.dump(payload, f, indent=2)
             return True
