@@ -85,7 +85,7 @@ echo   Library Folder : %LIB_DIR%
 echo   Ribbon Button  : %BUTTON_DIR%
 echo.
 echo How to use:
-echo   1. Launch Autodesk Revit (or click pyRevit -> Reload).
+echo   1. Launch Autodesk Revit ^(or click pyRevit -^> Reload^).
 echo   2. You will see the 'R2R' ribbon tab!
 echo   3. Launch Rhino from the 'Rhino.Inside' ribbon tab.
 echo   4. Click 'One-Click Transfer' to open the transfer dashboard!
