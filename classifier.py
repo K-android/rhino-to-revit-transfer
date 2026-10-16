@@ -89,7 +89,7 @@ class AecClassifier(object):
             re.IGNORECASE
         ),
         "Family": re.compile(
-            r"\b(block|col|pilar|column|mullion|montante|door|puerta|window|ventana|furniture|module|porta|finestra|mobiliari|columna|pilars|portes|finestres|carpinteria|fusteria)\b",
+            r"\b(block|blocks|col|cols|pilar|pilars|column|columns|mullion|mullions|montante|montantes|door|doors|puerta|puertas|window|windows|ventana|ventanas|furniture|module|modules|porta|portes|finestra|finestres|mobiliari|columna|columnes|carpinteria|fusteria)\b",
             re.IGNORECASE
         ),
         "DirectShape": re.compile(
@@ -107,11 +107,13 @@ class AecClassifier(object):
         "DirectShape": "OST_GenericModel"
     }
 
-    def __init__(self, mode="Hybrid"):
+    def __init__(self, mode="Hybrid", repetition_threshold=3):
         """
         :param mode: Global execution mode ("Native BIM", "Hybrid", "Geometry-First")
+        :param repetition_threshold: Minimum repeated elements to qualify for RepetitiveFamily instancing
         """
         self.mode = mode
+        self.repetition_threshold = repetition_threshold
         self.signature_counts = {}
 
     def prepare_repetition_cache(self, scanned_objects):
@@ -251,11 +253,20 @@ class AecClassifier(object):
             scores["Roofs"] = 0.70
             scores["Walls"] = 0.05
 
-        # 4. Vertical elements (Walls, Partitions)
-        # Typically dz >= 1.5m, thin thickness min(dx,dy) < 0.6m
+        # 4. Vertical elements (Walls, Partitions, Columns)
+        # Typically dz >= 1.5m
         min_horizontal_dim = min(obj.dx, obj.dy)
+        max_horizontal_dim = max(obj.dx, obj.dy)
         if obj.is_vertical or (obj.dz >= 1.5 and min_horizontal_dim <= 0.8):
-            scores["Walls"] = 0.95
+            aspect_ratio = max_horizontal_dim / max(min_horizontal_dim, 0.001)
+            if aspect_ratio <= 2.5 and max_horizontal_dim <= 1.5 and obj.dz >= 1.5:
+                # Compact vertical profile: Column / Post / Family
+                scores["Family"] = 0.95
+                scores["Walls"] = 0.20
+            else:
+                # Elongated vertical profile: Wall / Partition
+                scores["Walls"] = 0.95
+                scores["Family"] = 0.10
             scores["Floors"] = 0.05
             scores["Ceilings"] = 0.05
 
@@ -331,7 +342,14 @@ class AecClassifier(object):
             scores["Ceilings"] = 0.5
             scores["Roofs"] = 0.5
         elif obj.is_vertical:
-            scores["Walls"] = 0.8
+            min_horizontal_dim = min(obj.dx, obj.dy)
+            max_horizontal_dim = max(obj.dx, obj.dy)
+            aspect_ratio = max_horizontal_dim / max(min_horizontal_dim, 0.001)
+            if aspect_ratio <= 2.5 and max_horizontal_dim <= 1.5 and obj.dz >= 1.5:
+                scores["Family"] = 0.8
+                scores["Walls"] = 0.3
+            else:
+                scores["Walls"] = 0.8
 
         # Architectural Stainless Steel Veil / Screen
         if obj.building_zone == "Veil Envelope":
@@ -364,6 +382,22 @@ class AecClassifier(object):
 
     def _select_strategy(self, obj, category):
         """Selects the conversion strategy under the active Global Execution Mode."""
+        layer_lower = obj.layer_full_path.lower()
+
+        # 1. Adaptive Component candidate (3 or 4-point panels, 2-point struts)
+        adaptive_layer = any(k in layer_lower for k in ["panel", "adaptive", "diagrid", "facade", "screen", "veil", "curtain", "skin", "malla", "gelosia", "celosia"])
+        if obj.adaptive_point_count in (3, 4) and (adaptive_layer or category in ("DirectShape", "Family")):
+            return "AdaptiveComponent"
+        if obj.adaptive_point_count == 2 and any(k in layer_lower for k in ["strut", "truss", "bar", "mullion", "brace", "tirant"]):
+            return "AdaptiveComponent"
+
+        # 2. Repetitive Family candidate (Block Instance or 3+ repeated geometric signatures)
+        rep_count = getattr(obj, "repetition_count", 1) or self.signature_counts.get(obj.repetition_signature, 1)
+        thresh = getattr(self, "repetition_threshold", 3)
+        if obj.object_type == "InstanceReference" or rep_count >= thresh:
+            if category in ("Family", "DirectShape") and self.mode != "Geometry-First":
+                return "RepetitiveFamily"
+
         if self.mode == "Geometry-First":
             # DirectShape priority for maximum 3D fidelity
             if category == "Floors" and obj.is_horizontal and obj.is_closed:
@@ -394,7 +428,10 @@ class AecClassifier(object):
             return "CeilingNative"
 
         elif category == "Family":
-            return "FamilyInstance"
+            ref_cat = self._refine_family_category(obj)
+            if ref_cat in ("OST_Columns", "OST_StructuralColumns", "OST_Windows", "OST_Doors", "OST_Furniture"):
+                return "ParametricFamily"
+            return "RepetitiveFamily" if rep_count >= 2 else "FamilyInstance"
 
         elif category == "DirectShape":
             return "DirectShape"
@@ -404,6 +441,11 @@ class AecClassifier(object):
     def _build_explanation(self, result, obj):
         """Generates clear, human-readable rationale for the assigned classification."""
         reasons = []
+        if getattr(obj, "adaptive_point_count", 0) in (2, 3, 4):
+            reasons.append("{}-point adaptive boundary".format(obj.adaptive_point_count))
+        rep_count = getattr(obj, "repetition_count", 1) or self.signature_counts.get(obj.repetition_signature, 1)
+        if rep_count >= 2:
+            reasons.append("repeated module (count={})".format(rep_count))
         if result.score_breakdown["layer_name_score"] >= 20.0:
             reasons.append("layer/name keyword match")
         if result.score_breakdown["geometry_score"] >= 20.0:
@@ -415,8 +457,6 @@ class AecClassifier(object):
                 reasons.append("block instance reference")
         if result.score_breakdown["spatial_level_score"] >= 10.0:
             reasons.append("aligned with Level '{}' (dz={:.2f})".format(obj.nearest_level_name, obj.dz_to_level))
-        if result.score_breakdown["repetition_score"] >= 6.0:
-            reasons.append("repeated pattern (count={})".format(self.signature_counts.get(obj.repetition_signature, 1)))
 
         return "Inferred as {} ({:.1f}%) via: {}.".format(
             result.inferred_category,

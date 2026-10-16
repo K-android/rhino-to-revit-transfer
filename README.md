@@ -82,17 +82,19 @@ Computes an evidence-based classification score ($0\%$ to $100\%$) using weighte
 - $< 60\%$: `MANUAL_OR_EXCLUDED` (Red badge, routed to review queue)
 
 ### Stage 3: REVIEW & CONFIGURE (`ui_dialog.py` & `profile_manager.py`)
-- Eto.Forms DataGridView with search and multi-criteria filters (Category, Confidence Tier, Sync State).
+- Eto.Forms DataGridView with search, multi-criteria filters (Category, Confidence Tier, Sync State), and real-time **Pattern / Points** geometric signatures (`4-Pt Quad`, `3-Pt Tri`, `2-Pt Strut`, `Block: Name`, `Repetitive (Nx)`).
+- **Strategy Override Toolbar:** Allows instant bulk overriding of checked layers to `AdaptiveComponent`, `RepetitiveFamily`, `ParametricFamily`, `FloorNative`, `WallByCurve`, `RoofNative`, `FamilyInstance`, or `DirectShape`.
+- **Repetition Grouping Threshold:** Configurable cluster threshold (`>= 2`, `>= 3`, `>= 5`, `>= 10` identical geometries) to dynamically route repeated components to lightweight shared definitions.
 - Global Execution Mode Selector:
   - **Native BIM Mode:** Prioritizes native Revit elements (`Floor`, `Wall`, `Ceiling`, `Roof`).
-  - **Hybrid Mode (Recommended):** Native elements for orthogonal walls/floors, DirectShape for complex curved geometry and facade mesh panels.
+  - **Hybrid Mode (Recommended):** Native elements for orthogonal walls/floors, Adaptive Components for facade panels, DirectShape for complex organic surfaces.
   - **Geometry-First Mode:** DirectShape with assigned Category & Material for maximum 3D fidelity.
 - Auto-BUA / GFA Area Boundary Line generator toggle.
 - `Load Profile` and `Save Profile` to synchronize rule changes to `Transfer_Profile.json`.
 - `Run AI Semantic Assist` (`ai_assistant.py`) to parse ambiguous architectural layer names.
 
 ### Stage 4: TRANSFER (`conversion_router.py`)
-Dispatches across 10 RIR creation pipelines under a single `DB.TransactionGroup`:
+Dispatches across specialized RIR creation pipelines under a single `DB.TransactionGroup`:
 1. **Floors (Native Floor):** Extracts top horizontal face boundary and inner void/shaft loops into `DB.CurveLoop` $\rightarrow$ calls `DB.Floor.Create`. Automatically enables `Room Bounding = True` for BUA/GFA area calculations.
 2. **Floors by Host:** Sloped / faceted slab surfaces hosted or DirectShape with `OST_Floors`.
 3. **Walls by Curve:** Computes bottom centerline curve, height, snaps to base level $\rightarrow$ calls `DB.Wall.Create(doc, line, type, level, height, offset, flip, structural)`.
@@ -100,9 +102,11 @@ Dispatches across 10 RIR creation pipelines under a single `DB.TransactionGroup`
 5. **Ceilings (Native):** Horizontal perimeter curves $\rightarrow$ `DB.Ceiling.Create`.
 6. **Roofs (Native Footprint Roof):** Horizontal boundary curves $\rightarrow$ `doc.Create.NewFootPrintRoof`.
 7. **Roofs by Host / Face:** Freeform canopy DirectShape with `OST_Roofs`.
-8. **Family Creation & Placement:** Repeated Rhino blocks $\rightarrow$ instance placement using transformation plane (Origin, BasisX, BasisY, Rotation).
-9. **DirectShape Fallback:** Facade stainless-steel mesh, SubD, or complex Breps $\rightarrow$ `RhinoInside.Revit.Convert.Geometry.GeometryEncoder.ToGeometryObject` $\rightarrow$ `DB.DirectShape.CreateElement` with mapped Category, Subcategory, and Material.
-10. **Auto-BUA / GFA Area Plan Generator:** Ensures Revit Levels exist $\rightarrow$ locates or creates Area Scheme `BUA / GFA Assessment` $\rightarrow$ generates Area Plan view $\rightarrow$ projects closed outer boundary curves as `doc.Create.NewAreaBoundaryLine`.
+8. **Adaptive Components (Multi-Point Panels & Struts):** Extracts planar vertices, performs deterministic counter-clockwise winding ordering (starting bottom-left), and places native adaptive instances via `DB.AdaptiveComponentInstanceUtils.CreateAdaptiveComponentInstance`. Gracefully falls back to shared instancing if matching `.rfa` family is not pre-loaded.
+9. **Repetitive Family Instancing (Shared DirectShapeType):** For repeated geometry or Rhino block references, creates a single canonical definition in `DB.DirectShapeLibrary` as `DB.DirectShapeType` and places lightweight transformed instances via `DB.DirectShape.CreateElementInstance`. Saves over 90% Revit file size and memory.
+10. **Parametric Families (Dimension-Driven):** Places standard loadable `FamilySymbol` (columns, doors, windows, furniture) at centroid and rotation, driving instance parameters (`Width`, `Depth`, `Height`, `Length`, `Thickness`).
+11. **DirectShape Fallback:** Freeform double-curved meshes, SubD, or organic Breps $\rightarrow$ `RhinoInside.Revit.Convert.Geometry.GeometryEncoder.ToGeometryObject` $\rightarrow$ `DB.DirectShape.CreateElement` with mapped Category, Subcategory, and Material.
+12. **Auto-BUA / GFA Area Plan Generator:** Ensures Revit Levels exist $\rightarrow$ locates or creates Area Scheme `BUA / GFA Assessment` $\rightarrow$ generates Area Plan view $\rightarrow$ projects closed outer boundary curves as `doc.Create.NewAreaBoundaryLine`.
 
 **Warning Suppression:** Uses `TransferFailuresPreprocessor` (`IFailuresPreprocessor`) to delete non-fatal warnings (e.g. slightly off-axis lines, overlapping room separation lines) without modal dialog popups blocking execution.
 

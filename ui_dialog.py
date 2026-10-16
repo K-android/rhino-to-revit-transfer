@@ -66,13 +66,28 @@ class LayerRowItem(object):
         self.objects = objects  # list of ScannedObject
         self.object_count = len(objects)
         self.classification = classification  # ClassificationResult
-        self.inferred_category = classification.inferred_category
-        self.proposed_strategy = classification.proposed_strategy
-        self.revit_type = classification.revit_category_name
-        self.confidence_score = classification.confidence_score
-        self.confidence_tier = classification.confidence_tier
+        self.inferred_category = classification.inferred_category if classification else "Generic"
+        self.proposed_strategy = classification.proposed_strategy if classification else "DirectShape"
+        self.revit_type = classification.revit_category_name if classification else "OST_GenericModel"
+        self.confidence_score = classification.confidence_score if classification else 0.0
+        self.confidence_tier = classification.confidence_tier if classification else "MANUAL_OR_EXCLUDED"
         self.sync_state = sync_eval.sync_state if sync_eval else "CREATE"
         self.sync_eval = sync_eval
+
+        # Geometric pattern & adaptive summary tag
+        adaptive_cnt = sum(1 for o in objects if getattr(o, "adaptive_point_count", 0) in (2, 3, 4))
+        rep_cnt = max([getattr(o, "repetition_count", 1) for o in objects] + [1])
+        if adaptive_cnt > 0:
+            sample_pts = next((o.adaptive_point_count for o in objects if getattr(o, "adaptive_point_count", 0) in (2, 3, 4)), 4)
+            pt_desc = "4-Pt Quad" if sample_pts == 4 else ("3-Pt Tri" if sample_pts == 3 else "2-Pt Strut")
+            self.pattern_tag = "{} ({}x)".format(pt_desc, adaptive_cnt)
+        elif any(getattr(o, "object_type", "") == "InstanceReference" for o in objects):
+            blk_name = next((o.block_name for o in objects if getattr(o, "block_name", "")), "Block")
+            self.pattern_tag = "Block: {} ({}x)".format(blk_name[:12], len(objects))
+        elif rep_cnt >= 2:
+            self.pattern_tag = "Repetitive ({}x)".format(rep_cnt)
+        else:
+            self.pattern_tag = "Unique Mesh/Brep"
 
 
 class ValidationRowItem(object):
@@ -433,6 +448,52 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         layout.Add(opts_layout)
 
+        # Strategy Override & Repetition Toolbar
+        strat_layout = ef.DynamicLayout()
+        strat_layout.Spacing = ed.Size(8, 5)
+
+        lbl_strat_override = ef.Label()
+        lbl_strat_override.Text = "Override Strategy for Checked:"
+        lbl_strat_override.VerticalAlignment = ef.VerticalAlignment.Center
+
+        self.dd_strat_override = ef.DropDown()
+        self.dd_strat_override.Items.Add("AdaptiveComponent")
+        self.dd_strat_override.Items.Add("RepetitiveFamily")
+        self.dd_strat_override.Items.Add("ParametricFamily")
+        self.dd_strat_override.Items.Add("FloorNative")
+        self.dd_strat_override.Items.Add("WallByCurve")
+        self.dd_strat_override.Items.Add("RoofNative")
+        self.dd_strat_override.Items.Add("FamilyInstance")
+        self.dd_strat_override.Items.Add("DirectShape")
+        self.dd_strat_override.SelectedIndex = 0
+
+        btn_apply_strat = ef.Button()
+        btn_apply_strat.Text = "Apply Strategy"
+        btn_apply_strat.ToolTip = "Apply the selected strategy override to all currently checked layers"
+        btn_apply_strat.Click += self._on_apply_strategy_override
+
+        lbl_rep_thresh = ef.Label()
+        lbl_rep_thresh.Text = "Repetition Grouping:"
+        lbl_rep_thresh.VerticalAlignment = ef.VerticalAlignment.Center
+
+        self.dd_rep_threshold = ef.DropDown()
+        self.dd_rep_threshold.Items.Add(">= 2 identical")
+        self.dd_rep_threshold.Items.Add(">= 3 identical")
+        self.dd_rep_threshold.Items.Add(">= 5 identical")
+        self.dd_rep_threshold.Items.Add(">= 10 identical")
+        self.dd_rep_threshold.SelectedIndex = 1  # default >= 3 identical
+        self.dd_rep_threshold.SelectedIndexChanged += self._on_repetition_threshold_changed
+
+        strat_layout.BeginHorizontal()
+        strat_layout.Add(lbl_strat_override)
+        strat_layout.Add(self.dd_strat_override)
+        strat_layout.Add(btn_apply_strat)
+        strat_layout.Add(lbl_rep_thresh)
+        strat_layout.Add(self.dd_rep_threshold)
+        strat_layout.EndHorizontal()
+
+        layout.Add(strat_layout)
+
         # DataGridView
         self.grid_review = ef.GridView()
         self.grid_review.ShowHeader = True
@@ -497,6 +558,13 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         col_sync.DataCell = ef.TextBoxCell(7)
         col_sync.Width = 110
         self.grid_review.Columns.Add(col_sync)
+
+        # Pattern / Signature
+        col_pattern = ef.GridColumn()
+        col_pattern.HeaderText = "Pattern / Points"
+        col_pattern.DataCell = ef.TextBoxCell(8)
+        col_pattern.Width = 140
+        self.grid_review.Columns.Add(col_pattern)
 
         layout.Add(self.grid_review, True, True)
         return layout
@@ -832,7 +900,8 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 r.proposed_strategy,
                 r.revit_type,
                 "{:.0f}%".format(r.confidence_score),
-                r.sync_state
+                r.sync_state,
+                getattr(r, "pattern_tag", "-")
             ])
 
         self.grid_review.DataStore = grid_data
@@ -891,6 +960,47 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.lbl_prev_skip.Text = "Elements to SKIP (Unchanged Geometry): {}".format(cnt_skip)
         self.lbl_prev_review.Text = "Elements in REVIEW QUEUE (<60% Confidence): {}".format(cnt_review)
         self.lbl_prev_missing.Text = "Revit Elements MISSING in Rhino (Preserved): {}".format(len(self.missing_in_rhino))
+
+    def _on_apply_strategy_override(self, sender, e):
+        """Overrides proposed strategy for all currently checked layers."""
+        self._sync_grid_check_states()
+        selected_strat = str(self.dd_strat_override.SelectedValue or "").strip()
+        if not selected_strat:
+            return
+
+        updated_count = 0
+        for r in self.layer_rows:
+            if r.checked:
+                r.proposed_strategy = selected_strat
+                if r.classification:
+                    r.classification.proposed_strategy = selected_strat
+                updated_count += 1
+
+        self._refresh_review_grid_datastore()
+        self._update_preview_kpis()
+        self.lbl_global_status.Text = "Applied strategy override '{}' to {} checked layer(s).".format(
+            selected_strat, updated_count
+        )
+
+    def _on_repetition_threshold_changed(self, sender, e):
+        """Updates classifier repetition threshold and re-evaluates review grid."""
+        try:
+            val_str = str(self.dd_rep_threshold.SelectedValue or "3")
+            thresh = 3
+            if "2" in val_str:
+                thresh = 2
+            elif "5" in val_str:
+                thresh = 5
+            elif "10" in val_str:
+                thresh = 10
+            self.classifier.repetition_threshold = thresh
+            if self.scanned_objects:
+                self._run_classification_and_sync()
+                self._populate_review_grid()
+                self._update_preview_kpis()
+                self.lbl_global_status.Text = "Repetition grouping threshold set to >= {}.".format(thresh)
+        except Exception as ex:
+            self.lbl_global_status.Text = "Threshold update notice: {}".format(ex)
 
     def _on_mode_changed(self, sender, e):
         """Re-evaluates proposed strategies when global mode changes."""
@@ -965,6 +1075,8 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             if r.checked:
                 approved_objs.extend(r.objects)
 
+        layer_to_row = {r.layer_name: r for r in self.layer_rows}
+
         total = len(approved_objs)
         if total == 0:
             self.txt_exec_log.Text += "No objects approved for transfer. Please scan and check layers in Review tab.\n"
@@ -1013,7 +1125,20 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                         except Exception:
                             pass
 
-                    conv_res = router.convert_object(obj, c_res)
+                    # Resolve layer override rule if configured by user
+                    row = layer_to_row.get(obj.layer_full_path)
+                    layer_rule = None
+                    if row:
+                        cat_name = row.revit_type if (row.revit_type and row.revit_type.startswith("OST_")) else (c_res.revit_category_name if c_res else "OST_GenericModel")
+                        layer_rule = MappingRule(
+                            layer_pattern=obj.layer_full_path,
+                            revit_category=cat_name,
+                            revit_type=row.revit_type,
+                            strategy=row.proposed_strategy,
+                            room_bounding=True
+                        )
+
+                    conv_res = router.convert_object(obj, c_res, profile_rule=layer_rule)
 
                     if conv_res.status == "SUCCESS" and conv_res.revit_element_id != -1:
                         # Write ExtensibleStorage sync tracking

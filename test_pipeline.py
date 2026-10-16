@@ -234,5 +234,91 @@ class TestR2RPipeline(unittest.TestCase):
         self.assertGreater(os.path.getsize(html_path), 500)
 
 
+    def test_adaptive_points_ccw_ordering(self):
+        """Tests deterministic counter-clockwise winding ordering for 2, 3, and 4 points."""
+        # 4-point planar rectangle out of order
+        raw_4pts = [
+            (10.0, 10.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 10.0, 0.0),
+            (10.0, 0.0, 0.0)
+        ]
+        ordered_4 = RhinoScanner.order_adaptive_points_ccw(raw_4pts)
+        self.assertEqual(len(ordered_4), 4)
+        # Should start at bottom-left (0.0, 0.0, 0.0) and proceed CCW
+        self.assertEqual(ordered_4[0], (0.0, 0.0, 0.0))
+        self.assertEqual(ordered_4[1], (10.0, 0.0, 0.0))
+        self.assertEqual(ordered_4[2], (10.0, 10.0, 0.0))
+        self.assertEqual(ordered_4[3], (0.0, 10.0, 0.0))
+
+        # 3-point triangle
+        raw_3pts = [
+            (5.0, 8.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (10.0, 0.0, 0.0)
+        ]
+        ordered_3 = RhinoScanner.order_adaptive_points_ccw(raw_3pts)
+        self.assertEqual(len(ordered_3), 3)
+        self.assertEqual(ordered_3[0], (0.0, 0.0, 0.0))
+        self.assertEqual(ordered_3[1], (10.0, 0.0, 0.0))
+        self.assertEqual(ordered_3[2], (5.0, 8.0, 0.0))
+
+        # 2-point strut (bottom to top)
+        raw_2pts = [(0.0, 0.0, 10.0), (0.0, 0.0, 0.0)]
+        ordered_2 = RhinoScanner.order_adaptive_points_ccw(raw_2pts)
+        self.assertEqual(ordered_2[0], (0.0, 0.0, 0.0))
+        self.assertEqual(ordered_2[1], (0.0, 0.0, 10.0))
+
+    def test_classifier_adaptive_and_repetitive_strategies(self):
+        """Tests classification routing for AdaptiveComponent, RepetitiveFamily, and ParametricFamily."""
+        classifier = AecClassifier(mode="Hybrid")
+
+        # 1. Adaptive 4-point panel
+        panel_obj = ScannedObject("panel-01")
+        panel_obj.layer_full_path = "FAÇADE::PANELS_QUAD"
+        panel_obj.layer_name = "PANELS_QUAD"
+        panel_obj.object_type = "Brep"
+        panel_obj.adaptive_point_count = 4
+        panel_obj.adaptive_points = [(0, 0, 0), (2, 0, 0), (2, 3, 0), (0, 3, 0)]
+
+        res_panel = classifier.classify_object(panel_obj)
+        self.assertEqual(res_panel.proposed_strategy, "AdaptiveComponent")
+
+        # 2. Repetitive items exceeding threshold
+        bracket1 = ScannedObject("brk-01")
+        bracket1.layer_full_path = "BRACKETS"
+        bracket1.layer_name = "BRACKETS"
+        bracket1.object_type = "Brep"
+        bracket1.repetition_signature = "0.20x0.20x0.50_V0.02_A0.10"
+        bracket1.repetition_count = 10
+
+        bracket2 = ScannedObject("brk-02")
+        bracket2.layer_full_path = "BRACKETS"
+        bracket2.layer_name = "BRACKETS"
+        bracket2.object_type = "Brep"
+        bracket2.repetition_signature = bracket1.repetition_signature
+        bracket2.repetition_count = 10
+
+        classifier.prepare_repetition_cache([bracket1, bracket2])
+        res_brk = classifier.classify_object(bracket1)
+        self.assertEqual(res_brk.proposed_strategy, "RepetitiveFamily")
+
+        # 3. Parametric Column
+        col_obj = ScannedObject("col-01")
+        col_obj.layer_full_path = "STRUCTURE::COLUMNS"
+        col_obj.layer_name = "COLUMNS"
+        col_obj.object_type = "Brep"
+        col_obj.dx = 0.5
+        col_obj.dy = 0.5
+        col_obj.dz = 3.5
+        col_obj.is_vertical = True
+        col_obj.is_closed = True
+        col_obj.parametric_dims = {"Width": 0.5, "Depth": 0.5, "Height": 3.5}
+
+        res_col = classifier.classify_object(col_obj)
+        self.assertEqual(res_col.inferred_category, "Family")
+        self.assertEqual(res_col.proposed_strategy, "ParametricFamily")
+
+
 if __name__ == "__main__":
     unittest.main()

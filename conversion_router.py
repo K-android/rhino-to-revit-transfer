@@ -25,6 +25,8 @@ Includes TransferFailuresPreprocessor to cleanly suppress and log non-fatal Revi
 """
 
 import sys
+import os
+import re
 import math
 import traceback
 
@@ -159,6 +161,10 @@ class ConversionRouter(object):
         self.default_roof_type = self.doc.GetDefaultElementTypeId(DB.ElementTypeGroup.RoofType)
         self.default_ceiling_type = self.doc.GetDefaultElementTypeId(DB.ElementTypeGroup.CeilingType)
 
+        # Caches for repetitive definitions and adaptive families
+        self.repetitive_type_cache = {}
+        self.adaptive_family_cache = {}
+
     def convert_object(self, scanned_obj, classification_result, profile_rule=None):
         """Dispatches an object through the appropriate conversion strategy."""
         res = ConversionResult(scanned_obj.rhino_guid)
@@ -169,7 +175,7 @@ class ConversionRouter(object):
 
         # Strategy resolution: Profile Rule override > Classification result
         strategy = profile_rule.strategy if profile_rule else classification_result.proposed_strategy
-        if self.global_mode == "Geometry-First" and strategy != "FloorNative":
+        if self.global_mode == "Geometry-First" and strategy not in ("FloorNative", "AdaptiveComponent"):
             strategy = "DirectShape"
 
         res.strategy_used = strategy
@@ -188,10 +194,16 @@ class ConversionRouter(object):
             # Match Level
             level_id = self._resolve_level_id(scanned_obj)
 
-            # Route through 10 Pipelines
+            # Route through Conversion Pipelines
             created_elem = None
 
-            if strategy == "FloorNative":
+            if strategy == "AdaptiveComponent":
+                created_elem = self._pipeline_8a_adaptive_component(scanned_obj, geom_feet, level_id, profile_rule, res)
+            elif strategy == "RepetitiveFamily":
+                created_elem = self._pipeline_8b_repetitive_family(scanned_obj, geom_feet, level_id, profile_rule, res)
+            elif strategy == "ParametricFamily":
+                created_elem = self._pipeline_8c_parametric_family(scanned_obj, geom_feet, level_id, profile_rule, res)
+            elif strategy == "FloorNative":
                 created_elem = self._pipeline_1_native_floor(scanned_obj, geom_feet, level_id, profile_rule, res)
             elif strategy == "FloorByHost":
                 created_elem = self._pipeline_2_floor_by_host(scanned_obj, geom_feet, level_id, profile_rule, res)
@@ -475,16 +487,192 @@ class ConversionRouter(object):
         return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=DB.ElementId(DB.BuiltInCategory.OST_Roofs))
 
     # =========================================================================
-    # PIPELINE 8: Family Creation & Placement
+    # PIPELINE 8A: Adaptive Component Placement (Multi-Point Facade Panels / Struts)
     # =========================================================================
-    def _pipeline_8_family_placement(self, scanned_obj, geom_feet, level_id, profile_rule, res):
-        """Places repeated block definitions or custom family instances."""
+    def _pipeline_8a_adaptive_component(self, scanned_obj, geom_feet, level_id, profile_rule, res):
+        """Places multi-point Adaptive Component instances (panels, space frames, diagrids)."""
+        pts_rhino = getattr(scanned_obj, "adaptive_points", [])
+        num_pts = len(pts_rhino)
+        if num_pts not in (2, 3, 4):
+            res.warnings.append("AdaptiveComponent: Object has {} placement points (requires 2, 3, or 4). Falling back to DirectShape.".format(num_pts))
+            return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res)
+
+        # Scale coordinates into Revit internal feet
+        scale = self.unit_scale
+        pts_feet = [DB.XYZ(p[0] * scale, p[1] * scale, p[2] * scale) for p in pts_rhino]
+
+        # Locate matching loaded Adaptive FamilySymbol
+        target_sym = None
+        requested_type = profile_rule.revit_type if (profile_rule and profile_rule.revit_type) else ""
+
+        if requested_type:
+            collector = DB.FilteredElementCollector(self.doc).OfClass(DB.FamilySymbol)
+            for s in collector:
+                try:
+                    if s.Name == requested_type or s.FamilyName == requested_type:
+                        if hasattr(DB, "AdaptiveComponentInstanceUtils") and DB.AdaptiveComponentInstanceUtils.IsAdaptiveFamily(s.Family):
+                            target_sym = s
+                            break
+                except Exception:
+                    continue
+
+        if not target_sym and num_pts in self.adaptive_family_cache:
+            target_sym = self.adaptive_family_cache[num_pts]
+
+        if not target_sym and hasattr(DB, "AdaptiveComponentInstanceUtils"):
+            collector = DB.FilteredElementCollector(self.doc).OfClass(DB.FamilySymbol)
+            for s in collector:
+                try:
+                    if DB.AdaptiveComponentInstanceUtils.IsAdaptiveFamily(s.Family):
+                        target_sym = s
+                        self.adaptive_family_cache[num_pts] = s
+                        break
+                except Exception:
+                    continue
+
+        # If adaptive family found, instantiate and set placement point positions
+        if target_sym and hasattr(DB, "AdaptiveComponentInstanceUtils"):
+            try:
+                if not target_sym.IsActive:
+                    target_sym.Activate()
+                inst = DB.AdaptiveComponentInstanceUtils.CreateAdaptiveComponentInstance(self.doc, target_sym)
+                pt_elem_ids = DB.AdaptiveComponentInstanceUtils.GetPlacementPointElementIds(inst)
+                for idx, pid in enumerate(pt_elem_ids):
+                    if idx < len(pts_feet):
+                        pt_elem = self.doc.GetElement(pid)
+                        if pt_elem and hasattr(pt_elem, "Position"):
+                            pt_elem.Position = pts_feet[idx]
+                return inst
+            except Exception as ex:
+                res.warnings.append("AdaptiveComponentInstance placement notice: {}. Falling back to shared DirectShape.".format(ex))
+
+        # Safe fallback if no adaptive family is loaded: place as lightweight repetitive DirectShape
+        res.warnings.append("No {}-point Adaptive Family loaded in project. Transferred via DirectShape.".format(num_pts))
+        return self._pipeline_8b_repetitive_family(scanned_obj, geom_feet, level_id, profile_rule, res)
+
+    # =========================================================================
+    # PIPELINE 8B: Repetitive Family Instancing (Blocks & Repeated Signatures)
+    # =========================================================================
+    def _pipeline_8b_repetitive_family(self, scanned_obj, geom_feet, level_id, profile_rule, res):
+        """Creates a shared reusable DirectShapeType definition and places transformed instances."""
         cat_id = DB.ElementId(DB.BuiltInCategory.OST_GenericModel)
         if profile_rule and profile_rule.revit_category:
             cat_id = self._category_str_to_id(profile_rule.revit_category)
 
-        # DirectShapeType or DirectShape instance with library type
+        sig = scanned_obj.repetition_signature or ("Block_" + scanned_obj.block_name if scanned_obj.block_name else None)
+        if not sig:
+            return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=cat_id)
+
+        type_key = "R2R_" + re.sub(r'[^a-zA-Z0-9_]+', '_', sig)[:45]
+
+        # Try Revit DirectShapeType + DirectShapeLibrary instancing
+        try:
+            if hasattr(DB, "DirectShapeLibrary") and hasattr(DB, "DirectShapeType"):
+                lib = DB.DirectShapeLibrary.GetDirectShapeLibrary(self.doc)
+                type_id = None
+                if lib.ContainsType(type_key):
+                    type_id = lib.FindDefinitionType(type_key)
+                elif type_key in self.repetitive_type_cache:
+                    type_id = self.repetitive_type_cache[type_key]
+
+                if not type_id:
+                    # Canonical geometry: translate object to local origin (0, 0, 0)
+                    cx = scanned_obj.centroid[0] * self.unit_scale
+                    cy = scanned_obj.centroid[1] * self.unit_scale
+                    cz = scanned_obj.centroid[2] * self.unit_scale
+                    canonical_geom = geom_feet.Duplicate()
+                    if hasattr(canonical_geom, "Translate"):
+                        canonical_geom.Translate(-cx, -cy, -cz)
+                    revit_geoms = self._convert_rhino_to_revit_geometry(canonical_geom)
+                    if revit_geoms and len(revit_geoms) > 0:
+                        dst = DB.DirectShapeType.Create(self.doc, type_key, cat_id)
+                        dst.SetShape(revit_geoms)
+                        lib.AddDefinitionType(type_key, dst.Id)
+                        type_id = dst.Id
+                        self.repetitive_type_cache[type_key] = type_id
+
+                if type_id:
+                    cx = scanned_obj.centroid[0] * self.unit_scale
+                    cy = scanned_obj.centroid[1] * self.unit_scale
+                    cz = scanned_obj.centroid[2] * self.unit_scale
+                    tf = DB.Transform.CreateTranslation(DB.XYZ(cx, cy, cz))
+                    if scanned_obj.rotation_angle:
+                        rot = DB.Transform.CreateRotation(DB.XYZ.BasisZ, scanned_obj.rotation_angle)
+                        tf = tf.Multiply(rot)
+                    inst = DB.DirectShape.CreateElementInstance(self.doc, type_id, cat_id, type_key, tf)
+                    return inst
+        except Exception as ex:
+            res.warnings.append("Repetitive DirectShapeType notice: {}. Using standard DirectShape.".format(ex))
+
+        # DirectShape fallback
         return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=cat_id)
+
+    # =========================================================================
+    # PIPELINE 8C: Dimension-Driven Parametric Family Placement
+    # =========================================================================
+    def _pipeline_8c_parametric_family(self, scanned_obj, geom_feet, level_id, profile_rule, res):
+        """Places a loadable FamilyInstance and sets dimensional parameters (Width, Depth, Height)."""
+        cat_str = profile_rule.revit_category if (profile_rule and profile_rule.revit_category) else "OST_GenericModel"
+        requested_type = profile_rule.revit_type if (profile_rule and profile_rule.revit_type) else ""
+
+        target_sym = None
+        collector = DB.FilteredElementCollector(self.doc).OfClass(DB.FamilySymbol)
+        for s in collector:
+            try:
+                if requested_type and (s.Name == requested_type or s.FamilyName == requested_type):
+                    target_sym = s
+                    break
+                if not requested_type and s.Category and s.Category.Name and cat_str.replace("OST_", "").lower() in s.Category.Name.lower():
+                    target_sym = s
+                    break
+            except Exception:
+                continue
+
+        if target_sym:
+            try:
+                if not target_sym.IsActive:
+                    target_sym.Activate()
+                cx = scanned_obj.centroid[0] * self.unit_scale
+                cy = scanned_obj.centroid[1] * self.unit_scale
+                cz = scanned_obj.centroid[2] * self.unit_scale
+                pt = DB.XYZ(cx, cy, cz)
+                level_elem = self.doc.GetElement(level_id)
+                inst = self.doc.Create.NewFamilyInstance(pt, target_sym, level_elem, DB.Structure.StructuralType.NonStructural)
+
+                # Rotate if needed
+                if scanned_obj.rotation_angle and inst:
+                    axis = DB.Line.CreateBound(pt, DB.XYZ(pt.X, pt.Y, pt.Z + 1.0))
+                    DB.ElementTransformUtils.RotateElement(self.doc, inst.Id, axis, scanned_obj.rotation_angle)
+
+                # Drive instance dimensional parameters
+                dims = getattr(scanned_obj, "parametric_dims", {})
+                for p_name, p_val in dims.items():
+                    val_feet = p_val * self.unit_scale
+                    for alias in [p_name, p_name.lower(), p_name.capitalize()]:
+                        param = inst.LookupParameter(alias)
+                        if param and not param.IsReadOnly and param.StorageType == DB.StorageType.Double:
+                            try:
+                                param.Set(val_feet)
+                                break
+                            except Exception:
+                                pass
+                return inst
+            except Exception as ex:
+                res.warnings.append("ParametricFamily placement notice: {}. Falling back to repetitive family.".format(ex))
+
+        # Fallback to repetitive or direct shape
+        return self._pipeline_8b_repetitive_family(scanned_obj, geom_feet, level_id, profile_rule, res)
+
+    # =========================================================================
+    # PIPELINE 8: Generic Family Delegator
+    # =========================================================================
+    def _pipeline_8_family_placement(self, scanned_obj, geom_feet, level_id, profile_rule, res):
+        """Routes family placement to Adaptive, Repetitive, or Parametric pipeline."""
+        if getattr(scanned_obj, "adaptive_point_count", 0) in (2, 3, 4):
+            return self._pipeline_8a_adaptive_component(scanned_obj, geom_feet, level_id, profile_rule, res)
+        if scanned_obj.object_type == "InstanceReference" or getattr(scanned_obj, "repetition_count", 1) >= 2:
+            return self._pipeline_8b_repetitive_family(scanned_obj, geom_feet, level_id, profile_rule, res)
+        return self._pipeline_8c_parametric_family(scanned_obj, geom_feet, level_id, profile_rule, res)
 
     # =========================================================================
     # PIPELINE 9: DirectShape Fallback (Facade Mesh / Screen, SubD, Double-Curved Breps)

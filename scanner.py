@@ -66,7 +66,21 @@ class ScannedObject(object):
         self.thickness = 0.0
         self.loop_count = 0
         self.repetition_signature = ""
+        self.repetition_count = 1
         self.geo_hash = ""
+
+        # Adaptive & Parametric Family Metadata
+        self.adaptive_points = []       # Ordered list of (x, y, z) tuples in Rhino units
+        self.adaptive_point_count = 0   # 2, 3, 4, or N adaptive placement points
+        self.rotation_angle = 0.0       # Yaw rotation in radians (XY plane)
+        self.instance_transform = None  # Optional Rhino.Geometry.Transform for blocks
+        self.parametric_dims = {
+            "Width": 0.0,
+            "Depth": 0.0,
+            "Height": 0.0,
+            "Length": 0.0,
+            "Thickness": 0.0
+        }
 
         # Spatial Context
         self.nearest_level_name = "Unassigned"
@@ -101,6 +115,7 @@ class ScannedObject(object):
             "bbox_max": list(self.bbox_max),
             "centroid": list(self.centroid),
             "dimensions": {"dx": self.dx, "dy": self.dy, "dz": self.dz},
+            "parametric_dims": dict(self.parametric_dims),
             "area": self.area,
             "volume": self.volume,
             "is_closed": self.is_closed,
@@ -110,6 +125,10 @@ class ScannedObject(object):
             "thickness": self.thickness,
             "loop_count": self.loop_count,
             "repetition_signature": self.repetition_signature,
+            "repetition_count": self.repetition_count,
+            "adaptive_point_count": self.adaptive_point_count,
+            "adaptive_points": [list(pt) for pt in self.adaptive_points],
+            "rotation_angle": self.rotation_angle,
             "geo_hash": self.geo_hash,
             "nearest_level_name": self.nearest_level_name,
             "dz_to_level": self.dz_to_level,
@@ -130,6 +149,8 @@ class ScannerPreflightReport(object):
         self.total_duplicates = 0
         self.total_far_from_origin = 0
         self.total_non_closed_loops = 0
+        self.total_repetitive_groups = 0
+        self.total_adaptive_candidates = 0
         self.warnings = []
         self.levels_detected = []
         self.zones_detected = {}
@@ -281,6 +302,25 @@ class RhinoScanner(object):
 
             scanned_list.append(scanned)
 
+        # Repetition frequency count aggregation & preflight metrics
+        sig_counts = {}
+        for s in scanned_list:
+            if s.repetition_signature:
+                sig_counts[s.repetition_signature] = sig_counts.get(s.repetition_signature, 0) + 1
+
+        rep_groups = 0
+        adaptive_count = 0
+        for s in scanned_list:
+            if s.repetition_signature:
+                s.repetition_count = sig_counts[s.repetition_signature]
+            if s.adaptive_point_count in (2, 3, 4):
+                adaptive_count += 1
+        for sig, cnt in sig_counts.items():
+            if cnt >= 2:
+                rep_groups += 1
+
+        self.preflight.total_repetitive_groups = rep_groups
+        self.preflight.total_adaptive_candidates = adaptive_count
         self.preflight.total_scanned = len(scanned_list)
         return scanned_list
 
@@ -325,9 +365,19 @@ class RhinoScanner(object):
             if isinstance(obj, rd.InstanceObject):
                 instance_def = obj.InstanceDefinition
                 scanned.block_name = instance_def.Name if instance_def else ""
+                try:
+                    scanned.instance_transform = obj.InstanceXform
+                    scanned.rotation_angle = math.atan2(obj.InstanceXform.M10, obj.InstanceXform.M00)
+                except Exception:
+                    pass
             elif isinstance(geom, rg.InstanceReferenceGeometry):
                 idef = self.doc.InstanceDefinitions.FindId(geom.ParentIdefId)
                 scanned.block_name = idef.Name if idef else ""
+                try:
+                    scanned.instance_transform = geom.Xform
+                    scanned.rotation_angle = math.atan2(geom.Xform.M10, geom.Xform.M00)
+                except Exception:
+                    pass
         elif isinstance(geom, rg.Brep):
             scanned.object_type = "Brep"
         elif isinstance(geom, rg.Extrusion):
@@ -488,11 +538,183 @@ class RhinoScanner(object):
             scanned.is_closed = True
             scanned.repetition_signature = "Block_{}".format(scanned.block_name)
 
+        # Extract Adaptive Points and Parametric Dimensions
+        self._extract_adaptive_and_parametric_features(scanned, geom, working_brep)
+
         if not scanned.repetition_signature:
-            # Normalized shape signature: dims rounded + volume
-            scanned.repetition_signature = "{:.2f}x{:.2f}x{:.2f}_V{:.2f}".format(
-                scanned.dx, scanned.dy, scanned.dz, scanned.volume
+            # Normalized shape signature: plan dimensions sorted (rotation invariant) + Z height + volume + area
+            plan_dims = sorted([round(scanned.dx, 2), round(scanned.dy, 2)])
+            scanned.repetition_signature = "{:.2f}x{:.2f}x{:.2f}_V{:.2f}_A{:.2f}".format(
+                plan_dims[0], plan_dims[1], round(scanned.dz, 2), round(scanned.volume, 2), round(scanned.area, 2)
             )
+
+    @staticmethod
+    def order_adaptive_points_ccw(points):
+        """Deterministically orders 2, 3, or 4 spatial points into counter-clockwise winding order.
+
+        For 3 or 4 points:
+          - Computes face plane normal and local orthonormal basis (u, v).
+          - Sorts vertices counter-clockwise by polar angle around the centroid.
+          - Rotates the sequence so index 0 is consistently the bottom-left corner.
+        For 2 points:
+          - Orders from bottom / start to top / end.
+
+        :param points: list of (x, y, z) tuples or Point3d-like objects.
+        :return: list of (x, y, z) float tuples.
+        """
+        if not points:
+            return []
+
+        clean_pts = []
+        for p in points:
+            try:
+                clean_pts.append((float(p[0]), float(p[1]), float(p[2])))
+            except Exception:
+                try:
+                    clean_pts.append((float(p.X), float(p.Y), float(p.Z)))
+                except Exception:
+                    pass
+
+        count = len(clean_pts)
+        if count <= 1:
+            return clean_pts
+
+        if count == 2:
+            return sorted(clean_pts, key=lambda p: (round(p[2], 4), round(p[0], 4), round(p[1], 4)))
+
+        # 3 or 4 points: compute centroid
+        cx = sum(p[0] for p in clean_pts) / float(count)
+        cy = sum(p[1] for p in clean_pts) / float(count)
+        cz = sum(p[2] for p in clean_pts) / float(count)
+
+        # Estimate face normal from first three non-collinear vectors
+        p0 = clean_pts[0]
+        p1 = clean_pts[1]
+        p2 = clean_pts[2]
+        v1 = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+        v2 = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
+
+        nx = v1[1] * v2[2] - v1[2] * v2[1]
+        ny = v1[2] * v2[0] - v1[0] * v2[2]
+        nz = v1[0] * v2[1] - v1[1] * v2[0]
+        len_n = math.sqrt(nx * nx + ny * ny + nz * nz)
+
+        if len_n < 1e-9:
+            nx, ny, nz = 0.0, 0.0, 1.0
+        else:
+            nx /= len_n
+            ny /= len_n
+            nz /= len_n
+
+        # Standardize normal direction towards World +Z (or +Y if nearly vertical)
+        if abs(nz) > 0.4:
+            if nz < 0:
+                nx, ny, nz = -nx, -ny, -nz
+        elif abs(ny) > 0.4:
+            if ny < 0:
+                nx, ny, nz = -nx, -ny, -nz
+        elif nx < 0:
+            nx, ny, nz = -nx, -ny, -nz
+
+        # Construct local orthonormal basis (u, v) on the panel plane
+        ref_up = (0.0, 1.0, 0.0) if abs(nz) > 0.9 else (0.0, 0.0, 1.0)
+        ux = ref_up[1] * nz - ref_up[2] * ny
+        uy = ref_up[2] * nx - ref_up[0] * nz
+        uz = ref_up[0] * ny - ref_up[1] * nx
+        len_u = math.sqrt(ux * ux + uy * uy + uz * uz)
+        if len_u < 1e-9:
+            ux, uy, uz = 1.0, 0.0, 0.0
+        else:
+            ux /= len_u
+            uy /= len_u
+            uz /= len_u
+
+        vx = ny * uz - nz * uy
+        vy = nz * ux - nx * uz
+        vz = nx * uy - ny * ux
+
+        # Project points to 2D (u, v) and sort counter-clockwise by polar angle
+        projected = []
+        for p in clean_pts:
+            dx = p[0] - cx
+            dy = p[1] - cy
+            dz = p[2] - cz
+            u_coord = dx * ux + dy * uy + dz * uz
+            v_coord = dx * vx + dy * vy + dz * vz
+            ang = math.atan2(v_coord, u_coord)
+            projected.append((ang, u_coord, v_coord, p))
+
+        # Sort counter-clockwise
+        projected.sort(key=lambda item: item[0])
+
+        # Rotate sequence so index 0 is consistently bottom-left (lowest v, then lowest u)
+        min_idx = min(range(len(projected)), key=lambda i: (projected[i][2], projected[i][1]))
+        ordered = projected[min_idx:] + projected[:min_idx]
+        return [item[3] for item in ordered]
+
+    def _extract_adaptive_and_parametric_features(self, scanned, geom, working_brep):
+        """Extracts candidate adaptive component vertices and dimension-driving parameters."""
+        # 1. Parametric driving dimensions
+        scanned.parametric_dims = {
+            "Width": round(scanned.dx, 4),
+            "Depth": round(scanned.dy, 4),
+            "Height": round(scanned.dz, 4),
+            "Length": round(max(scanned.dx, scanned.dy, scanned.dz), 4),
+            "Thickness": round(scanned.thickness if scanned.thickness > 0 else min(scanned.dx, scanned.dy, scanned.dz), 4)
+        }
+
+        # 2. Extract Adaptive Points
+        raw_pts = []
+        try:
+            # Case A: Single-face Brep or Surface (e.g. quad or triangular facade panels)
+            if working_brep and hasattr(working_brep, "Faces") and working_brep.Faces.Count == 1:
+                face = working_brep.Faces[0]
+                loop = face.OuterLoop
+                if loop and hasattr(loop, "Trims"):
+                    for trim in loop.Trims:
+                        pt = trim.PointAtStart
+                        raw_pts.append((pt.X, pt.Y, pt.Z))
+                elif hasattr(working_brep, "Vertices") and working_brep.Vertices.Count in (3, 4):
+                    for v in working_brep.Vertices:
+                        pt = v.Location
+                        raw_pts.append((pt.X, pt.Y, pt.Z))
+
+            # Case B: Mesh Face (single quad or triangle mesh)
+            elif isinstance(geom, rg.Mesh):
+                if hasattr(geom, "Vertices") and geom.Vertices.Count in (3, 4) and geom.Faces.Count <= 2:
+                    for v in geom.Vertices:
+                        raw_pts.append((v.X, v.Y, v.Z))
+
+            # Case C: Curves (Polyline with 3-4 segments, or 2-point LineCurve for struts)
+            elif isinstance(geom, rg.Curve):
+                if hasattr(geom, "ToPolyline"):
+                    poly = geom.ToPolyline()
+                    if poly:
+                        poly_pts = [(p.X, p.Y, p.Z) for p in poly]
+                        if len(poly_pts) >= 4 and poly_pts[0] == poly_pts[-1]:
+                            poly_pts = poly_pts[:-1]
+                        if len(poly_pts) in (2, 3, 4):
+                            raw_pts = poly_pts
+                if not raw_pts and hasattr(geom, "PointAtStart") and hasattr(geom, "PointAtEnd"):
+                    p0 = geom.PointAtStart
+                    p1 = geom.PointAtEnd
+                    raw_pts = [(p0.X, p0.Y, p0.Z), (p1.X, p1.Y, p1.Z)]
+
+        except Exception:
+            pass
+
+        # Deduplicate sequential floating coordinates
+        dedup_pts = []
+        for p in raw_pts:
+            if not dedup_pts or any(abs(p[i] - dedup_pts[-1][i]) > 1e-4 for i in range(3)):
+                dedup_pts.append(p)
+        if len(dedup_pts) >= 3 and dedup_pts[0] == dedup_pts[-1]:
+            dedup_pts = dedup_pts[:-1]
+
+        if len(dedup_pts) in (2, 3, 4):
+            ordered_pts = self.order_adaptive_points_ccw(dedup_pts)
+            scanned.adaptive_points = ordered_pts
+            scanned.adaptive_point_count = len(ordered_pts)
 
     def _compute_level_relationship(self, scanned, revit_levels):
         """Finds nearest Revit Level and calculates vertical offset delta (dz_to_level)."""
