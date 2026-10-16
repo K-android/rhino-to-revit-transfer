@@ -89,6 +89,60 @@ class LayerRowItem(object):
         else:
             self.pattern_tag = "Unique Mesh/Brep"
 
+    def update_strategy(self, new_strategy):
+        """Updates proposed strategy and recalculates confidence score based on geometric compatibility."""
+        self.proposed_strategy = str(new_strategy).strip()
+        comp_score = 100.0
+
+        if self.proposed_strategy == "AdaptiveComponent":
+            pts = sum(1 for o in self.objects if getattr(o, "adaptive_point_count", 0) in (2, 3, 4))
+            if pts == len(self.objects):
+                comp_score = 98.0
+            elif pts > 0:
+                comp_score = 85.0
+            else:
+                comp_score = 70.0  # Lacks 2-4 pt boundary; will fall back to DirectShape if needed
+
+        elif self.proposed_strategy == "FloorNative":
+            horiz_cnt = sum(1 for o in self.objects if getattr(o, "is_horizontal", False))
+            comp_score = 96.0 if horiz_cnt == len(self.objects) else 65.0
+
+        elif self.proposed_strategy == "WallByCurve":
+            vert_cnt = sum(1 for o in self.objects if getattr(o, "is_vertical", False))
+            comp_score = 96.0 if vert_cnt == len(self.objects) else 65.0
+
+        elif self.proposed_strategy in ("RoofNative", "CeilingNative"):
+            horiz_cnt = sum(1 for o in self.objects if getattr(o, "is_horizontal", False))
+            comp_score = 95.0 if horiz_cnt > 0 else 70.0
+
+        elif self.proposed_strategy == "RepetitiveFamily":
+            rep_cnt = max([getattr(o, "repetition_count", 1) for o in self.objects] + [1])
+            is_blk = any(getattr(o, "object_type", "") == "InstanceReference" for o in self.objects)
+            comp_score = 98.0 if (rep_cnt >= 2 or is_blk) else 80.0
+
+        elif self.proposed_strategy == "ParametricFamily":
+            has_dims = all(bool(getattr(o, "parametric_dims", {})) for o in self.objects)
+            comp_score = 95.0 if has_dims else 80.0
+
+        elif self.proposed_strategy == "DirectShape":
+            comp_score = 100.0  # 100% universal geometric compatibility
+
+        else:
+            comp_score = 95.0
+
+        self.confidence_score = comp_score
+        if comp_score >= 85.0:
+            self.confidence_tier = "AUTO_READY"
+        elif comp_score >= 60.0:
+            self.confidence_tier = "SUGGESTED_NEEDS_APPROVAL"
+        else:
+            self.confidence_tier = "MANUAL_OR_EXCLUDED"
+
+        if self.classification:
+            self.classification.proposed_strategy = self.proposed_strategy
+            self.classification.confidence_score = comp_score
+            self.classification.confidence_tier = self.confidence_tier
+
 
 class ValidationRowItem(object):
     """Data item model for the Validate & QA Report GridView."""
@@ -410,6 +464,19 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.dd_global_mode.SelectedIndex = 0
         self.dd_global_mode.SelectedIndexChanged += self._on_mode_changed
 
+        lbl_units = ef.Label()
+        lbl_units.Text = "Unit Scale:"
+        lbl_units.VerticalAlignment = ef.VerticalAlignment.Center
+
+        self.dd_unit_scale = ef.DropDown()
+        self.dd_unit_scale.Items.Add("Auto-Detect")
+        self.dd_unit_scale.Items.Add("mm -> Feet (x0.00328)")
+        self.dd_unit_scale.Items.Add("Meters -> Feet (x3.28084)")
+        self.dd_unit_scale.Items.Add("cm -> Feet (x0.0328)")
+        self.dd_unit_scale.Items.Add("Inches -> Feet (x0.0833)")
+        self.dd_unit_scale.Items.Add("Feet -> Feet (1.0)")
+        self.dd_unit_scale.SelectedIndex = 0
+
         self.chk_gen_bua = ef.CheckBox()
         self.chk_gen_bua.Text = "Auto-Generate BUA / GFA Area Boundary Lines"
         self.chk_gen_bua.Checked = True
@@ -438,6 +505,8 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         opts_layout.BeginHorizontal()
         opts_layout.Add(lbl_mode)
         opts_layout.Add(self.dd_global_mode)
+        opts_layout.Add(lbl_units)
+        opts_layout.Add(self.dd_unit_scale)
         opts_layout.Add(self.chk_gen_bua)
         opts_layout.Add(btn_select_all)
         opts_layout.Add(btn_deselect_all)
@@ -801,12 +870,8 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             import traceback
             err_details = traceback.format_exc()
             print("[R2R Scan Error]:\n" + err_details)
-            self.lbl_global_status.Text = "Scan error: {}".format(ex)
+            self.lbl_global_status.Text = "Scan error: {}. See warnings tab for details.".format(ex)
             self.txt_scan_warnings.Text = "Scan Exception:\n{}\n{}".format(ex, err_details)
-            try:
-                ef.MessageBox.Show("Scan encountered an error:\n{}\n\nSee warnings tab for details.".format(ex), "R2R Scan Notice")
-            except Exception:
-                pass
 
     def _run_classification_and_sync(self):
         """Runs classifier and sync engine on scanned objects."""
@@ -825,13 +890,25 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.sync_evaluations, self.missing_in_rhino = self.sync_engine.evaluate_sync_states(self.scanned_objects)
 
     def _sync_grid_check_states(self):
-        """Syncs checkbox state changes made in Eto GridView back to LayerRowItem objects."""
+        """Syncs checkbox state and strategy changes made in Eto GridView back to LayerRowItem objects."""
         try:
             ds = self.grid_review.DataStore
             if ds is not None and self.filtered_layer_rows:
+                changed = False
                 for idx, row_data in enumerate(ds):
                     if idx < len(self.filtered_layer_rows) and len(row_data) > 0:
-                        self.filtered_layer_rows[idx].checked = bool(row_data[0])
+                        row = self.filtered_layer_rows[idx]
+                        row.checked = bool(row_data[0])
+                        # If strategy was modified in-place (column 4)
+                        if len(row_data) > 4:
+                            new_strat = str(row_data[4] or "").strip()
+                            if new_strat and new_strat != row.proposed_strategy:
+                                row.update_strategy(new_strat)
+                                if len(row_data) > 6:
+                                    row_data[6] = "{:.0f}%".format(row.confidence_score)
+                                changed = True
+                if changed:
+                    self._update_preview_kpis()
         except Exception:
             pass
 
@@ -971,14 +1048,12 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         updated_count = 0
         for r in self.layer_rows:
             if r.checked:
-                r.proposed_strategy = selected_strat
-                if r.classification:
-                    r.classification.proposed_strategy = selected_strat
+                r.update_strategy(selected_strat)
                 updated_count += 1
 
         self._refresh_review_grid_datastore()
         self._update_preview_kpis()
-        self.lbl_global_status.Text = "Applied strategy override '{}' to {} checked layer(s).".format(
+        self.lbl_global_status.Text = "Applied strategy override '{}' to {} checked layer(s). Confidence updated dynamically.".format(
             selected_strat, updated_count
         )
 
@@ -1028,45 +1103,78 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
     def _on_load_profile(self, sender, e):
         """Loads transfer profile from disk."""
-        if self.profile_mgr.load():
-            self._run_classification_and_sync()
-            self._populate_review_grid()
-            self._update_preview_kpis()
-            ef.MessageBox.Show("Transfer Profile loaded successfully.", "Profile Manager")
+        try:
+            if self.profile_mgr.load():
+                self._run_classification_and_sync()
+                self._populate_review_grid()
+                self._update_preview_kpis()
+                self.lbl_global_status.Text = "Transfer Profile loaded successfully from disk."
+            else:
+                self.lbl_global_status.Text = "No saved transfer profile found on disk."
+        except Exception as ex:
+            self.lbl_global_status.Text = "Profile load notice: {}".format(ex)
 
     def _on_save_profile(self, sender, e):
         """Saves current layer table configurations as persistent profile rules."""
-        self._sync_grid_check_states()
-        for r in self.layer_rows:
-            if r.checked:
-                rule = MappingRule(
-                    layer_pattern=r.layer_name,
-                    revit_category=r.classification.revit_category_name if r.classification else "OST_GenericModel",
-                    revit_type=r.revit_type,
-                    strategy=r.proposed_strategy,
-                    room_bounding=True
-                )
-                self.profile_mgr.add_rule(rule)
+        try:
+            self._sync_grid_check_states()
+            saved_count = 0
+            for r in self.layer_rows:
+                if r.checked:
+                    rule = MappingRule(
+                        layer_pattern=r.layer_name,
+                        revit_category=r.classification.revit_category_name if r.classification else "OST_GenericModel",
+                        revit_type=r.revit_type,
+                        strategy=r.proposed_strategy,
+                        room_bounding=True
+                    )
+                    self.profile_mgr.add_rule(rule)
+                    saved_count += 1
 
-        self.profile_mgr.save()
-        ef.MessageBox.Show("Active mappings saved to Transfer_Profile.json.", "Profile Manager")
+            self.profile_mgr.save()
+            self.lbl_global_status.Text = "Saved {} active layer mapping rule(s) to Transfer_Profile.json.".format(saved_count)
+        except Exception as ex:
+            self.lbl_global_status.Text = "Profile save notice: {}".format(ex)
+
+    def _get_active_unit_scale(self):
+        """Returns the chosen unit scale factor for converting Rhino units to Revit feet."""
+        try:
+            if hasattr(self, "dd_unit_scale") and self.dd_unit_scale is not None:
+                idx = self.dd_unit_scale.SelectedIndex
+                if idx == 1:
+                    return 1.0 / 304.8  # Millimeters to feet (0.003280839895013123)
+                elif idx == 2:
+                    return 3.280839895013123  # Meters to feet
+                elif idx == 3:
+                    return 1.0 / 30.48  # Centimeters to feet
+                elif idx == 4:
+                    return 1.0 / 12.0  # Inches to feet
+                elif idx == 5:
+                    return 1.0  # Feet to feet
+        except Exception:
+            pass
+        return None  # Auto-Detect from active Rhino document unit system
 
     def _on_execute_transfer(self, sender, e):
         """Executes full transfer with Revit TransactionGroup and Failure handling."""
         self._sync_grid_check_states()
 
         if not REVIT_AVAILABLE or not self.revit_doc:
-            ef.MessageBox.Show("Revit document is not available. Please run inside Rhino.Inside.Revit.", "Transfer")
+            self.lbl_global_status.Text = "Transfer aborted: Revit document is not available. Please run inside Rhino.Inside.Revit."
+            self.lbl_exec_status.Text = "Transfer aborted: Revit document is not available."
             return
 
         self.btn_execute.Enabled = False
         self.lbl_exec_status.Text = "Starting transfer transaction..."
-        self.txt_exec_log.Text = "Beginning R2R Transfer TransactionGroup...\n"
+        chosen_scale = self._get_active_unit_scale()
+        scale_label = str(self.dd_unit_scale.SelectedValue) if hasattr(self, "dd_unit_scale") else "Auto-Detect"
+        self.txt_exec_log.Text = "Beginning R2R Transfer TransactionGroup (Unit Scale: {})...\n".format(scale_label)
 
         router = ConversionRouter(
             self.revit_doc,
             global_mode=str(self.dd_global_mode.SelectedValue),
-            generate_bua=self.chk_gen_bua.Checked or False
+            generate_bua=self.chk_gen_bua.Checked or False,
+            unit_scale=chosen_scale
         )
 
         # Collect objects to transfer
@@ -1236,7 +1344,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         """Isolates highlighted row's element in active Revit view."""
         sel_idx = self.grid_validate.SelectedRow
         if sel_idx < 0 or sel_idx >= len(self.validation_rows):
-            ef.MessageBox.Show("Please select an element row in the table first.", "Isolate Element")
+            self.lbl_global_status.Text = "Please select an element row in the table first."
             return
 
         row = self.validation_rows[sel_idx]
@@ -1268,7 +1376,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         if dlg.ShowDialog(self) == ef.DialogResult.Ok:
             dest = dlg.FileName
             ReportExporter.export_html(self.qa_report, dest)
-            ef.MessageBox.Show("HTML QA Report generated at:\n{}".format(dest), "QA Export")
+            self.lbl_global_status.Text = "HTML QA Report generated at: {}".format(dest)
 
     def _on_export_csv(self, sender, e):
         """Exports QA report as CSV."""
@@ -1280,5 +1388,5 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         if dlg.ShowDialog(self) == ef.DialogResult.Ok:
             dest = dlg.FileName
             ReportExporter.export_csv(self.qa_report, dest)
-            ef.MessageBox.Show("CSV QA Report generated at:\n{}".format(dest), "QA Export")
+            self.lbl_global_status.Text = "CSV QA Report generated at: {}".format(dest)
 

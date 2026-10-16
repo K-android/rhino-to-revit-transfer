@@ -58,41 +58,57 @@ echo Verifying installed files in %LIB_DIR%:
 dir /b "%LIB_DIR%\*.py"
 echo.
 
-echo Generating pyRevit script launcher...
-(
-    echo # -*- coding: utf-8 -*-
-    echo """Rhino-to-Revit One-Click Transfer Launcher"""
-    echo import sys
-    echo import os
-    echo _this_dir = os.path.dirname^(os.path.abspath^(__file__^)^)
-    echo lib_dir = os.path.normpath^(os.path.join^(_this_dir, '..', '..', '..', 'lib'^)^)
-    echo if os.path.exists^(lib_dir^) and lib_dir not in sys.path:
-    echo     sys.path.insert^(0, lib_dir^)
-    echo pkg_fallback = r"%PKG_DIR%"
-    echo if not os.path.exists^(os.path.join^(lib_dir, 'main_launcher.py'^)^) and os.path.exists^(pkg_fallback^):
-    echo     if pkg_fallback not in sys.path:
-    echo         sys.path.insert^(0, pkg_fallback^)
-    echo for _mod in ['scanner', 'classifier', 'ai_assistant', 'profile_manager', 'conversion_router', 'graphics_validator', 'sync_engine', 'reporting', 'ui_dialog', 'main_launcher']:
-    echo     if _mod in sys.modules:
-    echo         del sys.modules[_mod]
-    echo import main_launcher
-    echo doc = None
-    echo uidoc = None
-    echo try:
-    echo     if '__revit__' in globals^(^):
-    echo         uidoc = __revit__.ActiveUIDocument
-    echo         doc = uidoc.Document if uidoc else None
-    echo except Exception:
-    echo     pass
-    echo main_launcher.launch_transfer^(revit_doc=doc, revit_uidoc=uidoc^)
-) > "%SCRIPT_FILE%"
+echo Deploying pyRevit button launcher and metadata...
+if exist "%~dp0script.py" (
+    copy /Y "%~dp0script.py" "%SCRIPT_FILE%" >nul
+) else (
+    (
+        echo # -*- coding: utf-8 -*-
+        echo """Rhino-to-Revit One-Click Transfer Launcher"""
+        echo import sys
+        echo import os
+        echo import clr
+        echo clr.AddReference^("System"^)
+        echo import System
+        echo loaded = [a.GetName^(^).Name for a in System.AppDomain.CurrentDomain.GetAssemblies^(^)]
+        echo if "RhinoCommon" not in loaded:
+        echo     try:
+        echo         from Autodesk.Revit.UI import TaskDialog, TaskDialogCommonButtons, TaskDialogIcon
+        echo         td = TaskDialog^("R2R Transfer - Rhino.Inside Required"^)
+        echo         td.MainInstruction = "Rhino.Inside.Revit is Not Started"
+        echo         td.MainContent = "Rhino.Inside is not currently active in Revit.\n\nPlease go to the 'Rhino.Inside' ribbon tab and click 'Start' first."
+        echo         td.MainIcon = TaskDialogIcon.TaskDialogIconWarning
+        echo         td.CommonButtons = TaskDialogCommonButtons.Ok
+        echo         td.Show^(^)
+        echo     except Exception:
+        echo         pass
+        echo     sys.exit^(0^)
+        echo _this_dir = os.path.dirname^(os.path.abspath^(__file__^)^)
+        echo lib_dir = os.path.normpath^(os.path.join^(_this_dir, '..', '..', '..', 'lib'^)^)
+        echo if os.path.exists^(lib_dir^) and lib_dir not in sys.path:
+        echo     sys.path.insert^(0, lib_dir^)
+        echo import main_launcher
+        echo doc = None
+        echo uidoc = None
+        echo try:
+        echo     if '__revit__' in globals^(^):
+        echo         uidoc = __revit__.ActiveUIDocument
+        echo         doc = uidoc.Document if uidoc else None
+        echo except Exception:
+        echo     pass
+        echo main_launcher.launch_transfer^(revit_doc=doc, revit_uidoc=uidoc^)
+    ) > "%SCRIPT_FILE%"
+)
 
-echo Generating button configuration...
-(
-    echo title: "One-Click\nTransfer"
-    echo tooltip: "Launch the Rhino-to-Revit 6-stage transfer dashboard (SCAN -> CLASSIFY -> REVIEW -> TRANSFER -> VALIDATE -> SYNC)"
-    echo author: "AEC Computational Design Team"
-) > "%BUNDLE_YAML%"
+if exist "%~dp0bundle.yaml" (
+    copy /Y "%~dp0bundle.yaml" "%BUNDLE_YAML%" >nul
+) else (
+    (
+        echo title: "One-Click\nTransfer"
+        echo tooltip: "Launch the Rhino-to-Revit 6-stage transfer dashboard (SCAN -> CLASSIFY -> REVIEW -> TRANSFER -> VALIDATE -> SYNC)"
+        echo author: "AEC Computational Design Team"
+    ) > "%BUNDLE_YAML%"
+)
 
 echo.
 echo ==========================================================

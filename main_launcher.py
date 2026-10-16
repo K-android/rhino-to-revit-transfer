@@ -20,81 +20,128 @@ for p in [current_dir, parent_dir]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-# Environment and CLR Assembly Resolution
+# Environment and Context Defaults
 REVIT_DOC = None
 REVIT_UIDOC = None
-IS_RIR = False
 
-try:
-    import clr
-    clr.AddReference("System")
 
-    # Try RhinoCommon
+def check_rhino_inside_status():
+    """Checks whether Rhino.Inside.Revit is active in the Revit process.
+
+    Inspects only ALREADY loaded assemblies in the AppDomain.
+    CRITICAL: Does NOT call clr.AddReference or load DLLs from disk if Rhino
+    is not running, preventing assembly conflict locks with openNURBS.
+    """
     try:
+        import clr
+        clr.AddReference("System")
+        import System
+
+        loaded_assemblies = [a.GetName().Name for a in System.AppDomain.CurrentDomain.GetAssemblies()]
+    except Exception:
+        loaded_assemblies = []
+
+    # If RhinoCommon is not already in the AppDomain, Rhino has not been started
+    if "RhinoCommon" not in loaded_assemblies:
+        return (False, "Rhino.Inside is not currently active in Revit.\n\n"
+                       "Please go to the 'Rhino.Inside' ribbon tab and click 'Start' (or 'Rhino') first.\n\n"
+                       "Once Rhino is open, click 'One-Click Transfer' again.")
+
+    # RhinoCommon is loaded; verify active document
+    try:
+        import clr
         clr.AddReference("RhinoCommon")
         import Rhino
-        import Rhino.UI as rui
-    except Exception:
-        Rhino = None
+        if not hasattr(Rhino, "RhinoApp") or Rhino.RhinoApp.ExeVersion <= 0:
+            return (False, "Rhino is initializing but not fully ready. Please wait a moment and try again.")
+        if not Rhino.RhinoDoc.ActiveDoc:
+            return (False, "Rhino is running, but no 3DM document is currently open.\n\n"
+                           "Please open your model in Rhino before scanning.")
+    except Exception as ex:
+        return (False, "Rhino runtime check notice:\n{}".format(ex))
 
-    # Try Rhino.Inside.Revit
-    try:
-        clr.AddReference("RhinoInside.Revit")
-        import RhinoInside.Revit as RIR
-        from RhinoInside.Revit import Revit
-        REVIT_DOC = Revit.ActiveDBDocument
-        REVIT_UIDOC = Revit.ActiveUIDocument
-        IS_RIR = True
-    except Exception:
-        pass
+    return (True, "")
 
-    # Try pyRevit / Standard Revit UI environment fallback
-    if not REVIT_DOC:
+
+def _resolve_revit_context(revit_doc=None, revit_uidoc=None):
+    """Resolves Revit Document and UIDocument from Rhino.Inside or pyRevit globals."""
+    doc = revit_doc
+    uidoc = revit_uidoc
+
+    if not doc:
+        # 1. Try RhinoInside.Revit only if already loaded in AppDomain
+        try:
+            import clr
+            clr.AddReference("System")
+            import System
+            loaded = [a.GetName().Name for a in System.AppDomain.CurrentDomain.GetAssemblies()]
+            if "RhinoInside.Revit" in loaded:
+                clr.AddReference("RhinoInside.Revit")
+                from RhinoInside.Revit import Revit
+                doc = Revit.ActiveDBDocument
+                uidoc = Revit.ActiveUIDocument
+        except Exception:
+            pass
+
+    if not doc:
+        # 2. Try pyRevit / Revit UI globals
         revit_app = None
         if "__revit__" in globals():
             revit_app = globals()["__revit__"]
         elif sys.modules.get('__main__') and hasattr(sys.modules['__main__'], '__revit__'):
             revit_app = getattr(sys.modules['__main__'], '__revit__')
-        
+
         if revit_app:
             try:
-                REVIT_UIDOC = revit_app.ActiveUIDocument
-                REVIT_DOC = REVIT_UIDOC.Document if REVIT_UIDOC else None
-                IS_RIR = True
+                uidoc = revit_app.ActiveUIDocument
+                doc = uidoc.Document if uidoc else None
             except Exception:
                 pass
 
-except Exception as ex:
-    print("[R2R Transfer] CLR Initialization Notice: {}".format(ex))
-
-# Import Transfer Dialog from local package
-try:
-    from ui_dialog import TransferDashboardDialog
-except (ImportError, ValueError):
-    try:
-        from .ui_dialog import TransferDashboardDialog
-    except Exception:
-        TransferDashboardDialog = None
+    return doc, uidoc
 
 
 def launch_transfer(revit_doc=None, revit_uidoc=None):
-    """Launches the interactive One-Click Rhino-to-Revit Transfer Dashboard."""
-    doc = revit_doc or REVIT_DOC
-    uidoc = revit_uidoc or REVIT_UIDOC
-
-    if not doc:
-        print("[R2R Transfer] WARNING: Running outside active Revit document.")
-        print("[R2R Transfer] Launching in offline geometry inspection mode.")
-
-    if TransferDashboardDialog is None:
-        err_msg = "[R2R Transfer] Could not load TransferDashboardDialog. Please check python environment."
-        print(err_msg)
+    """Safely launches the interactive One-Click Rhino-to-Revit Transfer Dashboard."""
+    # 1. Check Rhino.Inside readiness BEFORE loading modules to prevent locking Rhino.Inside
+    ready, not_ready_msg = check_rhino_inside_status()
+    if not ready:
         try:
-            import Autodesk.Revit.UI as UI
-            UI.TaskDialog.Show("R2R Transfer", err_msg)
+            from Autodesk.Revit.UI import TaskDialog, TaskDialogCommonButtons, TaskDialogIcon
+            td = TaskDialog("R2R Transfer - Rhino.Inside Required")
+            td.MainInstruction = "Rhino.Inside.Revit is Not Started"
+            td.MainContent = not_ready_msg
+            td.MainIcon = TaskDialogIcon.TaskDialogIconWarning
+            td.CommonButtons = TaskDialogCommonButtons.Ok
+            td.Show()
         except Exception:
-            pass
+            try:
+                import Autodesk.Revit.UI as UI
+                UI.TaskDialog.Show("R2R Transfer - Rhino.Inside Required", not_ready_msg)
+            except Exception:
+                print("[R2R Transfer NOTICE]:\n" + not_ready_msg)
         return None
+
+    # 2. Resolve Revit context
+    doc, uidoc = _resolve_revit_context(revit_doc, revit_uidoc)
+
+    # 3. Load TransferDashboardDialog
+    TransferDashboardDialog = None
+    try:
+        from ui_dialog import TransferDashboardDialog
+    except (ImportError, ValueError):
+        try:
+            from .ui_dialog import TransferDashboardDialog
+        except Exception as ex:
+            import traceback
+            err_msg = "[R2R Transfer] Could not load TransferDashboardDialog:\n" + traceback.format_exc()
+            print(err_msg)
+            try:
+                import Autodesk.Revit.UI as UI
+                UI.TaskDialog.Show("R2R Transfer", err_msg)
+            except Exception:
+                pass
+            return None
 
     try:
         dialog = TransferDashboardDialog(revit_doc=doc, revit_uidoc=uidoc)
@@ -112,7 +159,7 @@ def launch_transfer(revit_doc=None, revit_uidoc=None):
     if not dialog or not getattr(dialog, 'IsValid', True):
         return None
 
-    # Show modal anchored to Rhino Main Window if available
+    # 4. Show modal anchored to Rhino Main Window if available
     try:
         import Rhino.UI as rui
         if hasattr(rui, 'RhinoEtoApp') and hasattr(rui.RhinoEtoApp, 'MainWindow') and rui.RhinoEtoApp.MainWindow:

@@ -319,6 +319,64 @@ class TestR2RPipeline(unittest.TestCase):
         self.assertEqual(res_col.inferred_category, "Family")
         self.assertEqual(res_col.proposed_strategy, "ParametricFamily")
 
+    def test_dynamic_confidence_on_strategy_change(self):
+        """Tests that LayerRowItem dynamically updates confidence score and tier when strategy changes."""
+        from ui_dialog import LayerRowItem
+
+        obj = ScannedObject("test-panel")
+        obj.layer_name = "FAÇADE::PANELS"
+        obj.adaptive_point_count = 4
+
+        c_res = ClassificationResult("test-panel")
+        c_res.inferred_category = "CurtainPanel"
+        c_res.proposed_strategy = "AdaptiveComponent"
+        c_res.confidence_score = 98.0
+        c_res.confidence_tier = "AUTO_READY"
+
+        row = LayerRowItem("FAÇADE::PANELS", [obj], c_res, None)
+        self.assertEqual(row.confidence_score, 98.0)
+        self.assertEqual(row.confidence_tier, "AUTO_READY")
+
+        # Change strategy to FloorNative (object is NOT horizontal)
+        row.update_strategy("FloorNative")
+        self.assertEqual(row.proposed_strategy, "FloorNative")
+        self.assertEqual(row.confidence_score, 65.0)
+        self.assertEqual(row.confidence_tier, "SUGGESTED_NEEDS_APPROVAL")
+
+        # Change strategy to DirectShape (universal compatibility)
+        row.update_strategy("DirectShape")
+        self.assertEqual(row.proposed_strategy, "DirectShape")
+        self.assertEqual(row.confidence_score, 100.0)
+        self.assertEqual(row.confidence_tier, "AUTO_READY")
+
+    def test_conversion_router_unit_scaling(self):
+        """Tests that ConversionRouter properly respects custom unit scale overrides."""
+        from conversion_router import ConversionRouter
+
+        # Default fallback scale
+        router_auto = ConversionRouter(None, global_mode="Hybrid")
+        self.assertTrue(router_auto.unit_scale > 0)
+
+        # Custom scale override (e.g., Millimeters -> Feet: 1.0 / 304.8)
+        custom_mm_scale = 1.0 / 304.8
+        router_mm = ConversionRouter(None, global_mode="Hybrid", unit_scale=custom_mm_scale)
+        self.assertAlmostEqual(router_mm.unit_scale, custom_mm_scale, places=6)
+
+        # Custom scale override (e.g., Meters -> Feet: 3.28084)
+        custom_m_scale = 3.280839895013123
+        router_m = ConversionRouter(None, global_mode="Hybrid", unit_scale=custom_m_scale)
+        self.assertAlmostEqual(router_m.unit_scale, custom_m_scale, places=6)
+
+    def test_check_rhino_inside_status_guard(self):
+        """Tests that check_rhino_inside_status safely inspects AppDomain without throwing."""
+        from main_launcher import check_rhino_inside_status
+
+        ready, msg = check_rhino_inside_status()
+        self.assertIsInstance(ready, bool)
+        self.assertIsInstance(msg, str)
+        if not ready:
+            self.assertTrue("Rhino" in msg)
+
 
 if __name__ == "__main__":
     unittest.main()

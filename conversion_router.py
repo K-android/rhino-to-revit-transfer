@@ -120,17 +120,19 @@ class ConversionResult(object):
 class ConversionRouter(object):
     """10-pipeline dispatcher coordinating Rhino.Inside.Revit element generation."""
 
-    def __init__(self, revit_doc, global_mode="Hybrid", generate_bua=True):
+    def __init__(self, revit_doc, global_mode="Hybrid", generate_bua=True, unit_scale=None):
         """
         :param revit_doc: Autodesk.Revit.DB.Document
         :param global_mode: "Native BIM" | "Hybrid" | "Geometry-First"
         :param generate_bua: Boolean toggle for Auto-BUA Area Plan generation
+        :param unit_scale: Optional float override for Rhino-to-Revit foot scale
         """
         self.doc = revit_doc
         self.global_mode = global_mode
         self.generate_bua = generate_bua
         self.failures_preprocessor = TransferFailuresPreprocessor() if REVIT_AVAILABLE else None
-        self.unit_scale = self._calc_rhino_to_revit_scale()
+        self.natural_unit_scale = self._calc_rhino_to_revit_scale()
+        self.unit_scale = float(unit_scale) if unit_scale is not None else self.natural_unit_scale
 
         # Cache Revit Level and Type IDs for performance
         self.level_cache = {}
@@ -638,14 +640,22 @@ class ConversionRouter(object):
                     type_id = self.repetitive_type_cache[type_key]
 
                 if not type_id:
-                    # Canonical definition: local origin (0, 0, 0)
-                    cx = scanned_obj.centroid[0] * self.unit_scale
-                    cy = scanned_obj.centroid[1] * self.unit_scale
-                    cz = scanned_obj.centroid[2] * self.unit_scale
-                    canonical_geom = geom_feet.Duplicate()
-                    if hasattr(canonical_geom, "Translate"):
-                        canonical_geom.Translate(-cx, -cy, -cz)
-                    revit_geoms = self._convert_rhino_to_revit_geometry(canonical_geom)
+                    # Canonical definition: local origin (0, 0, 0) in native Rhino units and Revit feet
+                    cx_raw = scanned_obj.centroid[0]
+                    cy_raw = scanned_obj.centroid[1]
+                    cz_raw = scanned_obj.centroid[2]
+                    canonical_raw = scanned_obj.raw_geometry.Duplicate()
+                    if hasattr(canonical_raw, "Translate"):
+                        canonical_raw.Translate(-cx_raw, -cy_raw, -cz_raw)
+
+                    cx_feet = cx_raw * self.unit_scale
+                    cy_feet = cy_raw * self.unit_scale
+                    cz_feet = cz_raw * self.unit_scale
+                    canonical_feet = geom_feet.Duplicate()
+                    if hasattr(canonical_feet, "Translate"):
+                        canonical_feet.Translate(-cx_feet, -cy_feet, -cz_feet)
+
+                    revit_geoms = self._convert_rhino_to_revit_geometry(canonical_raw, geom_feet=canonical_feet)
                     if revit_geoms and len(revit_geoms) > 0:
                         dst = DB.DirectShapeType.Create(self.doc, type_key, cat_id)
                         dst.SetShape(revit_geoms)
@@ -791,8 +801,8 @@ class ConversionRouter(object):
             else:
                 category_id = DB.ElementId(DB.BuiltInCategory.OST_GenericModel)
 
-        # Convert Rhino geometry to Revit DB.GeometryObject
-        revit_geoms = self._convert_rhino_to_revit_geometry(geom_feet)
+        # Convert Rhino geometry to Revit DB.GeometryObject without double scaling
+        revit_geoms = self._convert_rhino_to_revit_geometry(scanned_obj.raw_geometry, geom_feet=geom_feet)
         if not revit_geoms or len(revit_geoms) == 0:
             if res:
                 res.status = "FAILED"
@@ -855,12 +865,31 @@ class ConversionRouter(object):
     # =========================================================================
     # Geometry Helpers & Encoders
     # =========================================================================
-    def _convert_rhino_to_revit_geometry(self, rh_geom):
-        """Converts Rhino Brep, Extrusion, Surface, SubD, Mesh, or Curve into IList of Revit DB.GeometryObject."""
+    def _convert_rhino_to_revit_geometry(self, rh_geom, geom_feet=None):
+        """Converts Rhino Brep, Extrusion, Surface, SubD, Mesh, or Curve into IList of Revit DB.GeometryObject.
+
+        Prevents double-scaling:
+        - Passes native unscaled Rhino geometry to Rhino.Inside GeometryEncoder
+          (which handles active RhinoDoc units -> Revit internal feet conversion automatically).
+        - Applies manual scale override ratio if user overrode document units in the UI.
+        - Uses geom_feet (scaled by unit_scale) for native TessellatedShapeBuilder fallback.
+        """
         geom_list = List[DB.GeometryObject]()
+        if not rh_geom:
+            return geom_list
+
+        # Determine if a manual unit scale override is in effect
+        scale_ratio = 1.0
+        if getattr(self, "natural_unit_scale", 1.0) > 0 and getattr(self, "unit_scale", 1.0) > 0:
+            scale_ratio = self.unit_scale / self.natural_unit_scale
+
+        working_geom = rh_geom
+        if abs(scale_ratio - 1.0) > 0.001:
+            working_geom = rh_geom.Duplicate()
+            if hasattr(working_geom, "Scale"):
+                working_geom.Scale(scale_ratio)
 
         # Normalize Extrusions, Surfaces, SubDs to Brep if needed
-        working_geom = rh_geom
         if not isinstance(working_geom, (rg.Brep, rg.Mesh)) and hasattr(working_geom, "ToBrep"):
             try:
                 brep_conv = working_geom.ToBrep()
@@ -869,7 +898,7 @@ class ConversionRouter(object):
             except Exception:
                 pass
 
-        # 1. Try RIR GeometryEncoder
+        # 1. Try RIR GeometryEncoder using native Rhino geometry (GeometryEncoder automatically scales to feet)
         try:
             if hasattr(GeometryEncoder, "ToGeometryObject"):
                 rvt_obj = GeometryEncoder.ToGeometryObject(working_geom)
@@ -896,14 +925,20 @@ class ConversionRouter(object):
         except Exception:
             pass
 
-        # 3. Native Revit TessellatedShapeBuilder fallback (handles any Brep, Extrusion, or Mesh)
+        # 3. Native Revit TessellatedShapeBuilder fallback (uses geom_feet with explicit feet coordinates)
         try:
+            working_feet = geom_feet
+            if not working_feet:
+                working_feet = working_geom.Duplicate()
+                if hasattr(working_feet, "Scale"):
+                    working_feet.Scale(self.unit_scale)
+
             meshes = []
-            if isinstance(working_geom, rg.Mesh):
-                meshes = [working_geom]
-            elif isinstance(working_geom, rg.Brep):
+            if isinstance(working_feet, rg.Mesh):
+                meshes = [working_feet]
+            elif isinstance(working_feet, rg.Brep):
                 mp = rg.MeshingParameters.Default
-                brep_meshes = rg.Mesh.CreateFromBrep(working_geom, mp)
+                brep_meshes = rg.Mesh.CreateFromBrep(working_feet, mp)
                 if brep_meshes:
                     meshes = list(brep_meshes)
 
