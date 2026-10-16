@@ -129,6 +129,41 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         # Build UI Structure
         self._init_ui()
 
+    def _create_separator(self):
+        """Creates a 1px horizontal divider panel compatible with all Eto.Forms versions."""
+        sep = ef.Panel()
+        sep.Height = 1
+        sep.Size = ed.Size(-1, 1)
+        try:
+            sep.BackgroundColor = ed.Colors.LightGrey
+        except Exception:
+            pass
+        return sep
+
+    def _set_bold_font(self, ctrl, size=11):
+        """Safely assigns a bold font across IronPython 2.7 and CPython 3 / pythonnet."""
+        try:
+            ctrl.Font = ed.Font(ed.SystemFont.Bold, float(size))
+        except Exception:
+            try:
+                ctrl.Font = ed.SystemFonts.Bold()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _make_elem_id(val):
+        try:
+            import System
+            return DB.ElementId(System.Int64(val))
+        except Exception:
+            return DB.ElementId(int(val))
+
+    def _on_close_clicked(self, sender, e):
+        try:
+            self.Close(True)
+        except Exception:
+            self.Close()
+
     def _init_ui(self):
         """Constructs layout, header tabs, and stage views."""
         layout = ef.DynamicLayout()
@@ -137,7 +172,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         # Top Header Bar
         header_label = ef.Label()
         header_label.Text = "ONE-CLICK RHINO-TO-REVIT TRANSFER"
-        header_label.Font = ed.Font(ed.SystemFont.Bold, 15)
+        self._set_bold_font(header_label, 15)
         header_label.TextColor = ed.Color.FromArgb(20, 110, 190)
 
         subtitle = ef.Label()
@@ -146,7 +181,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         layout.Add(header_label)
         layout.Add(subtitle)
-        layout.Add(ef.Separator())
+        layout.Add(self._create_separator())
 
         # Main 5-Stage Tab Control
         self.tabs = ef.TabControl()
@@ -175,8 +210,9 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.tabs.Pages.Add(self.tab_preview)
         self.tabs.Pages.Add(self.tab_execute)
         self.tabs.Pages.Add(self.tab_validate)
+        self.tabs.SelectedIndexChanged += self._on_tab_changed
 
-        layout.Add(self.tabs, yscale=True)
+        layout.Add(self.tabs, True, True)
 
         # Bottom Action Bar
         bottom_layout = ef.DynamicLayout()
@@ -188,11 +224,11 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         btn_close = ef.Button()
         btn_close.Text = "Close"
-        btn_close.Click += lambda sender, e: self.Close(True)
+        btn_close.Click += self._on_close_clicked
 
         bottom_layout.BeginHorizontal()
-        bottom_layout.Add(self.lbl_global_status, xscale=True)
-        bottom_layout.Add(btn_close, xscale=False)
+        bottom_layout.Add(self.lbl_global_status, True, False)
+        bottom_layout.Add(btn_close, False, False)
         bottom_layout.EndHorizontal()
 
         layout.Add(bottom_layout)
@@ -220,7 +256,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         btn_scan = ef.Button()
         btn_scan.Text = "Scan Active Rhino Document"
-        btn_scan.Font = ed.Font(ed.SystemFont.Bold, 11)
+        self._set_bold_font(btn_scan, 11)
         btn_scan.Size = ed.Size(260, 36)
         btn_scan.Click += self._on_scan_clicked
 
@@ -230,12 +266,12 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         layout.Add(self.chk_include_locked)
         layout.EndHorizontal()
         layout.Add(btn_scan)
-        layout.Add(ef.Separator())
+        layout.Add(self._create_separator())
 
         # Preflight KPI Cards Box
         cards_title = ef.Label()
         cards_title.Text = "PREFLIGHT & GEOMETRIC HEALTH SUMMARY"
-        cards_title.Font = ed.Font(ed.SystemFont.Bold, 11)
+        self._set_bold_font(cards_title, 11)
         layout.Add(cards_title)
 
         self.lbl_kpi_units = ef.Label()
@@ -264,7 +300,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.txt_scan_warnings.ReadOnly = True
         self.txt_scan_warnings.Size = ed.Size(-1, 140)
         self.txt_scan_warnings.Text = "No preflight warnings."
-        layout.Add(self.txt_scan_warnings, yscale=True)
+        layout.Add(self.txt_scan_warnings, True, True)
 
         return layout
 
@@ -347,6 +383,14 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.chk_gen_bua.Text = "Auto-Generate BUA / GFA Area Boundary Lines"
         self.chk_gen_bua.Checked = True
 
+        btn_select_all = ef.Button()
+        btn_select_all.Text = "Select All"
+        btn_select_all.Click += self._on_select_all_layers
+
+        btn_deselect_all = ef.Button()
+        btn_deselect_all.Text = "Deselect All"
+        btn_deselect_all.Click += self._on_deselect_all_layers
+
         btn_ai_assist = ef.Button()
         btn_ai_assist.Text = "Run AI Semantic Assist"
         btn_ai_assist.ToolTip = "Interpret Spanish/Catalan architectural layer naming using semantic AI heuristics"
@@ -364,6 +408,8 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         opts_layout.Add(lbl_mode)
         opts_layout.Add(self.dd_global_mode)
         opts_layout.Add(self.chk_gen_bua)
+        opts_layout.Add(btn_select_all)
+        opts_layout.Add(btn_deselect_all)
         opts_layout.Add(btn_ai_assist)
         opts_layout.Add(btn_load_profile)
         opts_layout.Add(btn_save_profile)
@@ -375,6 +421,10 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.grid_review = ef.GridView()
         self.grid_review.ShowHeader = True
         self.grid_review.AllowMultipleSelection = True
+        try:
+            self.grid_review.CellEdited += self._on_review_cell_edited
+        except Exception:
+            pass
 
         # Checkbox column
         col_check = ef.GridColumn()
@@ -432,7 +482,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         col_sync.Width = 110
         self.grid_review.Columns.Add(col_sync)
 
-        layout.Add(self.grid_review, yscale=True)
+        layout.Add(self.grid_review, True, True)
         return layout
 
     # =========================================================================
@@ -445,12 +495,12 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         title = ef.Label()
         title.Text = "PRE-EXECUTION TRANSACTION DASHBOARD"
-        title.Font = ed.Font(ed.SystemFont.Bold, 12)
+        self._set_bold_font(title, 12)
         layout.Add(title)
 
         self.lbl_prev_create = ef.Label()
         self.lbl_prev_create.Text = "Elements to CREATE: 0"
-        self.lbl_prev_create.Font = ed.Font(ed.SystemFont.Bold, 11)
+        self._set_bold_font(self.lbl_prev_create, 11)
 
         self.lbl_prev_update = ef.Label()
         self.lbl_prev_update.Text = "Elements to UPDATE (Modified Geometry): 0"
@@ -469,7 +519,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         layout.Add(self.lbl_prev_skip)
         layout.Add(self.lbl_prev_review)
         layout.Add(self.lbl_prev_missing)
-        layout.Add(ef.Separator())
+        layout.Add(self._create_separator())
 
         notice = ef.Label()
         notice.Text = "Notice: Clicking 'Proceed to Transfer' will switch to the Execute tab and initiate Revit API Transactions with automated warning suppression."
@@ -478,7 +528,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         btn_go_execute = ef.Button()
         btn_go_execute.Text = "Proceed to Transfer ->"
-        btn_go_execute.Font = ed.Font(ed.SystemFont.Bold, 11)
+        self._set_bold_font(btn_go_execute, 11)
         btn_go_execute.Size = ed.Size(220, 36)
 
         def _on_nav_to_execute(s, e):
@@ -499,12 +549,12 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         title = ef.Label()
         title.Text = "REVIT TRANSACTION EXECUTION PIPELINE"
-        title.Font = ed.Font(ed.SystemFont.Bold, 12)
+        self._set_bold_font(title, 12)
         layout.Add(title)
 
         self.btn_execute = ef.Button()
         self.btn_execute.Text = "Execute R2R Transfer"
-        self.btn_execute.Font = ed.Font(ed.SystemFont.Bold, 12)
+        self._set_bold_font(self.btn_execute, 12)
         self.btn_execute.Size = ed.Size(260, 40)
         self.btn_execute.Click += self._on_execute_transfer
         layout.Add(self.btn_execute)
@@ -526,7 +576,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.txt_exec_log = ef.TextArea()
         self.txt_exec_log.ReadOnly = True
         self.txt_exec_log.Size = ed.Size(-1, 260)
-        layout.Add(self.txt_exec_log, yscale=True)
+        layout.Add(self.txt_exec_log, True, True)
 
         return layout
 
@@ -544,7 +594,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         lbl_val_title = ef.Label()
         lbl_val_title.Text = "DUAL-STATUS BIM & GRAPHICS VALIDATION AUDIT"
-        lbl_val_title.Font = ed.Font(ed.SystemFont.Bold, 12)
+        self._set_bold_font(lbl_val_title, 12)
 
         btn_isolate = ef.Button()
         btn_isolate.Text = "Select / Isolate in Revit"
@@ -560,7 +610,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         btn_export_csv.Click += self._on_export_csv
 
         top_layout.BeginHorizontal()
-        top_layout.Add(lbl_val_title, xscale=True)
+        top_layout.Add(lbl_val_title, True, False)
         top_layout.Add(btn_isolate)
         top_layout.Add(btn_export_html)
         top_layout.Add(btn_export_csv)
@@ -593,7 +643,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             col.Width = width
             self.grid_validate.Columns.Add(col)
 
-        layout.Add(self.grid_validate, yscale=True)
+        layout.Add(self.grid_validate, True, True)
         return layout
 
     # =========================================================================
@@ -670,6 +720,43 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         # Sync Engine Evaluation
         self.sync_evaluations, self.missing_in_rhino = self.sync_engine.evaluate_sync_states(self.scanned_objects)
 
+    def _sync_grid_check_states(self):
+        """Syncs checkbox state changes made in Eto GridView back to LayerRowItem objects."""
+        try:
+            ds = self.grid_review.DataStore
+            if ds is not None and self.filtered_layer_rows:
+                for idx, row_data in enumerate(ds):
+                    if idx < len(self.filtered_layer_rows) and len(row_data) > 0:
+                        self.filtered_layer_rows[idx].checked = bool(row_data[0])
+        except Exception:
+            pass
+
+    def _on_review_cell_edited(self, sender, e):
+        """Updates LayerRowItem checked state and preview KPIs when user edits a cell."""
+        self._sync_grid_check_states()
+        self._update_preview_kpis()
+
+    def _on_tab_changed(self, sender, e):
+        """Syncs grid checkbox selections whenever user switches tabs."""
+        self._sync_grid_check_states()
+        self._update_preview_kpis()
+
+    def _on_select_all_layers(self, sender, e):
+        """Checks all currently visible layers in the review grid."""
+        self._sync_grid_check_states()
+        for r in self.filtered_layer_rows:
+            r.checked = True
+        self._refresh_review_grid_datastore()
+        self._update_preview_kpis()
+
+    def _on_deselect_all_layers(self, sender, e):
+        """Unchecks all currently visible layers in the review grid."""
+        self._sync_grid_check_states()
+        for r in self.filtered_layer_rows:
+            r.checked = False
+        self._refresh_review_grid_datastore()
+        self._update_preview_kpis()
+
     def _populate_review_grid(self):
         """Groups scanned objects by layer and populates DataGridView."""
         layer_groups = {}
@@ -685,14 +772,40 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             c_res = self.classifications.get(rep_obj.rhino_guid)
             s_ev = self.sync_evaluations.get(rep_obj.rhino_guid)
 
-            checked = c_res.is_prechecked if c_res else False
+            checked = c_res.is_prechecked if c_res else True
             row = LayerRowItem(lp, objs, c_res, s_ev, checked=checked)
             self.layer_rows.append(row)
 
+        # If no layers met the high auto-ready threshold (e.g., generic Rhino layer names
+        # like 'Default' or 'Layer 01'), pre-check all layers so user can transfer immediately
+        if self.layer_rows and not any(r.checked for r in self.layer_rows):
+            for r in self.layer_rows:
+                r.checked = True
+
         self._apply_review_filters(None, None)
+
+    def _refresh_review_grid_datastore(self):
+        """Rebinds filtered_layer_rows to self.grid_review.DataStore."""
+        grid_data = []
+        for r in self.filtered_layer_rows:
+            grid_data.append([
+                r.checked,
+                r.layer_name,
+                str(r.object_count),
+                r.inferred_category,
+                r.proposed_strategy,
+                r.revit_type,
+                "{:.0f}%".format(r.confidence_score),
+                r.sync_state
+            ])
+
+        self.grid_review.DataStore = grid_data
 
     def _apply_review_filters(self, sender, e):
         """Filters the review DataGridView based on search text, category, confidence and sync state."""
+        if sender is not None:
+            self._sync_grid_check_states()
+
         search_txt = (self.txt_search.Text or "").strip().lower()
         cat_filter = str(self.dd_cat_filter.SelectedValue or "All Categories")
         conf_filter = str(self.dd_conf_filter.SelectedValue or "All Tiers")
@@ -715,21 +828,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
             self.filtered_layer_rows.append(r)
 
-        # Bind to Eto GridView data store
-        grid_data = []
-        for r in self.filtered_layer_rows:
-            grid_data.append([
-                r.checked,
-                r.layer_name,
-                str(r.object_count),
-                r.inferred_category,
-                r.proposed_strategy,
-                r.revit_type,
-                "{:.0f}%".format(r.confidence_score),
-                r.sync_state
-            ])
-
-        self.grid_review.DataStore = grid_data
+        self._refresh_review_grid_datastore()
 
     def _update_preview_kpis(self):
         """Calculates exact execution counts for the Preview tab."""
@@ -765,6 +864,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
     def _on_run_ai_assist(self, sender, e):
         """Uses AI semantic interpreter to resolve ambiguous Catalan/Spanish layers."""
+        self._sync_grid_check_states()
         self.lbl_global_status.Text = "Running semantic interpretation on layers..."
         boosted = 0
         for r in self.layer_rows:
@@ -776,7 +876,8 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 r.checked = True
                 boosted += 1
 
-        self._apply_review_filters(None, None)
+        self._refresh_review_grid_datastore()
+        self._update_preview_kpis()
         self.lbl_global_status.Text = "AI Semantic Assist refined {} layer classifications.".format(boosted)
 
     def _on_load_profile(self, sender, e):
@@ -784,10 +885,12 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         if self.profile_mgr.load():
             self._run_classification_and_sync()
             self._populate_review_grid()
+            self._update_preview_kpis()
             ef.MessageBox.Show("Transfer Profile loaded successfully.", "Profile Manager")
 
     def _on_save_profile(self, sender, e):
         """Saves current layer table configurations as persistent profile rules."""
+        self._sync_grid_check_states()
         for r in self.layer_rows:
             if r.checked:
                 rule = MappingRule(
@@ -804,6 +907,8 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
     def _on_execute_transfer(self, sender, e):
         """Executes full transfer with Revit TransactionGroup and Failure handling."""
+        self._sync_grid_check_states()
+
         if not REVIT_AVAILABLE or not self.revit_doc:
             ef.MessageBox.Show("Revit document is not available. Please run inside Rhino.Inside.Revit.", "Transfer")
             return
@@ -826,7 +931,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         total = len(approved_objs)
         if total == 0:
-            self.txt_exec_log.Text += "No objects approved for transfer.\n"
+            self.txt_exec_log.Text += "No objects approved for transfer. Please scan and check layers in Review tab.\n"
             self.btn_execute.Enabled = True
             return
 
@@ -863,11 +968,20 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
                     trans.Start()
 
+                    # If updating modified geometry, delete previous Revit element before recreating
+                    if s_ev and s_ev.sync_state == "UPDATE_MODIFIED" and s_ev.revit_element_id > 0:
+                        try:
+                            old_eid = self._make_elem_id(s_ev.revit_element_id)
+                            if self.revit_doc.GetElement(old_eid) is not None:
+                                self.revit_doc.Delete(old_eid)
+                        except Exception:
+                            pass
+
                     conv_res = router.convert_object(obj, c_res)
 
                     if conv_res.status == "SUCCESS" and conv_res.revit_element_id != -1:
                         # Write ExtensibleStorage sync tracking
-                        created_elem = self.revit_doc.GetElement(DB.ElementId(conv_res.revit_element_id))
+                        created_elem = self.revit_doc.GetElement(self._make_elem_id(conv_res.revit_element_id))
                         self.sync_engine.write_sync_record(created_elem, obj, conv_res.strategy_used)
 
                         trans.Commit()
@@ -970,11 +1084,24 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             GraphicsValidator.isolate_element_in_view(self.revit_uidoc, elem_id)
             self.lbl_global_status.Text = "Element ID {} isolated in Revit view.".format(elem_id)
 
+    @staticmethod
+    def _add_file_filter(dlg, name, ext):
+        """Safely adds a FileFilter across IronPython 2.7 and CPython 3 (pythonnet)."""
+        try:
+            import System
+            arr = System.Array[System.String]([ext])
+            dlg.Filters.Add(ef.FileFilter(name, arr))
+        except Exception:
+            try:
+                dlg.Filters.Add(ef.FileFilter(name, ext))
+            except Exception:
+                pass
+
     def _on_export_html(self, sender, e):
         """Exports QA report as interactive HTML."""
         dlg = ef.SaveFileDialog()
         dlg.Title = "Save QA Report (HTML)"
-        dlg.Filters.Add(ef.FileFilter("HTML File (*.html)", "*.html"))
+        self._add_file_filter(dlg, "HTML File (*.html)", ".html")
         dlg.FileName = "R2R_QA_Report.html"
 
         if dlg.ShowDialog(self) == ef.DialogResult.Ok:
@@ -986,10 +1113,11 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         """Exports QA report as CSV."""
         dlg = ef.SaveFileDialog()
         dlg.Title = "Save QA Report (CSV)"
-        dlg.Filters.Add(ef.FileFilter("CSV File (*.csv)", "*.csv"))
+        self._add_file_filter(dlg, "CSV File (*.csv)", ".csv")
         dlg.FileName = "R2R_QA_Report.csv"
 
         if dlg.ShowDialog(self) == ef.DialogResult.Ok:
             dest = dlg.FileName
             ReportExporter.export_csv(self.qa_report, dest)
             ef.MessageBox.Show("CSV QA Report generated at:\n{}".format(dest), "QA Export")
+

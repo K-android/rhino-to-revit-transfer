@@ -220,8 +220,12 @@ class ProfileManager(object):
             "metadata": self.metadata,
             "rules": [r.to_dict() for r in self.rules]
         }
-        with open(dest, "w") as f:
-            json.dump(payload, f, indent=2)
+        try:
+            with open(dest, "w") as f:
+                json.dump(payload, f, indent=2)
+            return True
+        except Exception:
+            return False
 
     def load(self, filepath=None):
         """Loads profile from JSON file."""

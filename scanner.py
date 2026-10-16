@@ -142,29 +142,45 @@ class RhinoScanner(object):
     ORIGIN_LIMIT_METERS = 16000.0
 
     def __init__(self, rhino_doc=None):
+        self._explicit_doc = rhino_doc
+        self.doc = None
+        self._refresh_active_doc()
+        self.preflight = ScannerPreflightReport()
+
+    def _refresh_active_doc(self):
+        """Safely resolves the active Rhino document if Rhino.Inside is initialized."""
+        if self._explicit_doc is not None:
+            self.doc = self._explicit_doc
+            return
         if RHINO_AVAILABLE:
-            self.doc = rhino_doc if rhino_doc else Rhino.RhinoDoc.ActiveDoc
+            try:
+                self.doc = Rhino.RhinoDoc.ActiveDoc
+            except Exception:
+                self.doc = None
         else:
             self.doc = None
-        self.preflight = ScannerPreflightReport()
 
     def get_unit_scale_to_meters(self):
         """Calculates scale factor from active Rhino document units to meters."""
+        self._refresh_active_doc()
         if not RHINO_AVAILABLE or not self.doc:
             return 1.0
 
-        unit = self.doc.ModelUnitSystem
-        self.preflight.rhino_unit_system = str(unit)
+        try:
+            unit = self.doc.ModelUnitSystem
+            self.preflight.rhino_unit_system = str(unit)
 
-        # Rhino.UnitSystem enum mapping
-        scales = {
-            Rhino.UnitSystem.Millimeters: 0.001,
-            Rhino.UnitSystem.Centimeters: 0.01,
-            Rhino.UnitSystem.Meters: 1.0,
-            Rhino.UnitSystem.Inches: 0.0254,
-            Rhino.UnitSystem.Feet: 0.3048,
-        }
-        return scales.get(unit, 1.0)
+            # Rhino.UnitSystem enum mapping
+            scales = {
+                Rhino.UnitSystem.Millimeters: 0.001,
+                Rhino.UnitSystem.Centimeters: 0.01,
+                Rhino.UnitSystem.Meters: 1.0,
+                Rhino.UnitSystem.Inches: 0.0254,
+                Rhino.UnitSystem.Feet: 0.3048,
+            }
+            return scales.get(unit, 1.0)
+        except Exception:
+            return 1.0
 
     def scan_all(self, include_hidden=False, include_locked=False, revit_levels=None):
         """Scans the active Rhino document and returns a list of ScannedObject instances.
@@ -174,6 +190,8 @@ class RhinoScanner(object):
         :param revit_levels: List of dicts [{'name': 'L01', 'elevation': 0.0}, ...] in Rhino units.
         :return: list of ScannedObject
         """
+        self.preflight = ScannerPreflightReport()
+        self._refresh_active_doc()
         if not RHINO_AVAILABLE or not self.doc:
             return []
 

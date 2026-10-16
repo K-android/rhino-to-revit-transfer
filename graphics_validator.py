@@ -93,24 +93,44 @@ class GraphicsValidator(object):
             "3D": None
         }
         if REVIT_AVAILABLE and self.doc:
-            self._locate_test_views()
+            try:
+                self._locate_test_views()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _get_elem_id_val(elem_id):
+        if hasattr(elem_id, "Value"):
+            return int(elem_id.Value)
+        return int(elem_id.IntegerValue)
+
+    @staticmethod
+    def _make_elem_id(val):
+        try:
+            import System
+            return DB.ElementId(System.Int64(val))
+        except Exception:
+            return DB.ElementId(int(val))
 
     def _locate_test_views(self):
         """Finds representative Plan, Section, Elevation, and 3D views for documentation testing."""
         collector = DB.FilteredElementCollector(self.doc).OfClass(DB.View)
         for v in collector:
-            if v.IsTemplate:
-                continue
+            try:
+                if v.IsTemplate:
+                    continue
 
-            vt = v.ViewType
-            if vt == DB.ViewType.FloorPlan and not self.test_views["Plan"]:
-                self.test_views["Plan"] = v
-            elif vt == DB.ViewType.Section and not self.test_views["Section"]:
-                self.test_views["Section"] = v
-            elif vt == DB.ViewType.Elevation and not self.test_views["Elevation"]:
-                self.test_views["Elevation"] = v
-            elif vt == DB.ViewType.ThreeD and not v.IsPerspective and not self.test_views["3D"]:
-                self.test_views["3D"] = v
+                vt = v.ViewType
+                if vt == DB.ViewType.FloorPlan and not self.test_views["Plan"]:
+                    self.test_views["Plan"] = v
+                elif vt == DB.ViewType.Section and not self.test_views["Section"]:
+                    self.test_views["Section"] = v
+                elif vt == DB.ViewType.Elevation and not self.test_views["Elevation"]:
+                    self.test_views["Elevation"] = v
+                elif vt == DB.ViewType.ThreeD and not v.IsPerspective and not self.test_views["3D"]:
+                    self.test_views["3D"] = v
+            except Exception:
+                continue
 
     def validate_element(self, element_id, rhino_guid):
         """Executes full Dual-Status validation on a Revit element."""
@@ -122,7 +142,7 @@ class GraphicsValidator(object):
             report.issues.append("Revit environment unavailable")
             return report
 
-        elem = self.doc.GetElement(DB.ElementId(element_id))
+        elem = self.doc.GetElement(self._make_elem_id(element_id))
         if not elem:
             report.bim_status = "FAIL"
             report.graphics_status = "REVIEW"
@@ -138,7 +158,7 @@ class GraphicsValidator(object):
         # 1. BIM STATUS EVALUATION
         # ---------------------------------------------------------------------
         # Category Check
-        if not elem.Category or elem.Category.Id.IntegerValue == -1:
+        if not elem.Category or self._get_elem_id_val(elem.Category.Id) == -1:
             report.bim_status = "FAIL"
             report.issues.append("No valid Revit category assigned.")
 
@@ -247,7 +267,7 @@ class GraphicsValidator(object):
             return False
 
         try:
-            elem_id = DB.ElementId(element_id)
+            elem_id = GraphicsValidator._make_elem_id(element_id)
             elem_ids = List[DB.ElementId]()
             elem_ids.Add(elem_id)
 

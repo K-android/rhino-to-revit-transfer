@@ -83,7 +83,24 @@ class SyncEngine(object):
         self.doc = revit_doc
         self.schema = None
         if REVIT_AVAILABLE and self.doc:
-            self.schema = self._get_or_create_schema()
+            try:
+                self.schema = self._get_or_create_schema()
+            except Exception:
+                self.schema = None
+
+    @staticmethod
+    def _get_elem_id_val(elem_id):
+        if hasattr(elem_id, "Value"):
+            return int(elem_id.Value)
+        return int(elem_id.IntegerValue)
+
+    @staticmethod
+    def _make_elem_id(val):
+        try:
+            import System
+            return DB.ElementId(System.Int64(val))
+        except Exception:
+            return DB.ElementId(int(val))
 
     def _get_or_create_schema(self):
         """Initializes the Revit ExtensibleStorage schema for R2R transfer metadata."""
@@ -95,17 +112,18 @@ class SyncEngine(object):
         builder = ES.SchemaBuilder(schema_guid)
         builder.SetReadAccessLevel(ES.AccessLevel.Public)
         builder.SetWriteAccessLevel(ES.AccessLevel.Public)
-        builder.SetVendorId("AEC_R2R")
+        builder.SetVendorId("AECR2R")
         builder.SetSchemaName("AecTransferTracking")
         builder.SetDocumentation("Tracks Rhino-to-Revit transfer identity and geometry hash")
 
-        builder.AddSimpleField("R2R_SourceDocName", str)
-        builder.AddSimpleField("R2R_RhinoGUID", str)
-        builder.AddSimpleField("R2R_LayerPath", str)
-        builder.AddSimpleField("R2R_GeoHash", str)
-        builder.AddSimpleField("R2R_MappingVersion", str)
-        builder.AddSimpleField("R2R_Timestamp", str)
-        builder.AddSimpleField("R2R_Strategy", str)
+        str_type = clr.GetClrType(str) if hasattr(clr, "GetClrType") else str
+        builder.AddSimpleField("R2R_SourceDocName", str_type)
+        builder.AddSimpleField("R2R_RhinoGUID", str_type)
+        builder.AddSimpleField("R2R_LayerPath", str_type)
+        builder.AddSimpleField("R2R_GeoHash", str_type)
+        builder.AddSimpleField("R2R_MappingVersion", str_type)
+        builder.AddSimpleField("R2R_Timestamp", str_type)
+        builder.AddSimpleField("R2R_Strategy", str_type)
 
         return builder.Finish()
 
@@ -119,14 +137,15 @@ class SyncEngine(object):
             if not entity.IsValid():
                 return None
 
-            rec = RevitSyncRecord(element.Id.IntegerValue)
-            rec.source_doc_name = entity.Get[str]("R2R_SourceDocName")
-            rec.rhino_guid = entity.Get[str]("R2R_RhinoGUID")
-            rec.layer_path = entity.Get[str]("R2R_LayerPath")
-            rec.geo_hash = entity.Get[str]("R2R_GeoHash")
-            rec.mapping_version = entity.Get[str]("R2R_MappingVersion")
-            rec.timestamp = entity.Get[str]("R2R_Timestamp")
-            rec.strategy = entity.Get[str]("R2R_Strategy")
+            str_type = clr.GetClrType(str) if hasattr(clr, "GetClrType") else str
+            rec = RevitSyncRecord(self._get_elem_id_val(element.Id))
+            rec.source_doc_name = entity.Get[str_type]("R2R_SourceDocName")
+            rec.rhino_guid = entity.Get[str_type]("R2R_RhinoGUID")
+            rec.layer_path = entity.Get[str_type]("R2R_LayerPath")
+            rec.geo_hash = entity.Get[str_type]("R2R_GeoHash")
+            rec.mapping_version = entity.Get[str_type]("R2R_MappingVersion")
+            rec.timestamp = entity.Get[str_type]("R2R_Timestamp")
+            rec.strategy = entity.Get[str_type]("R2R_Strategy")
             return rec
         except Exception:
             return None
@@ -139,14 +158,15 @@ class SyncEngine(object):
         try:
             entity = ES.Entity(self.schema)
             now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            str_type = clr.GetClrType(str) if hasattr(clr, "GetClrType") else str
 
-            entity.Set[str]("R2R_SourceDocName", "Rhino_Model")
-            entity.Set[str]("R2R_RhinoGUID", scanned_obj.rhino_guid)
-            entity.Set[str]("R2R_LayerPath", scanned_obj.layer_full_path)
-            entity.Set[str]("R2R_GeoHash", scanned_obj.geo_hash)
-            entity.Set[str]("R2R_MappingVersion", version)
-            entity.Set[str]("R2R_Timestamp", now_str)
-            entity.Set[str]("R2R_Strategy", strategy)
+            entity.Set[str_type]("R2R_SourceDocName", "Rhino_Model")
+            entity.Set[str_type]("R2R_RhinoGUID", scanned_obj.rhino_guid)
+            entity.Set[str_type]("R2R_LayerPath", scanned_obj.layer_full_path)
+            entity.Set[str_type]("R2R_GeoHash", scanned_obj.geo_hash)
+            entity.Set[str_type]("R2R_MappingVersion", version)
+            entity.Set[str_type]("R2R_Timestamp", now_str)
+            entity.Set[str_type]("R2R_Strategy", strategy)
 
             element.SetEntity(entity)
 
@@ -226,7 +246,7 @@ class SyncEngine(object):
         deleted_count = 0
         for eid in element_ids:
             try:
-                elem_id = DB.ElementId(eid)
+                elem_id = self._make_elem_id(eid)
                 self.doc.Delete(elem_id)
                 deleted_count += 1
             except Exception:

@@ -217,7 +217,7 @@ class ConversionRouter(object):
                 self._pipeline_10_auto_bua(scanned_obj, geom_feet, level_id, res)
 
             if created_elem:
-                res.revit_element_id = created_elem.Id.IntegerValue
+                res.revit_element_id = self._get_elem_id_val(created_elem.Id)
                 res.revit_unique_id = created_elem.UniqueId
                 res.status = "SUCCESS"
                 res.category_created = created_elem.Category.Name if created_elem.Category else "Unknown"
@@ -231,6 +231,12 @@ class ConversionRouter(object):
             res.warnings.append(traceback.format_exc())
 
         return res
+
+    @staticmethod
+    def _get_elem_id_val(elem_id):
+        if hasattr(elem_id, "Value"):
+            return int(elem_id.Value)
+        return int(elem_id.IntegerValue)
 
     def _resolve_level_id(self, scanned_obj):
         """Finds closest Revit Level element ID for an object."""
@@ -558,34 +564,88 @@ class ConversionRouter(object):
     # Geometry Helpers & Encoders
     # =========================================================================
     def _convert_rhino_to_revit_geometry(self, rh_geom):
-        """Converts Rhino Brep, Mesh, or Curve into IList of Revit DB.GeometryObject."""
+        """Converts Rhino Brep, Extrusion, Surface, SubD, Mesh, or Curve into IList of Revit DB.GeometryObject."""
         geom_list = List[DB.GeometryObject]()
 
-        # Try RIR GeometryEncoder
+        # Normalize Extrusions, Surfaces, SubDs to Brep if needed
+        working_geom = rh_geom
+        if not isinstance(working_geom, (rg.Brep, rg.Mesh)) and hasattr(working_geom, "ToBrep"):
+            try:
+                brep_conv = working_geom.ToBrep()
+                if brep_conv:
+                    working_geom = brep_conv
+            except Exception:
+                pass
+
+        # 1. Try RIR GeometryEncoder
         try:
             if hasattr(GeometryEncoder, "ToGeometryObject"):
-                rvt_obj = GeometryEncoder.ToGeometryObject(rh_geom)
+                rvt_obj = GeometryEncoder.ToGeometryObject(working_geom)
                 if rvt_obj:
                     geom_list.Add(rvt_obj)
                     return geom_list
         except Exception:
             pass
 
-        # Native fallback reconstruction
+        # 2. Try specific ToSolid / ToMesh encoders
         try:
-            if isinstance(rh_geom, rg.Brep):
-                # Try ToSolid
+            if isinstance(working_geom, rg.Brep):
                 if hasattr(GeometryEncoder, "ToSolid"):
-                    solid = GeometryEncoder.ToSolid(rh_geom)
+                    solid = GeometryEncoder.ToSolid(working_geom)
                     if solid:
                         geom_list.Add(solid)
                         return geom_list
-            elif isinstance(rh_geom, rg.Mesh):
+            elif isinstance(working_geom, rg.Mesh):
                 if hasattr(GeometryEncoder, "ToMesh"):
-                    rvt_mesh = GeometryEncoder.ToMesh(rh_geom)
+                    rvt_mesh = GeometryEncoder.ToMesh(working_geom)
                     if rvt_mesh:
                         geom_list.Add(rvt_mesh)
                         return geom_list
+        except Exception:
+            pass
+
+        # 3. Native Revit TessellatedShapeBuilder fallback (handles any Brep, Extrusion, or Mesh)
+        try:
+            meshes = []
+            if isinstance(working_geom, rg.Mesh):
+                meshes = [working_geom]
+            elif isinstance(working_geom, rg.Brep):
+                mp = rg.MeshingParameters.Default
+                brep_meshes = rg.Mesh.CreateFromBrep(working_geom, mp)
+                if brep_meshes:
+                    meshes = list(brep_meshes)
+
+            if meshes:
+                tsb = DB.TessellatedShapeBuilder()
+                tsb.OpenConnectedFaceSet(False)
+                face_added = False
+                for m in meshes:
+                    m.Faces.ConvertQuadsToTriangles()
+                    verts = m.Vertices
+                    for i in range(m.Faces.Count):
+                        f = m.Faces[i]
+                        p0 = verts[f.A]
+                        p1 = verts[f.B]
+                        p2 = verts[f.C]
+                        v0 = DB.XYZ(float(p0.X), float(p0.Y), float(p0.Z))
+                        v1 = DB.XYZ(float(p1.X), float(p1.Y), float(p1.Z))
+                        v2 = DB.XYZ(float(p2.X), float(p2.Y), float(p2.Z))
+                        if v0.DistanceTo(v1) > 0.001 and v1.DistanceTo(v2) > 0.001 and v2.DistanceTo(v0) > 0.001:
+                            loop_pts = List[DB.XYZ]()
+                            loop_pts.Add(v0)
+                            loop_pts.Add(v1)
+                            loop_pts.Add(v2)
+                            tsb.AddFace(DB.TessellatedFace(loop_pts, DB.ElementId.InvalidElementId))
+                            face_added = True
+                tsb.CloseConnectedFaceSet()
+                if face_added:
+                    tsb.Target = DB.TessellatedShapeBuilderTarget.AnyGeometry
+                    tsb.Fallback = DB.TessellatedShapeBuilderFallback.Mesh
+                    tsb.Build()
+                    res_objs = tsb.GetBuildResult().GetGeometricalObjects()
+                    if res_objs:
+                        for go in res_objs:
+                            geom_list.Add(go)
         except Exception:
             pass
 
