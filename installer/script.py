@@ -51,7 +51,7 @@ if os.path.exists(lib_dir) and lib_dir not in sys.path:
 # 3. Reload R2R modules for live iterative updates
 for _mod in [
     'scanner', 'classifier', 'ai_assistant', 'profile_manager',
-    'conversion_router', 'graphics_validator', 'sync_engine',
+    'conversion_router', 'family_factory', 'graphics_validator', 'sync_engine',
     'reporting', 'ui_dialog', 'main_launcher'
 ]:
     if _mod in sys.modules:

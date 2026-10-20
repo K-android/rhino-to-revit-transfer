@@ -21,6 +21,7 @@ from profile_manager import ProfileManager, MappingRule
 from sync_engine import SyncEngine, RevitSyncRecord
 from graphics_validator import GraphicsValidator, ElementValidationReport
 from reporting import TransferQAReport, ReportExporter
+from conversion_router import ConversionRouter
 
 
 class TestR2RPipeline(unittest.TestCase):
@@ -376,6 +377,72 @@ class TestR2RPipeline(unittest.TestCase):
         self.assertIsInstance(msg, str)
         if not ready:
             self.assertTrue("Rhino" in msg)
+
+    def test_family_template_locator_and_load_options(self):
+        """Tests FamilyLoadOptions and FamilyTemplateLocator without Revit crash."""
+        from family_factory import FamilyLoadOptions, FamilyTemplateLocator
+
+        load_opts = FamilyLoadOptions()
+        found_res = load_opts.OnFamilyFound(True, True)
+        self.assertIn(True, found_res)
+
+        # Template search with None app should safely search standard directories or return None
+        tpl_path = FamilyTemplateLocator.find_template(None, "Generic Model")
+        if tpl_path:
+            self.assertTrue(tpl_path.lower().endswith(".rft"))
+
+    def test_conversion_router_pre_generate_families_safe(self):
+        """Tests that Phase 1 pre_generate_families gracefully handles uninitialized docs."""
+        router = ConversionRouter(None, global_mode="Hybrid")
+        res = router.pre_generate_families([], {})
+        self.assertEqual(res, {})
+
+    def test_layer_row_category_override_and_confidence(self):
+        """Tests dynamic category overrides on LayerRowItem and subsequent confidence updates."""
+        from ui_dialog import LayerRowItem
+        from classifier import ClassificationResult
+
+        class MockObj(object):
+            def __init__(self, is_horizontal=False, is_vertical=False):
+                self.is_horizontal = is_horizontal
+                self.is_vertical = is_vertical
+                self.adaptive_point_count = 0
+                self.repetition_count = 1
+                self.parametric_dims = {}
+
+        mock_obj = MockObj(is_horizontal=True, is_vertical=False)
+        c_res = ClassificationResult("test-obj-guid")
+        c_res.inferred_category = "Roof"
+        c_res.proposed_strategy = "RoofNative"
+        c_res.confidence_score = 95.0
+        c_res.confidence_tier = "AUTO_READY"
+        c_res.revit_category_name = "OST_Roofs"
+        c_res.is_prechecked = True
+
+        row = LayerRowItem("ARCH_ROOFS", [mock_obj], c_res, None)
+        self.assertEqual(row.inferred_category, "Roof")
+        self.assertEqual(row.revit_type, "OST_Roofs")
+
+        # User overrides category to "Floor"
+        row.update_category("Floor")
+        self.assertEqual(row.inferred_category, "Floor")
+        self.assertEqual(row.revit_type, "OST_Floors")
+        self.assertEqual(row.proposed_strategy, "FloorNative")
+        self.assertGreaterEqual(row.confidence_score, 85.0)
+
+        # User overrides category to "Toposolid"
+        row.update_category("Toposolid")
+        self.assertEqual(row.inferred_category, "Toposolid")
+        self.assertEqual(row.revit_type, "OST_Toposolid")
+        self.assertEqual(row.proposed_strategy, "Toposolid")
+        self.assertGreaterEqual(row.confidence_score, 85.0)
+
+    def test_conversion_router_category_str_to_id(self):
+        """Tests _category_str_to_id with friendly and OST names."""
+        router = ConversionRouter(None, global_mode="Hybrid")
+        # When REVIT_AVAILABLE is False, it returns None safely
+        res_none = router._category_str_to_id("Toposolid")
+        self.assertIsNone(res_none)
 
 
 if __name__ == "__main__":

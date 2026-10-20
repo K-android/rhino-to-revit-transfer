@@ -115,6 +115,10 @@ class LayerRowItem(object):
             horiz_cnt = sum(1 for o in self.objects if getattr(o, "is_horizontal", False))
             comp_score = 95.0 if horiz_cnt > 0 else 70.0
 
+        elif self.proposed_strategy == "Toposolid":
+            horiz_cnt = sum(1 for o in self.objects if getattr(o, "is_horizontal", False))
+            comp_score = 96.0 if horiz_cnt > 0 else 85.0
+
         elif self.proposed_strategy == "RepetitiveFamily":
             rep_cnt = max([getattr(o, "repetition_count", 1) for o in self.objects] + [1])
             is_blk = any(getattr(o, "object_type", "") == "InstanceReference" for o in self.objects)
@@ -142,6 +146,68 @@ class LayerRowItem(object):
             self.classification.proposed_strategy = self.proposed_strategy
             self.classification.confidence_score = comp_score
             self.classification.confidence_tier = self.confidence_tier
+
+    def update_category(self, new_category):
+        """Updates inferred Revit category, maps to proper BuiltInCategory name, and adjusts strategy."""
+        self.inferred_category = str(new_category).strip()
+        cat_lower = self.inferred_category.lower()
+
+        # Map to standard OST Revit Category
+        if "toposolid" in cat_lower or "topograph" in cat_lower or "terrain" in cat_lower:
+            self.revit_type = "OST_Toposolid"
+            if self.proposed_strategy not in ("Toposolid", "DirectShape"):
+                self.proposed_strategy = "Toposolid"
+        elif "floor" in cat_lower or "slab" in cat_lower:
+            self.revit_type = "OST_Floors"
+            if self.proposed_strategy in ("RoofNative", "CeilingNative", "Toposolid"):
+                self.proposed_strategy = "FloorNative"
+        elif "roof" in cat_lower:
+            self.revit_type = "OST_Roofs"
+            if self.proposed_strategy in ("FloorNative", "CeilingNative", "Toposolid"):
+                self.proposed_strategy = "RoofNative"
+        elif "wall" in cat_lower:
+            self.revit_type = "OST_Walls"
+            if self.proposed_strategy in ("FloorNative", "RoofNative", "Toposolid"):
+                self.proposed_strategy = "WallByCurve"
+        elif "ceiling" in cat_lower:
+            self.revit_type = "OST_Ceilings"
+            if self.proposed_strategy in ("FloorNative", "RoofNative", "Toposolid"):
+                self.proposed_strategy = "CeilingNative"
+        elif "column" in cat_lower or "pillar" in cat_lower:
+            self.revit_type = "OST_Columns"
+        elif "curtain" in cat_lower or "panel" in cat_lower:
+            self.revit_type = "OST_CurtainWallPanels"
+        elif "door" in cat_lower:
+            self.revit_type = "OST_Doors"
+        elif "window" in cat_lower:
+            self.revit_type = "OST_Windows"
+        elif "furniture" in cat_lower:
+            self.revit_type = "OST_Furniture"
+        elif "site" in cat_lower:
+            self.revit_type = "OST_Site"
+        elif "stair" in cat_lower:
+            self.revit_type = "OST_Stairs"
+        elif "mass" in cat_lower:
+            self.revit_type = "OST_Mass"
+        elif "generic" in cat_lower:
+            self.revit_type = "OST_GenericModel"
+        elif self.inferred_category.startswith("OST_"):
+            self.revit_type = self.inferred_category
+        else:
+            self.revit_type = "OST_GenericModel"
+
+        if self.classification:
+            self.classification.inferred_category = self.inferred_category
+            self.classification.revit_category_name = self.revit_type
+            self.classification.proposed_strategy = self.proposed_strategy
+
+        for obj in self.objects:
+            if hasattr(obj, "classification") and obj.classification:
+                obj.classification.inferred_category = self.inferred_category
+                obj.classification.revit_category_name = self.revit_type
+                obj.classification.proposed_strategy = self.proposed_strategy
+
+        self.update_strategy(self.proposed_strategy)
 
 
 class ValidationRowItem(object):
@@ -522,7 +588,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         strat_layout.Spacing = ed.Size(8, 5)
 
         lbl_strat_override = ef.Label()
-        lbl_strat_override.Text = "Override Strategy for Checked:"
+        lbl_strat_override.Text = "Override Strategy:"
         lbl_strat_override.VerticalAlignment = ef.VerticalAlignment.Center
 
         self.dd_strat_override = ef.DropDown()
@@ -532,6 +598,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.dd_strat_override.Items.Add("FloorNative")
         self.dd_strat_override.Items.Add("WallByCurve")
         self.dd_strat_override.Items.Add("RoofNative")
+        self.dd_strat_override.Items.Add("Toposolid")
         self.dd_strat_override.Items.Add("FamilyInstance")
         self.dd_strat_override.Items.Add("DirectShape")
         self.dd_strat_override.SelectedIndex = 0
@@ -540,6 +607,20 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         btn_apply_strat.Text = "Apply Strategy"
         btn_apply_strat.ToolTip = "Apply the selected strategy override to all currently checked layers"
         btn_apply_strat.Click += self._on_apply_strategy_override
+
+        lbl_cat_override = ef.Label()
+        lbl_cat_override.Text = "Override Category:"
+        lbl_cat_override.VerticalAlignment = ef.VerticalAlignment.Center
+
+        self.dd_cat_override = ef.DropDown()
+        for cat_opt in ["Floors", "Walls", "Roofs", "Ceilings", "Columns", "Toposolid", "Curtain Panels", "Doors", "Windows", "Furniture", "Site", "Mass", "Generic Models"]:
+            self.dd_cat_override.Items.Add(cat_opt)
+        self.dd_cat_override.SelectedIndex = 0
+
+        btn_apply_cat = ef.Button()
+        btn_apply_cat.Text = "Apply Category"
+        btn_apply_cat.ToolTip = "Override the Revit category for all currently checked layers"
+        btn_apply_cat.Click += self._on_apply_category_override
 
         lbl_rep_thresh = ef.Label()
         lbl_rep_thresh.Text = "Repetition Grouping:"
@@ -557,6 +638,9 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         strat_layout.Add(lbl_strat_override)
         strat_layout.Add(self.dd_strat_override)
         strat_layout.Add(btn_apply_strat)
+        strat_layout.Add(lbl_cat_override)
+        strat_layout.Add(self.dd_cat_override)
+        strat_layout.Add(btn_apply_cat)
         strat_layout.Add(lbl_rep_thresh)
         strat_layout.Add(self.dd_rep_threshold)
         strat_layout.EndHorizontal()
@@ -598,6 +682,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         col_cat.HeaderText = "Inferred Category"
         col_cat.DataCell = ef.TextBoxCell(3)
         col_cat.Width = 140
+        col_cat.Editable = True
         self.grid_review.Columns.Add(col_cat)
 
         # Proposed Strategy
@@ -605,6 +690,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         col_strat.HeaderText = "Proposed Strategy"
         col_strat.DataCell = ef.TextBoxCell(4)
         col_strat.Width = 140
+        col_strat.Editable = True
         self.grid_review.Columns.Add(col_strat)
 
         # Target Type
@@ -890,7 +976,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.sync_evaluations, self.missing_in_rhino = self.sync_engine.evaluate_sync_states(self.scanned_objects)
 
     def _sync_grid_check_states(self):
-        """Syncs checkbox state and strategy changes made in Eto GridView back to LayerRowItem objects."""
+        """Syncs checkbox state and category/strategy changes made in Eto GridView back to LayerRowItem objects."""
         try:
             ds = self.grid_review.DataStore
             if ds is not None and self.filtered_layer_rows:
@@ -899,11 +985,39 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                     if idx < len(self.filtered_layer_rows) and len(row_data) > 0:
                         row = self.filtered_layer_rows[idx]
                         row.checked = bool(row_data[0])
+
+                        # If category was modified in-place (column 3)
+                        if len(row_data) > 3:
+                            new_cat = str(row_data[3] or "").strip()
+                            if new_cat and new_cat != row.inferred_category:
+                                row.update_category(new_cat)
+                                for obj in row.objects:
+                                    c = self.classifications.get(obj.rhino_guid)
+                                    if c:
+                                        c.inferred_category = row.inferred_category
+                                        c.revit_category_name = row.revit_type
+                                        c.proposed_strategy = row.proposed_strategy
+                                        c.confidence_score = row.confidence_score
+                                        c.confidence_tier = row.confidence_tier
+                                if len(row_data) > 4:
+                                    row_data[4] = row.proposed_strategy
+                                if len(row_data) > 5:
+                                    row_data[5] = row.revit_type
+                                if len(row_data) > 6:
+                                    row_data[6] = "{:.0f}%".format(row.confidence_score)
+                                changed = True
+
                         # If strategy was modified in-place (column 4)
                         if len(row_data) > 4:
                             new_strat = str(row_data[4] or "").strip()
                             if new_strat and new_strat != row.proposed_strategy:
                                 row.update_strategy(new_strat)
+                                for obj in row.objects:
+                                    c = self.classifications.get(obj.rhino_guid)
+                                    if c:
+                                        c.proposed_strategy = row.proposed_strategy
+                                        c.confidence_score = row.confidence_score
+                                        c.confidence_tier = row.confidence_tier
                                 if len(row_data) > 6:
                                     row_data[6] = "{:.0f}%".format(row.confidence_score)
                                 changed = True
@@ -1049,12 +1163,45 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         for r in self.layer_rows:
             if r.checked:
                 r.update_strategy(selected_strat)
+                for obj in r.objects:
+                    c = self.classifications.get(obj.rhino_guid)
+                    if c:
+                        c.proposed_strategy = r.proposed_strategy
+                        c.confidence_score = r.confidence_score
+                        c.confidence_tier = r.confidence_tier
                 updated_count += 1
 
         self._refresh_review_grid_datastore()
         self._update_preview_kpis()
         self.lbl_global_status.Text = "Applied strategy override '{}' to {} checked layer(s). Confidence updated dynamically.".format(
             selected_strat, updated_count
+        )
+
+    def _on_apply_category_override(self, sender, e):
+        """Overrides Revit category for all currently checked layers."""
+        self._sync_grid_check_states()
+        selected_cat = str(self.dd_cat_override.SelectedValue or "").strip()
+        if not selected_cat:
+            return
+
+        updated_count = 0
+        for r in self.layer_rows:
+            if r.checked:
+                r.update_category(selected_cat)
+                for obj in r.objects:
+                    c = self.classifications.get(obj.rhino_guid)
+                    if c:
+                        c.inferred_category = r.inferred_category
+                        c.revit_category_name = r.revit_type
+                        c.proposed_strategy = r.proposed_strategy
+                        c.confidence_score = r.confidence_score
+                        c.confidence_tier = r.confidence_tier
+                updated_count += 1
+
+        self._refresh_review_grid_datastore()
+        self._update_preview_kpis()
+        self.lbl_global_status.Text = "Applied category override '{}' to {} checked layer(s). Updated target Revit types and confidence.".format(
+            selected_cat, updated_count
         )
 
     def _on_repetition_threshold_changed(self, sender, e):
@@ -1123,7 +1270,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 if r.checked:
                     rule = MappingRule(
                         layer_pattern=r.layer_name,
-                        revit_category=r.classification.revit_category_name if r.classification else "OST_GenericModel",
+                        revit_category=r.revit_type if (r.revit_type and r.revit_type.startswith("OST_")) else (r.classification.revit_category_name if r.classification else "OST_GenericModel"),
                         revit_type=r.revit_type,
                         strategy=r.proposed_strategy,
                         room_bounding=True
@@ -1183,7 +1330,12 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             if r.checked:
                 approved_objs.extend(r.objects)
 
-        layer_to_row = {r.layer_name: r for r in self.layer_rows}
+        layer_to_row = {}
+        for r in self.layer_rows:
+            layer_to_row[r.layer_name] = r
+            for o in getattr(r, "objects", []):
+                layer_to_row[getattr(o, "layer_name", "")] = r
+                layer_to_row[getattr(o, "layer_full_path", "")] = r
 
         total = len(approved_objs)
         if total == 0:
@@ -1199,6 +1351,38 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.validation_rows = []
         self.qa_report = TransferQAReport()
         self.qa_report.execution_mode = str(self.dd_global_mode.SelectedValue)
+
+        # =========================================================================
+        # PHASE 1: Pre-Transaction Native .rfa Family Generation & Loading
+        # Runs BEFORE the main project TransactionGroup / Transaction to avoid
+        # Revit API transaction nesting deadlocks with LoadFamily()
+        # =========================================================================
+        try:
+            self.txt_exec_log.Text += "Phase 1: Pre-generating and loading parametric/repetitive .rfa families...\n"
+            profile_rules_map = {}
+            for r in self.layer_rows:
+                if r.checked:
+                    cat_name = r.revit_type if (r.revit_type and r.revit_type.startswith("OST_")) else (r.classification.revit_category_name if r.classification else "OST_GenericModel")
+                    rule_item = MappingRule(
+                        layer_pattern=r.layer_name,
+                        revit_category=cat_name,
+                        revit_type=r.revit_type,
+                        strategy=r.proposed_strategy,
+                        room_bounding=True
+                    )
+                    profile_rules_map[r.layer_name] = rule_item
+                    for o in getattr(r, "objects", []):
+                        profile_rules_map[getattr(o, "layer_name", "")] = rule_item
+                        profile_rules_map[getattr(o, "layer_full_path", "")] = rule_item
+
+            pregen_symbols = router.pre_generate_families(approved_objs, self.classifications, profile_rules=profile_rules_map)
+            pregen_cnt = len(pregen_symbols) if pregen_symbols else 0
+            if pregen_cnt > 0:
+                self.txt_exec_log.Text += "Phase 1 Complete: {} native .rfa family definition(s) loaded into project.\n".format(pregen_cnt)
+            else:
+                self.txt_exec_log.Text += "Phase 1 Complete: No family pre-generation required.\n"
+        except Exception as ex:
+            self.txt_exec_log.Text += "Phase 1 Warning: Family pre-generation encountered: {}. Continuing with fallback pipelines.\n".format(ex)
 
         tg = DB.TransactionGroup(self.revit_doc, "R2R One-Click Transfer")
         tg.Start()
@@ -1234,7 +1418,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                             pass
 
                     # Resolve layer override rule if configured by user
-                    row = layer_to_row.get(obj.layer_full_path)
+                    row = layer_to_row.get(obj.layer_full_path) or layer_to_row.get(getattr(obj, "layer_name", ""))
                     layer_rule = None
                     if row:
                         cat_name = row.revit_type if (row.revit_type and row.revit_type.startswith("OST_")) else (c_res.revit_category_name if c_res else "OST_GenericModel")

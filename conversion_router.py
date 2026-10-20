@@ -60,6 +60,15 @@ try:
 except Exception:
     REVIT_AVAILABLE = False
 
+try:
+    from family_factory import FamilyFactory, FamilyLoadOptions
+except (ImportError, ValueError):
+    try:
+        from .family_factory import FamilyFactory, FamilyLoadOptions
+    except Exception:
+        FamilyFactory = None
+        FamilyLoadOptions = None
+
 
 class TransferFailuresPreprocessor(DB.IFailuresPreprocessor if REVIT_AVAILABLE else object):
     """Suppresses non-fatal Revit warning messages during automated transfer to prevent modal popups."""
@@ -137,6 +146,8 @@ class ConversionRouter(object):
         # Cache Revit Level and Type IDs for performance
         self.level_cache = {}
         self.type_cache = {}
+        self.family_symbol_cache = {}
+        self.app = revit_doc.Application if revit_doc and hasattr(revit_doc, "Application") else None
         if REVIT_AVAILABLE and self.doc:
             self._cache_revit_data()
 
@@ -163,10 +174,104 @@ class ConversionRouter(object):
         self.default_roof_type = self.doc.GetDefaultElementTypeId(DB.ElementTypeGroup.RoofType)
         self.default_ceiling_type = self.doc.GetDefaultElementTypeId(DB.ElementTypeGroup.CeilingType)
 
+        # Toposolid type (Revit 2024+)
+        if hasattr(DB.ElementTypeGroup, "ToposolidType"):
+            try:
+                self.default_toposolid_type = self.doc.GetDefaultElementTypeId(DB.ElementTypeGroup.ToposolidType)
+            except Exception:
+                self.default_toposolid_type = None
+        else:
+            self.default_toposolid_type = None
+
         # Caches for repetitive definitions, orientation baselines, and adaptive families
         self.repetitive_type_cache = {}
         self.canonical_repetition_cache = {}
         self.adaptive_family_cache = {}
+
+    def pre_generate_families(self, approved_objects, classifications, profile_rules=None):
+        """Phase 1: Pre-Transaction Native .rfa Family Generator.
+
+        Generates and loads real Revit .rfa families in memory BEFORE opening the project
+        TransactionGroup/Transaction, completely preventing API transaction nesting deadlocks.
+
+        :param approved_objects: list of ScannedObject approved for transfer
+        :param classifications: dict {rhino_guid: ClassificationResult}
+        :param profile_rules: optional dict {layer_name: MappingRule}
+        :return: dict {family_key: DB.FamilySymbol}
+        """
+        if not REVIT_AVAILABLE or not self.doc or not self.app or not FamilyFactory:
+            return self.family_symbol_cache
+
+        rules_by_layer = profile_rules or {}
+
+        for obj in approved_objects:
+            c_res = classifications.get(obj.rhino_guid)
+            rule = rules_by_layer.get(obj.layer_name) or rules_by_layer.get(getattr(obj, "layer_full_path", None))
+            strat = rule.strategy if rule else (c_res.proposed_strategy if c_res else "DirectShape")
+            inferred_cat = rule.revit_category if rule else (c_res.inferred_category if c_res else "GenericModel")
+
+            if strat == "ParametricFamily":
+                fam_key = "R2R_Parametric_{}".format(re.sub(r'[^a-zA-Z0-9_]', '_', obj.layer_name))
+                if fam_key not in self.family_symbol_cache:
+                    w = max(0.2, (obj.dx or 1.0) * self.unit_scale)
+                    d = max(0.2, (obj.dy or 1.0) * self.unit_scale)
+                    h = max(0.2, (obj.dz or 1.0) * self.unit_scale)
+                    target_bic_id = self._category_str_to_id(inferred_cat)
+                    target_bic = None
+                    try:
+                        target_bic = System.Enum.ToObject(DB.BuiltInCategory, self._get_elem_id_val(target_bic_id))
+                    except Exception:
+                        pass
+
+                    sym = FamilyFactory.create_parametric_box_or_profile_family(
+                        self.app,
+                        self.doc,
+                        family_name=fam_key,
+                        width=w,
+                        depth=d,
+                        height=h,
+                        category_hint=inferred_cat,
+                        target_bic=target_bic
+                    )
+                    if sym:
+                        self.family_symbol_cache[fam_key] = sym
+
+            elif strat == "RepetitiveFamily":
+                is_block = (obj.object_type == "InstanceReference")
+                blk_name = getattr(obj, "block_name", "") or ""
+                sig = getattr(obj, "repetition_signature", "") or "default_sig"
+                fam_key = "R2R_Block_{}".format(re.sub(r'[^a-zA-Z0-9_]', '_', blk_name)) if (is_block and blk_name) else "R2R_Repetitive_{}".format(sig)
+
+                if fam_key not in self.family_symbol_cache and obj.raw_geometry:
+                    cx_raw = obj.centroid[0]
+                    cy_raw = obj.centroid[1]
+                    cz_raw = obj.centroid[2]
+                    canonical_raw = obj.raw_geometry.Duplicate()
+                    if hasattr(canonical_raw, "Translate"):
+                        canonical_raw.Translate(-cx_raw, -cy_raw, -cz_raw)
+                    if hasattr(canonical_raw, "Scale"):
+                        canonical_raw.Scale(self.unit_scale)
+
+                    target_bic_id = self._category_str_to_id(inferred_cat)
+                    target_bic = None
+                    try:
+                        target_bic = System.Enum.ToObject(DB.BuiltInCategory, self._get_elem_id_val(target_bic_id))
+                    except Exception:
+                        pass
+
+                    sym = FamilyFactory.create_native_freeform_family(
+                        self.app,
+                        self.doc,
+                        family_name=fam_key,
+                        rh_brep_or_solid=canonical_raw,
+                        subcategory_name=obj.layer_name,
+                        category_hint=inferred_cat,
+                        target_bic=target_bic
+                    )
+                    if sym:
+                        self.family_symbol_cache[fam_key] = sym
+
+        return self.family_symbol_cache
 
     def convert_object(self, scanned_obj, classification_result, profile_rule=None):
         """Dispatches an object through the appropriate conversion strategy."""
@@ -208,6 +313,8 @@ class ConversionRouter(object):
                 created_elem = self._pipeline_8c_parametric_family(scanned_obj, geom_feet, level_id, profile_rule, res)
             elif strategy == "FloorNative":
                 created_elem = self._pipeline_1_native_floor(scanned_obj, geom_feet, level_id, profile_rule, res)
+            elif strategy == "Toposolid" or (classification_result and classification_result.inferred_category in ("Toposolid", "Topography", "Site") and strategy in ("DirectShape", "Toposolid")):
+                created_elem = self._pipeline_11_toposolid(scanned_obj, geom_feet, level_id, profile_rule, res)
             elif strategy == "FloorByHost":
                 created_elem = self._pipeline_2_floor_by_host(scanned_obj, geom_feet, level_id, profile_rule, res)
             elif strategy == "WallByCurve":
@@ -613,10 +720,10 @@ class ConversionRouter(object):
             return None
 
     def _pipeline_8b_repetitive_family(self, scanned_obj, geom_feet, level_id, profile_rule, res):
-        """Creates a shared reusable DirectShapeType definition and places transformed instances.
+        """Creates a shared reusable native .rfa FamilyInstance or DirectShapeType definition.
         
-        Guarantees that rotated loose copies preserve their exact world-space orientation by
-        routing to standard DirectShape whenever orientation differs from canonical definition.
+        Prioritizes real native .rfa FreeFormElement families generated during Phase 1.
+        Guarantees that rotated loose copies preserve their exact world-space orientation.
         """
         cat_id = DB.ElementId(DB.BuiltInCategory.OST_GenericModel)
         if profile_rule and profile_rule.revit_category:
@@ -628,8 +735,30 @@ class ConversionRouter(object):
 
         type_key = "R2R_" + re.sub(r'[^a-zA-Z0-9_]+', '_', sig)[:45]
         is_block = (scanned_obj.object_type == "InstanceReference")
+        blk_name = getattr(scanned_obj, "block_name", "") or ""
+        fam_key = "R2R_Block_{}".format(re.sub(r'[^a-zA-Z0-9_]', '_', blk_name)) if (is_block and blk_name) else "R2R_Repetitive_{}".format(sig)
 
-        # Try Revit DirectShapeType + DirectShapeLibrary instancing
+        # 1. Native Loadable .rfa Family Placement (from Phase 1 Pre-Generation)
+        if fam_key in self.family_symbol_cache:
+            sym = self.family_symbol_cache[fam_key]
+            try:
+                if not sym.IsActive:
+                    sym.Activate()
+                cx = scanned_obj.centroid[0] * self.unit_scale
+                cy = scanned_obj.centroid[1] * self.unit_scale
+                cz = scanned_obj.centroid[2] * self.unit_scale
+                pt = DB.XYZ(cx, cy, cz)
+                level_elem = self.doc.GetElement(level_id)
+                inst = self.doc.Create.NewFamilyInstance(pt, sym, level_elem, DB.Structure.StructuralType.NonStructural)
+
+                if scanned_obj.rotation_angle and inst:
+                    axis = DB.Line.CreateBound(pt, DB.XYZ(pt.X, pt.Y, pt.Z + 1.0))
+                    DB.ElementTransformUtils.RotateElement(self.doc, inst.Id, axis, scanned_obj.rotation_angle)
+                return inst
+            except Exception as ex:
+                res.warnings.append("Native .rfa repetitive family placement notice: {}. Falling back to DirectShapeType.".format(ex))
+
+        # Try Revit DirectShapeType + DirectShapeLibrary instancing fallback
         try:
             if hasattr(DB, "DirectShapeLibrary") and hasattr(DB, "DirectShapeType"):
                 lib = DB.DirectShapeLibrary.GetDirectShapeLibrary(self.doc)
@@ -720,17 +849,25 @@ class ConversionRouter(object):
         target_cat_id = self._category_str_to_id(cat_str)
 
         target_sym = None
-        collector = DB.FilteredElementCollector(self.doc).OfClass(DB.FamilySymbol)
-        for s in collector:
-            try:
-                if requested_type and (s.Name == requested_type or s.FamilyName == requested_type):
-                    target_sym = s
-                    break
-                if not requested_type and s.Category and s.Category.Id == target_cat_id:
-                    target_sym = s
-                    break
-            except Exception:
-                continue
+
+        # 1. Check Phase 1 Pre-Generated Native .rfa FamilySymbol cache
+        fam_key = "R2R_Parametric_{}".format(re.sub(r'[^a-zA-Z0-9_]', '_', scanned_obj.layer_name))
+        if fam_key in self.family_symbol_cache:
+            target_sym = self.family_symbol_cache[fam_key]
+
+        # 2. Check project symbols if not found in pre-generated cache
+        if not target_sym:
+            collector = DB.FilteredElementCollector(self.doc).OfClass(DB.FamilySymbol)
+            for s in collector:
+                try:
+                    if requested_type and (s.Name == requested_type or s.FamilyName == requested_type):
+                        target_sym = s
+                        break
+                    if not requested_type and s.Category and s.Category.Id == target_cat_id:
+                        target_sym = s
+                        break
+                except Exception:
+                    continue
 
         if target_sym:
             try:
@@ -749,7 +886,10 @@ class ConversionRouter(object):
                     DB.ElementTransformUtils.RotateElement(self.doc, inst.Id, axis, scanned_obj.rotation_angle)
 
                 # Drive instance/type dimensional parameters with multilingual aliases
-                dims = getattr(scanned_obj, "parametric_dims", {})
+                dims = dict(getattr(scanned_obj, "parametric_dims", {}) or {})
+                if "Width" not in dims and scanned_obj.dx: dims["Width"] = scanned_obj.dx
+                if "Depth" not in dims and scanned_obj.dy: dims["Depth"] = scanned_obj.dy
+                if "Height" not in dims and scanned_obj.dz: dims["Height"] = scanned_obj.dz
                 param_aliases = {
                     "Width": ["Width", "b", "w", "Ancho", "Anchura", "Amplada"],
                     "Depth": ["Depth", "d", "Largo", "Profundidad", "Profunditat", "Length"],
@@ -861,6 +1001,65 @@ class ConversionRouter(object):
 
         except Exception as ex:
             res.warnings.append("Auto-BUA boundary generation notice: {}".format(ex))
+
+    # =========================================================================
+    # PIPELINE 11: Toposolid (Revit 2024+) & Site Fallback
+    # =========================================================================
+    def _pipeline_11_toposolid(self, scanned_obj, geom_feet, level_id, profile_rule, res):
+        """Creates a native Revit Toposolid element (Revit 2024+) or OST_Toposolid DirectShape."""
+        target_cat_id = self._category_str_to_id("OST_Toposolid")
+
+        if hasattr(DB, "Toposolid"):
+            try:
+                working_brep = geom_feet if isinstance(geom_feet, rg.Brep) else (geom_feet.ToBrep() if hasattr(geom_feet, "ToBrep") else None)
+                curve_loops = List[DB.CurveLoop]()
+
+                if working_brep:
+                    top_face = None
+                    max_z = float("-inf")
+                    for face in working_brep.Faces:
+                        u_mid = 0.5 * (face.Domain(0).Min + face.Domain(0).Max)
+                        v_mid = 0.5 * (face.Domain(1).Min + face.Domain(1).Max)
+                        norm = face.NormalAt(u_mid, v_mid)
+                        norm.Unitize()
+                        if norm.Z > 0.60:
+                            fz = face.GetBoundingBox(True).Center.Z
+                            if fz > max_z:
+                                max_z = fz
+                                top_face = face
+                    if top_face and top_face.OuterLoop:
+                        cl = self._rg_loop_to_revit_curveloop(top_face.OuterLoop)
+                        if cl and not cl.IsOpen():
+                            curve_loops.Add(cl)
+
+                if curve_loops.Count == 0:
+                    bbox = geom_feet.GetBoundingBox(True)
+                    p0 = DB.XYZ(bbox.Min.X, bbox.Min.Y, bbox.Min.Z)
+                    p1 = DB.XYZ(bbox.Max.X, bbox.Min.Y, bbox.Min.Z)
+                    p2 = DB.XYZ(bbox.Max.X, bbox.Max.Y, bbox.Min.Z)
+                    p3 = DB.XYZ(bbox.Min.X, bbox.Max.Y, bbox.Min.Z)
+
+                    bbox_cl = DB.CurveLoop()
+                    bbox_cl.Append(DB.Line.CreateBound(p0, p1))
+                    bbox_cl.Append(DB.Line.CreateBound(p1, p2))
+                    bbox_cl.Append(DB.Line.CreateBound(p2, p3))
+                    bbox_cl.Append(DB.Line.CreateBound(p3, p0))
+                    curve_loops.Add(bbox_cl)
+
+                topo_type_id = getattr(self, "default_toposolid_type", None)
+                if not topo_type_id or topo_type_id == DB.ElementId.InvalidElementId:
+                    collector = DB.FilteredElementCollector(self.doc).OfClass(getattr(DB, "ToposolidType", DB.ElementType))
+                    first_type = collector.FirstElement()
+                    topo_type_id = first_type.Id if first_type else DB.ElementId.InvalidElementId
+
+                if topo_type_id and topo_type_id != DB.ElementId.InvalidElementId:
+                    toposolid = DB.Toposolid.Create(self.doc, curve_loops, topo_type_id, level_id)
+                    if toposolid:
+                        return toposolid
+            except Exception as ex:
+                res.warnings.append("Toposolid native generation notice: {}. Falling back to DirectShape.".format(ex))
+
+        return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=target_cat_id)
 
     # =========================================================================
     # Geometry Helpers & Encoders
@@ -1017,20 +1216,66 @@ class ConversionRouter(object):
         return arr
 
     def _category_str_to_id(self, cat_name):
-        """Maps category name string to Revit ElementId."""
+        """Maps category name string to Revit ElementId with Toposolid and full friendly name support."""
+        if not REVIT_AVAILABLE or not hasattr(DB, "BuiltInCategory"):
+            return None
+
+        # Resolve Toposolid BuiltInCategory safely (Revit 2024+)
+        toposolid_bic = getattr(DB.BuiltInCategory, "OST_Toposolid", DB.BuiltInCategory.OST_Topography)
+
         cat_map = {
             "OST_Floors": DB.BuiltInCategory.OST_Floors,
+            "Floors": DB.BuiltInCategory.OST_Floors,
+            "Floor": DB.BuiltInCategory.OST_Floors,
             "OST_Walls": DB.BuiltInCategory.OST_Walls,
+            "Walls": DB.BuiltInCategory.OST_Walls,
+            "Wall": DB.BuiltInCategory.OST_Walls,
             "OST_Roofs": DB.BuiltInCategory.OST_Roofs,
+            "Roofs": DB.BuiltInCategory.OST_Roofs,
+            "Roof": DB.BuiltInCategory.OST_Roofs,
             "OST_Ceilings": DB.BuiltInCategory.OST_Ceilings,
+            "Ceilings": DB.BuiltInCategory.OST_Ceilings,
+            "Ceiling": DB.BuiltInCategory.OST_Ceilings,
             "OST_Columns": DB.BuiltInCategory.OST_Columns,
+            "Columns": DB.BuiltInCategory.OST_Columns,
+            "Column": DB.BuiltInCategory.OST_Columns,
             "OST_StructuralColumns": DB.BuiltInCategory.OST_StructuralColumns,
+            "Structural Columns": DB.BuiltInCategory.OST_StructuralColumns,
             "OST_Doors": DB.BuiltInCategory.OST_Doors,
+            "Doors": DB.BuiltInCategory.OST_Doors,
+            "Door": DB.BuiltInCategory.OST_Doors,
             "OST_Windows": DB.BuiltInCategory.OST_Windows,
+            "Windows": DB.BuiltInCategory.OST_Windows,
+            "Window": DB.BuiltInCategory.OST_Windows,
             "OST_Furniture": DB.BuiltInCategory.OST_Furniture,
-            "OST_GenericModel": DB.BuiltInCategory.OST_GenericModel
+            "Furniture": DB.BuiltInCategory.OST_Furniture,
+            "OST_GenericModel": DB.BuiltInCategory.OST_GenericModel,
+            "Generic Model": DB.BuiltInCategory.OST_GenericModel,
+            "Generic Models": DB.BuiltInCategory.OST_GenericModel,
+            "Generic": DB.BuiltInCategory.OST_GenericModel,
+            "OST_Toposolid": toposolid_bic,
+            "Toposolid": toposolid_bic,
+            "Topography": DB.BuiltInCategory.OST_Topography,
+            "OST_Topography": DB.BuiltInCategory.OST_Topography,
+            "Site": DB.BuiltInCategory.OST_Site,
+            "OST_Site": DB.BuiltInCategory.OST_Site,
+            "Curtain Panels": DB.BuiltInCategory.OST_CurtainWallPanels,
+            "Curtain Wall Panels": DB.BuiltInCategory.OST_CurtainWallPanels,
+            "OST_CurtainWallPanels": DB.BuiltInCategory.OST_CurtainWallPanels,
+            "Stairs": DB.BuiltInCategory.OST_Stairs,
+            "OST_Stairs": DB.BuiltInCategory.OST_Stairs,
+            "Mass": DB.BuiltInCategory.OST_Mass,
+            "OST_Mass": DB.BuiltInCategory.OST_Mass,
+            "Structural Framing": DB.BuiltInCategory.OST_StructuralFraming,
+            "OST_StructuralFraming": DB.BuiltInCategory.OST_StructuralFraming,
         }
-        bic = cat_map.get(cat_name, DB.BuiltInCategory.OST_GenericModel)
+        clean_name = str(cat_name or "").strip()
+        bic = cat_map.get(clean_name)
+        if bic is None:
+            if clean_name.startswith("OST_") and hasattr(DB.BuiltInCategory, clean_name):
+                bic = getattr(DB.BuiltInCategory, clean_name)
+            else:
+                bic = DB.BuiltInCategory.OST_GenericModel
         return DB.ElementId(bic)
 
     def _get_or_create_bua_area_scheme(self):
