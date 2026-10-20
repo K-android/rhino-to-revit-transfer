@@ -36,6 +36,7 @@ namespace RhinoToRevitTransfer
         public int LoopCount { get; set; }
         public string RepetitionSignature { get; set; } = string.Empty;
         public string GeoHash { get; set; } = string.Empty;
+        public double RotationAngle { get; set; } = 0.0;
 
         // Spatial Context
         public string NearestLevelName { get; set; } = "Level 1";

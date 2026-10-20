@@ -10,6 +10,7 @@
     <AssemblyName>RhinoToRevitTransfer</AssemblyName>
     <RootNamespace>RhinoToRevitTransfer</RootNamespace>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <NuGetAudit>false</NuGetAudit>
   </PropertyGroup>
 
   <ItemGroup>

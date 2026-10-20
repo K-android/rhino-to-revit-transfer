@@ -58,7 +58,7 @@ namespace RhinoToRevitTransfer
 
             foreach (var scanned in scannedObjects)
             {
-                if (!classifications.TryGetValue(scanned.RhinoGuid, out var cResult)) continue;
+                if (!classifications.TryGetValue(scanned.RhinoGuid.ToString(), out var cResult)) continue;
                 string strategy = cResult.ProposedStrategy;
 
                 if (strategy == "ParametricFamily")
@@ -91,7 +91,9 @@ namespace RhinoToRevitTransfer
                         localGeom.Translate(-scanned.Centroid.X, -scanned.Centroid.Y, -scanned.Centroid.Z);
                         localGeom.Scale(scale);
 
-                        Solid? revitSolid = GeometryEncoder.ToSolid(localGeom);
+                        Solid? revitSolid = null;
+                        if (localGeom is Brep b) revitSolid = GeometryEncoder.ToSolid(b);
+                        else if (localGeom is Rhino.Geometry.Mesh m) revitSolid = GeometryEncoder.ToSolid(m);
                         if (revitSolid != null && revitSolid.Volume > 0.0001)
                         {
                             var sym = FamilyFactory.CreateNativeFreeFormFamily(app, _doc, famKey, revitSolid, subcategoryName: scanned.LayerName, categoryHint: cResult.InferredCategory);
@@ -143,7 +145,7 @@ namespace RhinoToRevitTransfer
 
                     if (scanned.RotationAngle != 0 && inst != null)
                     {
-                        var axis = Line.CreateBound(pt, new XYZ(pt.X, pt.Y, pt.Z + 1.0));
+                        var axis = Autodesk.Revit.DB.Line.CreateBound(pt, new XYZ(pt.X, pt.Y, pt.Z + 1.0));
                         ElementTransformUtils.RotateElement(_doc, inst.Id, axis, scanned.RotationAngle);
                     }
 
@@ -181,7 +183,7 @@ namespace RhinoToRevitTransfer
 
                     if (scanned.RotationAngle != 0 && inst != null)
                     {
-                        var axis = Line.CreateBound(pt, new XYZ(pt.X, pt.Y, pt.Z + 1.0));
+                        var axis = Autodesk.Revit.DB.Line.CreateBound(pt, new XYZ(pt.X, pt.Y, pt.Z + 1.0));
                         ElementTransformUtils.RotateElement(_doc, inst.Id, axis, scanned.RotationAngle);
                     }
 

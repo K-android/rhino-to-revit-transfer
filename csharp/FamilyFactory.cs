@@ -164,7 +164,7 @@ namespace RhinoToRevitTransfer
                     if (pHeight != null && height > 0.001) famMgr.Set(pHeight, height);
 
                     // Build 2D Extrusion Profile centered at (0, 0, 0)
-                    var plane = Plane.CreateByNormalAndOrigin(XYZ.BasisZ, XYZ.Zero);
+                    var plane = Autodesk.Revit.DB.Plane.CreateByNormalAndOrigin(XYZ.BasisZ, XYZ.Zero);
                     var sketchPlane = SketchPlane.Create(famDoc, plane);
 
                     double hw = Math.Max(0.05, width / 2.0);
@@ -175,10 +175,10 @@ namespace RhinoToRevitTransfer
                     var pt3 = new XYZ(-hw, hd, 0.0);
 
                     var ca = new CurveArray();
-                    ca.Append(Line.CreateBound(pt0, pt1));
-                    ca.Append(Line.CreateBound(pt1, pt2));
-                    ca.Append(Line.CreateBound(pt2, pt3));
-                    ca.Append(Line.CreateBound(pt3, pt0));
+                    ca.Append(Autodesk.Revit.DB.Line.CreateBound(pt0, pt1));
+                    ca.Append(Autodesk.Revit.DB.Line.CreateBound(pt1, pt2));
+                    ca.Append(Autodesk.Revit.DB.Line.CreateBound(pt2, pt3));
+                    ca.Append(Autodesk.Revit.DB.Line.CreateBound(pt3, pt0));
 
                     var caa = new CurveArrArray();
                     caa.Append(ca);
@@ -186,7 +186,7 @@ namespace RhinoToRevitTransfer
                     var extrusion = famDoc.FamilyCreate.NewExtrusion(true, caa, sketchPlane, Math.Max(0.1, height));
                     if (extrusion != null && pHeight != null)
                     {
-                        var endParam = extrusion.get_Parameter(BuiltInParameter.EXTRUSION_END_OFFSET);
+                        var endParam = extrusion.get_Parameter(BuiltInParameter.EXTRUSION_END_PARAM);
                         if (endParam != null) famMgr.AssociateElementParameterToFamilyParameter(endParam, pHeight);
                     }
                     if (extrusion != null && pMat != null)
@@ -212,7 +212,7 @@ namespace RhinoToRevitTransfer
                     string tempFile = Path.Combine(tempDir, $"{familyName}.rfa");
                     var saveOpts = new SaveAsOptions { OverwriteExistingFile = true };
                     famDoc.SaveAs(tempFile, saveOpts);
-                    loadedFam = projectDoc.LoadFamily(tempFile, loadOpts);
+                    projectDoc.LoadFamily(tempFile, loadOpts, out loadedFam);
                 }
 
                 famDoc.Close(false);
@@ -318,7 +318,7 @@ namespace RhinoToRevitTransfer
                     string tempFile = Path.Combine(tempDir, $"{familyName}.rfa");
                     var saveOpts = new SaveAsOptions { OverwriteExistingFile = true };
                     famDoc.SaveAs(tempFile, saveOpts);
-                    loadedFam = projectDoc.LoadFamily(tempFile, loadOpts);
+                    projectDoc.LoadFamily(tempFile, loadOpts, out loadedFam);
                 }
 
                 famDoc.Close(false);
@@ -350,15 +350,9 @@ namespace RhinoToRevitTransfer
 
             try
             {
-#if NET8_0_OR_GREATER || REVIT2022_OR_GREATER
                 ForgeTypeId spec = isLength ? SpecTypeId.Length : (isMaterial ? SpecTypeId.Reference.Material : SpecTypeId.String.Text);
                 ForgeTypeId group = isMaterial ? GroupTypeId.Materials : GroupTypeId.Geometry;
                 return famMgr.AddParameter(name, group, spec, true);
-#else
-                ParameterType ptype = isLength ? ParameterType.Length : (isMaterial ? ParameterType.Material : ParameterType.Text);
-                BuiltInParameterGroup pgroup = isMaterial ? BuiltInParameterGroup.PG_MATERIALS : BuiltInParameterGroup.PG_GEOMETRY;
-                return famMgr.AddParameter(name, pgroup, ptype, true);
-#endif
             }
             catch
             {
