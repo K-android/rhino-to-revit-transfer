@@ -40,7 +40,7 @@ except Exception:
 try:
     from scanner import RhinoScanner
     from classifier import AecClassifier
-    from ai_assistant import AISemanticInterpreter
+    from ai_assistant import AISemanticInterpreter, PROVIDER_PRESETS
     from profile_manager import ProfileManager, MappingRule
     from conversion_router import ConversionRouter
     from graphics_validator import GraphicsValidator
@@ -49,7 +49,7 @@ try:
 except (ImportError, ValueError):
     from .scanner import RhinoScanner
     from .classifier import AecClassifier
-    from .ai_assistant import AISemanticInterpreter
+    from .ai_assistant import AISemanticInterpreter, PROVIDER_PRESETS
     from .profile_manager import ProfileManager, MappingRule
     from .conversion_router import ConversionRouter
     from .graphics_validator import GraphicsValidator
@@ -232,6 +232,220 @@ class ValidationRowItem(object):
         self.section = val_report.view_matrix.get("Section", "PASS")
         self.issues = "; ".join(val_report.issues) if val_report.issues else "None"
         self.raw_report = val_report
+
+
+class AISettingsDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
+    """Configuration modal for LLM Provider, API Key, Model Engine, and Custom Endpoints."""
+
+    def __init__(self, ai_interpreter, parent=None):
+        if not ETO_AVAILABLE:
+            return
+
+        super(AISettingsDialog, self).__init__()
+        self.Title = "R2R AI Model & API Key Configuration"
+        self.ClientSize = ed.Size(560, 420)
+        self.Resizable = False
+        self.Padding = ed.Padding(16)
+        self.ai_interpreter = ai_interpreter
+
+        layout = ef.DynamicLayout()
+        layout.Spacing = ed.Size(10, 10)
+
+        # Header Title
+        lbl_header = ef.Label()
+        lbl_header.Text = "AI Semantic Classifier & Model Settings"
+        try:
+            lbl_header.Font = ed.Font(ed.SystemFont.Bold, 12)
+        except Exception:
+            pass
+        layout.Add(lbl_header)
+
+        lbl_desc = ef.Label()
+        lbl_desc.Text = (
+            "Configure an AI provider to automatically decode complex layer names, foreign\n"
+            "architectural naming conventions, and ambiguous geometric categories."
+        )
+        try:
+            lbl_desc.TextColor = ed.Colors.DimGray
+        except Exception:
+            pass
+        layout.Add(lbl_desc)
+
+        # Provider Selection
+        lbl_provider = ef.Label()
+        lbl_provider.Text = "LLM Provider:"
+        self.dd_provider = ef.DropDown()
+        providers = ["OpenAI", "Google Gemini", "DeepSeek", "OpenRouter", "Local Ollama / LM Studio", "Custom / Other"]
+        for p in providers:
+            self.dd_provider.Items.Add(p)
+
+        curr_prov = getattr(self.ai_interpreter, "provider", "OpenAI")
+        if curr_prov in providers:
+            self.dd_provider.SelectedValue = curr_prov
+        else:
+            self.dd_provider.SelectedIndex = 0
+        self.dd_provider.SelectedIndexChanged += self._on_provider_changed
+
+        row_prov = ef.DynamicLayout()
+        row_prov.Spacing = ed.Size(8, 5)
+        row_prov.BeginHorizontal()
+        row_prov.Add(lbl_provider)
+        row_prov.Add(self.dd_provider, True)
+        row_prov.EndHorizontal()
+        layout.Add(row_prov)
+
+        # Model Engine Selection
+        lbl_model = ef.Label()
+        lbl_model.Text = "Model Engine:"
+        self.dd_model = ef.DropDown()
+
+        self.txt_custom_model = ef.TextBox()
+        self.txt_custom_model.PlaceholderText = "Or type custom model name (e.g. gpt-4o, gemini-2.0-flash)"
+        self.txt_custom_model.Text = getattr(self.ai_interpreter, "model", "gpt-4o-mini")
+
+        self._populate_model_options()
+
+        row_model = ef.DynamicLayout()
+        row_model.Spacing = ed.Size(8, 5)
+        row_model.BeginHorizontal()
+        row_model.Add(lbl_model)
+        row_model.Add(self.dd_model, True)
+        row_model.Add(self.txt_custom_model, True)
+        row_model.EndHorizontal()
+        layout.Add(row_model)
+
+        # API Key
+        lbl_key = ef.Label()
+        lbl_key.Text = "API Key:"
+        self.txt_api_key = ef.TextBox()
+        self.txt_api_key.PlaceholderText = "Paste API Key (sk-... / AIza...)"
+        self.txt_api_key.Text = getattr(self.ai_interpreter, "api_key", "") or ""
+
+        row_key = ef.DynamicLayout()
+        row_key.Spacing = ed.Size(8, 5)
+        row_key.BeginHorizontal()
+        row_key.Add(lbl_key)
+        row_key.Add(self.txt_api_key, True)
+        row_key.EndHorizontal()
+        layout.Add(row_key)
+
+        # API Endpoint URL
+        lbl_endpoint = ef.Label()
+        lbl_endpoint.Text = "API Endpoint:"
+        self.txt_endpoint = ef.TextBox()
+        self.txt_endpoint.Text = getattr(self.ai_interpreter, "api_endpoint", "https://api.openai.com/v1/chat/completions")
+
+        row_ep = ef.DynamicLayout()
+        row_ep.Spacing = ed.Size(8, 5)
+        row_ep.BeginHorizontal()
+        row_ep.Add(lbl_endpoint)
+        row_ep.Add(self.txt_endpoint, True)
+        row_ep.EndHorizontal()
+        layout.Add(row_ep)
+
+        # Status & Feedback
+        self.lbl_status = ef.Label()
+        self.lbl_status.Text = "Status: Configuration stored in AppData/pyRevit/R2R/ai_config.json"
+        try:
+            self.lbl_status.TextColor = ed.Colors.DimGray
+        except Exception:
+            pass
+        layout.Add(self.lbl_status)
+
+        # Buttons Bar
+        btn_test = ef.Button()
+        btn_test.Text = "Test Connection"
+        btn_test.Click += self._on_test_connection
+
+        btn_save = ef.Button()
+        btn_save.Text = "Save & Apply"
+        btn_save.Click += self._on_save_config
+
+        btn_cancel = ef.Button()
+        btn_cancel.Text = "Close"
+        btn_cancel.Click += self._on_cancel
+
+        btn_layout = ef.DynamicLayout()
+        btn_layout.Spacing = ed.Size(10, 5)
+        btn_layout.BeginHorizontal()
+        btn_layout.Add(btn_test)
+        btn_layout.Add(None, True)  # Spacer
+        btn_layout.Add(btn_save)
+        btn_layout.Add(btn_cancel)
+        btn_layout.EndHorizontal()
+
+        layout.Add(None, True)  # Vertical Spacer
+        layout.Add(btn_layout)
+
+        self.Content = layout
+
+    def _populate_model_options(self):
+        """Populates model dropdown based on selected provider presets."""
+        prov = str(self.dd_provider.SelectedValue or "OpenAI")
+        preset = PROVIDER_PRESETS.get(prov, {})
+        models = preset.get("models", ["gpt-4o-mini", "gpt-4o"])
+        self.dd_model.Items.Clear()
+        for m in models:
+            self.dd_model.Items.Add(m)
+        curr_model = getattr(self.ai_interpreter, "model", "")
+        if curr_model in models:
+            self.dd_model.SelectedValue = curr_model
+        else:
+            self.dd_model.SelectedIndex = 0
+        try:
+            self.dd_model.SelectedIndexChanged -= self._on_model_dd_changed
+        except Exception:
+            pass
+        self.dd_model.SelectedIndexChanged += self._on_model_dd_changed
+
+    def _on_model_dd_changed(self, sender, e):
+        val = str(self.dd_model.SelectedValue or "")
+        if val:
+            self.txt_custom_model.Text = val
+
+    def _on_provider_changed(self, sender, e):
+        prov = str(self.dd_provider.SelectedValue or "OpenAI")
+        preset = PROVIDER_PRESETS.get(prov, {})
+        if preset:
+            self.txt_endpoint.Text = preset.get("endpoint", "")
+            self._populate_model_options()
+            self.txt_custom_model.Text = preset.get("default_model", "")
+
+    def _on_test_connection(self, sender, e):
+        self.lbl_status.Text = "Testing live connection..."
+        prov = str(self.dd_provider.SelectedValue or "")
+        model = (self.txt_custom_model.Text or str(self.dd_model.SelectedValue or "")).strip()
+        key = (self.txt_api_key.Text or "").strip()
+        endpoint = (self.txt_endpoint.Text or "").strip()
+
+        success, msg = self.ai_interpreter.test_connection(
+            api_key=key,
+            api_endpoint=endpoint,
+            model=model,
+            provider=prov
+        )
+        self.lbl_status.Text = msg
+        try:
+            self.lbl_status.TextColor = ed.Colors.Green if success else ed.Colors.Red
+        except Exception:
+            pass
+
+    def _on_save_config(self, sender, e):
+        prov = str(self.dd_provider.SelectedValue or "OpenAI")
+        model = (self.txt_custom_model.Text or str(self.dd_model.SelectedValue or "gpt-4o-mini")).strip()
+        key = (self.txt_api_key.Text or "").strip()
+        endpoint = (self.txt_endpoint.Text or "").strip()
+
+        self.ai_interpreter.provider = prov
+        self.ai_interpreter.model = model
+        self.ai_interpreter.api_key = key
+        self.ai_interpreter.api_endpoint = endpoint
+        self.ai_interpreter.save_config()
+
+        self.Close(True)
+
+    def _on_cancel(self, sender, e):
+        self.Close(False)
 
 
 class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
@@ -566,6 +780,11 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         btn_ai_assist.ToolTip = "Interpret Spanish/Catalan architectural layer naming using semantic AI heuristics"
         btn_ai_assist.Click += self._on_run_ai_assist
 
+        btn_ai_config = ef.Button()
+        btn_ai_config.Text = "AI Config..."
+        btn_ai_config.ToolTip = "Configure AI Provider (OpenAI, Gemini, DeepSeek, Ollama), API Key, and Model Engine"
+        btn_ai_config.Click += self._on_open_ai_settings
+
         btn_load_profile = ef.Button()
         btn_load_profile.Text = "Load Profile"
         btn_load_profile.Click += self._on_load_profile
@@ -583,6 +802,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         opts_layout.Add(btn_select_all)
         opts_layout.Add(btn_deselect_all)
         opts_layout.Add(btn_ai_assist)
+        opts_layout.Add(btn_ai_config)
         opts_layout.Add(btn_load_profile)
         opts_layout.Add(btn_save_profile)
         opts_layout.EndHorizontal()
@@ -1236,11 +1456,29 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self._populate_review_grid()
         self._update_preview_kpis()
 
+    def _on_open_ai_settings(self, sender, e):
+        """Opens the AI Model & API Key Configuration dialog."""
+        try:
+            dlg = AISettingsDialog(self.ai_interpreter)
+            if dlg.ShowModal(self):
+                prov = getattr(self.ai_interpreter, "provider", "OpenAI")
+                model = getattr(self.ai_interpreter, "model", "gpt-4o-mini")
+                has_key = bool(getattr(self.ai_interpreter, "api_key", ""))
+                key_tag = "Key Configured" if has_key else "Offline Heuristics"
+                self.lbl_global_status.Text = "AI configured: {} / {} [{}]".format(prov, model, key_tag)
+        except Exception as ex:
+            self.lbl_global_status.Text = "AI config dialog notice: {}".format(ex)
+
     def _on_run_ai_assist(self, sender, e):
-        """Uses AI semantic interpreter to resolve ambiguous Catalan/Spanish layers."""
+        """Uses AI semantic interpreter to resolve ambiguous architectural layers."""
         self._sync_grid_check_states()
-        self.lbl_global_status.Text = "Running semantic interpretation on layers..."
+        prov = getattr(self.ai_interpreter, "provider", "OpenAI")
+        model = getattr(self.ai_interpreter, "model", "gpt-4o-mini")
+        has_key = bool(getattr(self.ai_interpreter, "api_key", ""))
+        mode_str = "{} ({})".format(prov, model) if has_key else "Offline Heuristic Lexicon"
+        self.lbl_global_status.Text = "Running AI semantic interpretation [{} on layers]...".format(mode_str)
         boosted = 0
+        llm_count = 0
         for r in self.layer_rows:
             interp = self.ai_interpreter.interpret(r.layer_name)
             if interp and interp.confidence_boost > 0:
@@ -1249,10 +1487,17 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 r.confidence_score = min(100.0, r.confidence_score + (interp.confidence_boost * 20.0))
                 r.checked = True
                 boosted += 1
+                if getattr(interp, "source", "") == "LLM":
+                    llm_count += 1
 
         self._refresh_review_grid_datastore()
         self._update_preview_kpis()
-        self.lbl_global_status.Text = "AI Semantic Assist refined {} layer classifications.".format(boosted)
+        if llm_count > 0:
+            self.lbl_global_status.Text = "AI Semantic Assist refined {} layer(s) ({} via live LLM, {} via lexicon).".format(
+                boosted, llm_count, boosted - llm_count
+            )
+        else:
+            self.lbl_global_status.Text = "AI Semantic Assist refined {} layer classifications (Lexicon Heuristics).".format(boosted)
 
     def _on_load_profile(self, sender, e):
         """Loads transfer profile from disk."""

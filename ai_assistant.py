@@ -29,6 +29,40 @@ except ImportError:
         HTTP_AVAILABLE = False
 
 
+PROVIDER_PRESETS = {
+    "OpenAI": {
+        "endpoint": "https://api.openai.com/v1/chat/completions",
+        "default_model": "gpt-4o-mini",
+        "models": ["gpt-4o-mini", "gpt-4o", "o3-mini", "gpt-3.5-turbo"]
+    },
+    "Google Gemini": {
+        "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "default_model": "gemini-2.0-flash",
+        "models": ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    },
+    "DeepSeek": {
+        "endpoint": "https://api.deepseek.com/v1/chat/completions",
+        "default_model": "deepseek-chat",
+        "models": ["deepseek-chat", "deepseek-reasoner"]
+    },
+    "OpenRouter": {
+        "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+        "default_model": "google/gemini-2.0-flash-exp:free",
+        "models": ["google/gemini-2.0-flash-exp:free", "anthropic/claude-3.5-sonnet", "meta-llama/llama-3.3-70b-instruct"]
+    },
+    "Local Ollama / LM Studio": {
+        "endpoint": "http://localhost:11434/v1/chat/completions",
+        "default_model": "llama3",
+        "models": ["llama3", "mistral", "qwen2.5", "phi3"]
+    },
+    "Custom / Other": {
+        "endpoint": "https://api.openai.com/v1/chat/completions",
+        "default_model": "custom-model",
+        "models": ["custom-model"]
+    }
+}
+
+
 class SemanticInterpretation(object):
     """Holds semantic decoding and architectural intent for an ambiguous layer or block."""
 
@@ -112,19 +146,132 @@ class AISemanticInterpreter(object):
         "puerta": ("Door", "Family", "Single Flush Door", "Hinged or sliding door"),
         "finestra": ("Window", "Family", "Fixed Glazed Window", "Exterior or interior window"),
         "ventana": ("Window", "Family", "Fixed Glazed Window", "Exterior or interior window"),
+        "jardinera": ("Planter Box", "Family", "OST_Planting", "Architectural planter container"),
+        "plantador": ("Planter", "Family", "OST_Planting", "Vegetation container"),
+        "terreny": ("Topography / Site", "Toposolid", "Toposolid: Earth", "Site terrain / toposolid surface"),
+        "topografia": ("Topography", "Toposolid", "Toposolid: Natural Earth", "Topographical site mesh"),
+        "sofa": ("Lounge Seating", "Family", "OST_Furniture", "Architectural furniture seating"),
+        "banc": ("Bench / Seating", "Family", "OST_Furniture", "Fixed or loose bench seating"),
+        "cadira": ("Chair", "Family", "OST_Furniture", "Seating furniture"),
+        "taula": ("Table", "Family", "OST_Furniture", "Surface furniture"),
         "fusteria": ("Joinery / Millwork", "Family", "Architectural Millwork", "Custom wood joinery / cabinetry"),
         "carpinteria": ("Joinery / Millwork", "Family", "Architectural Millwork", "Custom joinery / casework")
     }
 
-    def __init__(self, api_key=None, api_endpoint=None):
-        self.api_key = api_key or os.environ.get("R2R_AI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        self.api_endpoint = api_endpoint or os.environ.get("R2R_AI_ENDPOINT")
+    def __init__(self, api_key=None, api_endpoint=None, model=None, provider=None):
+        self.provider = provider or "OpenAI"
+        self.model = model or "gpt-4o-mini"
+        self.api_key = api_key or os.environ.get("R2R_AI_API_KEY") or os.environ.get("OPENAI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        self.api_endpoint = api_endpoint or os.environ.get("R2R_AI_ENDPOINT") or "https://api.openai.com/v1/chat/completions"
         self.cache = {}
+
+        # Load persisted settings if available
+        self.load_config()
+
+    @classmethod
+    def get_config_path(cls):
+        """Returns isolated persistent path in AppData/pyRevit/R2R/ai_config.json."""
+        base_dir = os.path.join(os.environ.get("APPDATA", ""), "pyRevit", "R2R")
+        if not os.path.exists(base_dir):
+            try:
+                os.makedirs(base_dir)
+            except Exception:
+                pass
+        return os.path.join(base_dir, "ai_config.json")
+
+    def load_config(self):
+        """Loads saved provider, model, api_key, and endpoint from disk."""
+        cfg_path = self.get_config_path()
+        if os.path.exists(cfg_path):
+            try:
+                with open(cfg_path, "r") as f:
+                    data = json.load(f)
+                    if data.get("provider"):
+                        self.provider = data["provider"]
+                    if data.get("model"):
+                        self.model = data["model"]
+                    if data.get("api_key"):
+                        self.api_key = data["api_key"]
+                    if data.get("api_endpoint"):
+                        self.api_endpoint = data["api_endpoint"]
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def save_config(self):
+        """Saves current provider, model, api_key, and endpoint to disk."""
+        cfg_path = self.get_config_path()
+        try:
+            data = {
+                "provider": getattr(self, "provider", "OpenAI"),
+                "model": getattr(self, "model", "gpt-4o-mini"),
+                "api_key": getattr(self, "api_key", ""),
+                "api_endpoint": getattr(self, "api_endpoint", "https://api.openai.com/v1/chat/completions")
+            }
+            with open(cfg_path, "w") as f:
+                json.dump(data, f, indent=2)
+            return True
+        except Exception:
+            return False
+
+    def test_connection(self, api_key=None, api_endpoint=None, model=None, provider=None):
+        """Tests live connectivity to the chosen LLM provider and model."""
+        key = api_key if api_key is not None else self.api_key
+        endpoint = api_endpoint or self.api_endpoint or "https://api.openai.com/v1/chat/completions"
+        target_model = model or self.model or "gpt-4o-mini"
+        prov = provider or self.provider or "AI"
+
+        is_local = any(loc in endpoint.lower() for loc in ["localhost", "127.0.0.1", "0.0.0.0"])
+        if not key and not is_local:
+            return False, "API Key is required for {}".format(prov)
+
+        if not HTTP_AVAILABLE:
+            return False, "HTTP client module is not available in this Python environment."
+
+        headers = {
+            "Content-Type": "application/json"
+        }
+        if key:
+            headers["Authorization"] = "Bearer {}".format(key.strip())
+
+        payload = {
+            "model": target_model.strip(),
+            "messages": [
+                {"role": "user", "content": "Respond with the word OK."}
+            ],
+            "max_tokens": 10,
+            "temperature": 0.0
+        }
+
+        try:
+            req = urllib_req.Request(
+                endpoint.strip(),
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers
+            )
+            with urllib_req.urlopen(req, timeout=8) as response:
+                status_code = getattr(response, "status", getattr(response, "code", 200))
+                if status_code in (200, 201):
+                    raw_body = response.read().decode("utf-8")
+                    data = json.loads(raw_body)
+                    if "choices" in data and len(data["choices"]) > 0:
+                        return True, "Connected successfully to '{}' via {}!".format(target_model, prov)
+                    return True, "Endpoint responded with status 200 OK."
+                return False, "HTTP status code: {}".format(status_code)
+        except Exception as ex:
+            err_msg = str(ex)
+            if hasattr(ex, "read"):
+                try:
+                    err_msg += " - " + ex.read().decode("utf-8")[:200]
+                except Exception:
+                    pass
+            return False, "Connection failed: {}".format(err_msg)
 
     def interpret(self, raw_layer_name):
         """Translates and categorizes an architectural layer or block name.
 
-        Uses local cache -> rule-based lexicon -> optional LLM endpoint.
+        Uses local cache -> optional LLM endpoint (if key provided) -> rule-based lexicon.
         """
         clean_key = raw_layer_name.strip()
         if clean_key in self.cache:
@@ -132,25 +279,24 @@ class AISemanticInterpreter(object):
             cached_res.source = "Cached"
             return cached_res
 
-        # 1. Offline heuristic scan
-        heuristic_res = self._interpret_heuristically(clean_key)
-        if heuristic_res and heuristic_res.confidence_boost >= 0.70:
-            self.cache[clean_key] = heuristic_res
-            return heuristic_res
-
-        # 2. Try LLM endpoint if configured
+        # 1. Try LLM endpoint if configured with an API key
         if self.api_key and HTTP_AVAILABLE:
             try:
                 llm_res = self._call_llm_api(clean_key)
                 if llm_res:
                     self.cache[clean_key] = llm_res
                     return llm_res
-            except Exception as ex:
-                # Silently fallback to heuristic result on network/API failure
+            except Exception:
                 pass
 
-        # 3. Fallback to best heuristic match or default
-        res = heuristic_res if heuristic_res else SemanticInterpretation(clean_key)
+        # 2. Offline heuristic scan
+        heuristic_res = self._interpret_heuristically(clean_key)
+        if heuristic_res:
+            self.cache[clean_key] = heuristic_res
+            return heuristic_res
+
+        # 3. Default fallback
+        res = SemanticInterpretation(clean_key)
         self.cache[clean_key] = res
         return res
 
@@ -185,35 +331,38 @@ class AISemanticInterpreter(object):
     def _call_llm_api(self, raw_name):
         """Optional JSON-based call to an external LLM endpoint."""
         prompt = (
-            "You are an AEC BIM architect. Decode this Catalan/Spanish architectural CAD layer name from RCR Arquitectes:\n"
+            "You are an AEC BIM architect. Decode this architectural CAD/Rhino layer name:\n"
             "Layer: '{}'\n"
             "Return strictly valid JSON with keys: 'english_translation', 'inferred_category' "
-            "(one of: Floors, Walls, Roofs, Ceilings, Family, DirectShape), 'suggested_revit_type', and 'architectural_intent'."
+            "(one of: Floors, Walls, Roofs, Ceilings, Columns, Toposolid, Planting, Furniture, Site, Family, DirectShape), "
+            "'suggested_revit_type', and 'architectural_intent'."
         ).format(raw_name)
 
         headers = {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer {}".format(self.api_key)
+            "Content-Type": "application/json"
         }
+        if self.api_key:
+            headers["Authorization"] = "Bearer {}".format(self.api_key.strip())
 
         endpoint = self.api_endpoint or "https://api.openai.com/v1/chat/completions"
         payload = {
-            "model": "gpt-4o-mini",
+            "model": getattr(self, "model", "gpt-4o-mini").strip(),
             "messages": [
-                {"role": "system", "content": "You are a bilingual Spanish/Catalan AEC BIM specialist."},
+                {"role": "system", "content": "You are a bilingual multilingual AEC BIM specialist. Output only JSON."},
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.0
         }
 
         req = urllib_req.Request(
-            endpoint,
+            endpoint.strip(),
             data=json.dumps(payload).encode("utf-8"),
             headers=headers
         )
 
-        with urllib_req.urlopen(req, timeout=5) as response:
-            if response.status == 200:
+        with urllib_req.urlopen(req, timeout=6) as response:
+            status_code = getattr(response, "status", getattr(response, "code", 200))
+            if status_code in (200, 201):
                 raw_body = response.read().decode("utf-8")
                 data = json.loads(raw_body)
                 content = data["choices"][0]["message"]["content"]

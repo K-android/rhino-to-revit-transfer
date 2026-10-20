@@ -454,6 +454,63 @@ class TestR2RPipeline(unittest.TestCase):
         res_none = router._category_str_to_id("Toposolid")
         self.assertIsNone(res_none)
 
+    def test_ai_provider_presets_and_config(self):
+        """Tests provider presets, config save and load outside extension directory."""
+        from ai_assistant import PROVIDER_PRESETS, AISemanticInterpreter
+        import tempfile
+
+        # Verify key providers exist in presets
+        expected_providers = ["OpenAI", "Google Gemini", "DeepSeek", "OpenRouter", "Local Ollama / LM Studio", "Custom / Other"]
+        for p in expected_providers:
+            self.assertIn(p, PROVIDER_PRESETS)
+            self.assertTrue(len(PROVIDER_PRESETS[p]["endpoint"]) > 0)
+            self.assertTrue(len(PROVIDER_PRESETS[p]["models"]) > 0)
+
+        # Verify Google Gemini endpoint is OpenAI compatible
+        gemini_preset = PROVIDER_PRESETS["Google Gemini"]
+        self.assertIn("openai", gemini_preset["endpoint"].lower())
+
+        # Test config save and load with temporary file path
+        ai = AISemanticInterpreter()
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            ai.get_config_path = lambda: tmp_path
+            ai.provider = "Google Gemini"
+            ai.model = "gemini-2.0-flash"
+            ai.api_key = "AIzaSyTestMockKey123"
+            ai.api_endpoint = gemini_preset["endpoint"]
+            saved = ai.save_config()
+            self.assertTrue(saved)
+
+            # Create fresh instance and load
+            ai2 = AISemanticInterpreter()
+            ai2.get_config_path = lambda: tmp_path
+            loaded = ai2.load_config()
+            self.assertTrue(loaded)
+            self.assertEqual(ai2.provider, "Google Gemini")
+            self.assertEqual(ai2.model, "gemini-2.0-flash")
+            self.assertEqual(ai2.api_key, "AIzaSyTestMockKey123")
+            self.assertEqual(ai2.api_endpoint, gemini_preset["endpoint"])
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def test_ai_test_connection_validation(self):
+        """Tests test_connection validation rules (empty key requirement and local endpoint bypass)."""
+        from ai_assistant import AISemanticInterpreter
+
+        ai = AISemanticInterpreter()
+        # Remote provider without key must fail validation cleanly
+        ok, msg = ai.test_connection(api_key="", api_endpoint="https://api.openai.com/v1/chat/completions", provider="OpenAI")
+        self.assertFalse(ok)
+        self.assertIn("API Key is required", msg)
+
+        # Local Ollama endpoint without key should attempt connection rather than rejecting key
+        ok_local, msg_local = ai.test_connection(api_key="", api_endpoint="http://localhost:11434/v1/chat/completions", provider="Local Ollama")
+        self.assertNotIn("API Key is required", msg_local)
+
 
 if __name__ == "__main__":
     unittest.main()
