@@ -338,11 +338,21 @@ class TestR2RPipeline(unittest.TestCase):
         self.assertEqual(row.confidence_score, 98.0)
         self.assertEqual(row.confidence_tier, "AUTO_READY")
 
-        # Change strategy to FloorNative (object is NOT horizontal)
+        # Change strategy to FloorNative (object is NOT horizontal -> confidence drops to 0.0%)
         row.update_strategy("FloorNative")
         self.assertEqual(row.proposed_strategy, "FloorNative")
-        self.assertEqual(row.confidence_score, 65.0)
-        self.assertEqual(row.confidence_tier, "SUGGESTED_NEEDS_APPROVAL")
+        self.assertEqual(row.confidence_score, 0.0)
+        self.assertEqual(row.confidence_tier, "MANUAL_OR_EXCLUDED")
+        self.assertFalse(row.checked)
+
+        # Change strategy to AdaptiveComponent on object with 0 points -> confidence drops to 0.0%
+        obj_no_pts = ScannedObject("test-solid")
+        obj_no_pts.adaptive_point_count = 0
+        row_solid = LayerRowItem("SOLID::BREP", [obj_no_pts], c_res, None)
+        row_solid.update_strategy("AdaptiveComponent")
+        self.assertEqual(row_solid.confidence_score, 0.0)
+        self.assertEqual(row_solid.confidence_tier, "MANUAL_OR_EXCLUDED")
+        self.assertFalse(row_solid.checked)
 
         # Change strategy to DirectShape (universal compatibility)
         row.update_strategy("DirectShape")

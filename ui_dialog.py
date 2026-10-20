@@ -99,34 +99,38 @@ class LayerRowItem(object):
             if pts == len(self.objects):
                 comp_score = 98.0
             elif pts > 0:
-                comp_score = 85.0
+                comp_score = round((float(pts) / len(self.objects)) * 85.0, 1)
             else:
-                comp_score = 70.0  # Lacks 2-4 pt boundary; will fall back to DirectShape if needed
+                comp_score = 0.0  # 0% confidence: physically impossible to place without 2, 3, or 4 boundary points
 
         elif self.proposed_strategy == "FloorNative":
             horiz_cnt = sum(1 for o in self.objects if getattr(o, "is_horizontal", False))
-            comp_score = 96.0 if horiz_cnt == len(self.objects) else 65.0
+            comp_score = 96.0 if horiz_cnt == len(self.objects) else (round((float(horiz_cnt) / len(self.objects)) * 80.0, 1) if horiz_cnt > 0 else 0.0)
 
         elif self.proposed_strategy == "WallByCurve":
             vert_cnt = sum(1 for o in self.objects if getattr(o, "is_vertical", False))
-            comp_score = 96.0 if vert_cnt == len(self.objects) else 65.0
+            comp_score = 96.0 if vert_cnt == len(self.objects) else (round((float(vert_cnt) / len(self.objects)) * 80.0, 1) if vert_cnt > 0 else 0.0)
 
         elif self.proposed_strategy in ("RoofNative", "CeilingNative"):
             horiz_cnt = sum(1 for o in self.objects if getattr(o, "is_horizontal", False))
-            comp_score = 95.0 if horiz_cnt > 0 else 70.0
+            comp_score = 95.0 if horiz_cnt > 0 else 0.0
 
         elif self.proposed_strategy == "Toposolid":
             horiz_cnt = sum(1 for o in self.objects if getattr(o, "is_horizontal", False))
-            comp_score = 96.0 if horiz_cnt > 0 else 85.0
+            vert_cnt = sum(1 for o in self.objects if getattr(o, "is_vertical", False))
+            if vert_cnt == len(self.objects):
+                comp_score = 0.0  # Vertical geometry cannot form a Toposolid
+            else:
+                comp_score = 96.0 if horiz_cnt > 0 else 85.0
 
         elif self.proposed_strategy == "RepetitiveFamily":
             rep_cnt = max([getattr(o, "repetition_count", 1) for o in self.objects] + [1])
             is_blk = any(getattr(o, "object_type", "") == "InstanceReference" for o in self.objects)
-            comp_score = 98.0 if (rep_cnt >= 2 or is_blk) else 80.0
+            comp_score = 98.0 if (rep_cnt >= 2 or is_blk) else 75.0
 
         elif self.proposed_strategy == "ParametricFamily":
             has_dims = all(bool(getattr(o, "parametric_dims", {})) for o in self.objects)
-            comp_score = 95.0 if has_dims else 80.0
+            comp_score = 95.0 if has_dims else 0.0
 
         elif self.proposed_strategy == "DirectShape":
             comp_score = 100.0  # 100% universal geometric compatibility
@@ -141,6 +145,8 @@ class LayerRowItem(object):
             self.confidence_tier = "SUGGESTED_NEEDS_APPROVAL"
         else:
             self.confidence_tier = "MANUAL_OR_EXCLUDED"
+            if comp_score == 0.0:
+                self.checked = False  # Auto-uncheck physically incompatible strategy
 
         if self.classification:
             self.classification.proposed_strategy = self.proposed_strategy
