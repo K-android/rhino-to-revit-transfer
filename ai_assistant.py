@@ -37,8 +37,16 @@ PROVIDER_PRESETS = {
     },
     "Google Gemini": {
         "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-        "default_model": "gemini-2.0-flash",
-        "models": ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+        "default_model": "gemini-3.8-flash",
+        "models": [
+            "gemini-3.8-flash",
+            "gemini-3.8",
+            "gemini-3.6-flash",
+            "gemini-3.6",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+            "gemini-1.5-pro"
+        ]
     },
     "DeepSeek": {
         "endpoint": "https://api.deepseek.com/v1/chat/completions",
@@ -47,8 +55,14 @@ PROVIDER_PRESETS = {
     },
     "OpenRouter": {
         "endpoint": "https://openrouter.ai/api/v1/chat/completions",
-        "default_model": "google/gemini-2.0-flash-exp:free",
-        "models": ["google/gemini-2.0-flash-exp:free", "anthropic/claude-3.5-sonnet", "meta-llama/llama-3.3-70b-instruct"]
+        "default_model": "google/gemini-3.8-flash",
+        "models": [
+            "google/gemini-3.8-flash",
+            "google/gemini-3.6-flash",
+            "google/gemini-2.0-flash-exp:free",
+            "anthropic/claude-3.5-sonnet",
+            "meta-llama/llama-3.3-70b-instruct"
+        ]
     },
     "Local Ollama / LM Studio": {
         "endpoint": "http://localhost:11434/v1/chat/completions",

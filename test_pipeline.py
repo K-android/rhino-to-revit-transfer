@@ -466,9 +466,11 @@ class TestR2RPipeline(unittest.TestCase):
             self.assertTrue(len(PROVIDER_PRESETS[p]["endpoint"]) > 0)
             self.assertTrue(len(PROVIDER_PRESETS[p]["models"]) > 0)
 
-        # Verify Google Gemini endpoint is OpenAI compatible
+        # Verify Google Gemini endpoint is OpenAI compatible and has 3.8 / 3.6 flash models
         gemini_preset = PROVIDER_PRESETS["Google Gemini"]
         self.assertIn("openai", gemini_preset["endpoint"].lower())
+        self.assertIn("gemini-3.8-flash", gemini_preset["models"])
+        self.assertIn("gemini-3.6-flash", gemini_preset["models"])
 
         # Test config save and load with temporary file path
         ai = AISemanticInterpreter()
@@ -478,7 +480,7 @@ class TestR2RPipeline(unittest.TestCase):
         try:
             ai.get_config_path = lambda: tmp_path
             ai.provider = "Google Gemini"
-            ai.model = "gemini-2.0-flash"
+            ai.model = "gemini-3.8-flash"
             ai.api_key = "AIzaSyTestMockKey123"
             ai.api_endpoint = gemini_preset["endpoint"]
             saved = ai.save_config()
@@ -490,7 +492,7 @@ class TestR2RPipeline(unittest.TestCase):
             loaded = ai2.load_config()
             self.assertTrue(loaded)
             self.assertEqual(ai2.provider, "Google Gemini")
-            self.assertEqual(ai2.model, "gemini-2.0-flash")
+            self.assertEqual(ai2.model, "gemini-3.8-flash")
             self.assertEqual(ai2.api_key, "AIzaSyTestMockKey123")
             self.assertEqual(ai2.api_endpoint, gemini_preset["endpoint"])
         finally:

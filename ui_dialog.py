@@ -300,8 +300,8 @@ class AISettingsDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.dd_model = ef.DropDown()
 
         self.txt_custom_model = ef.TextBox()
-        self.txt_custom_model.PlaceholderText = "Or type custom model name (e.g. gpt-4o, gemini-2.0-flash)"
-        self.txt_custom_model.Text = getattr(self.ai_interpreter, "model", "gpt-4o-mini")
+        self.txt_custom_model.PlaceholderText = "Or type custom model name (e.g. gemini-3.8-flash, gemini-3.6-flash, gpt-4o)"
+        self.txt_custom_model.Text = getattr(self.ai_interpreter, "model", "gemini-3.8-flash")
 
         self._populate_model_options()
 
