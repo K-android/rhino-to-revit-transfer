@@ -84,14 +84,26 @@ Computes an evidence-based classification score ($0\%$ to $100\%$) using weighte
 ### Stage 3: REVIEW & CONFIGURE (`ui_dialog.py` & `profile_manager.py`)
 - Eto.Forms DataGridView with search, multi-criteria filters (Category, Confidence Tier, Sync State), and real-time **Pattern / Points** geometric signatures (`4-Pt Quad`, `3-Pt Tri`, `2-Pt Strut`, `Block: Name`, `Repetitive (Nx)`).
 - **Strategy Override Toolbar:** Allows instant bulk overriding of checked layers to `AdaptiveComponent`, `RepetitiveFamily`, `ParametricFamily`, `FloorNative`, `WallByCurve`, `RoofNative`, `FamilyInstance`, or `DirectShape`.
+  - **Dynamic Compatibility & 0% Confidence Drop:** Selecting a physically incompatible strategy (e.g. `AdaptiveComponent` for geometry without 2, 3, or 4 boundary points, or `FloorNative` for vertical geometry) automatically drops confidence to **0.0%** and unchecks the layer row from execution.
+- **Category Override Toolbar:** Bulk override Revit target categories (`Floors`, `Walls`, `Roofs`, `Ceilings`, `Columns`, `Toposolid`, `Curtain Panels`, `Doors`, `Windows`, `Furniture`, `Site`, `Generic Models`) with automatic BuiltInCategory mapping.
 - **Repetition Grouping Threshold:** Configurable cluster threshold (`>= 2`, `>= 3`, `>= 5`, `>= 10` identical geometries) to dynamically route repeated components to lightweight shared definitions.
+- **AI Semantic Classifier & Engine Configuration (`AI Config...`):**
+  - Dedicated configuration dialog to input your API key, select LLM providers, change model engines, and test connections.
+  - **Google Gemini:** Pre-configured with `gemini-3.8-flash` (default), `gemini-3.8`, `gemini-3.6-flash`, `gemini-3.6`, `gemini-2.0-flash`, `gemini-1.5-flash`, and `gemini-1.5-pro` using the OpenAI-compatible endpoint (`https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`).
+  - **OpenAI:** `gpt-4o-mini`, `gpt-4o`, `o3-mini`, `gpt-3.5-turbo`.
+  - **DeepSeek:** `deepseek-chat` and `deepseek-reasoner` via `https://api.deepseek.com/v1/chat/completions`.
+  - **OpenRouter:** Multi-model routing including `google/gemini-3.8-flash`, `anthropic/claude-3.5-sonnet`, `meta-llama/llama-3.3-70b-instruct`.
+  - **Local Ollama / LM Studio:** Fully offline, local inference (`http://localhost:11434/v1/chat/completions` with `llama3`, `mistral`, `qwen2.5`, `phi3`) with zero external network or keys.
+  - **Custom / Other:** Connect to any self-hosted or OpenAI-compatible endpoint.
+  - **Live Handshake Testing:** Single-click "Test Connection" button tests endpoints and key credentials in real time.
+  - **Zero Startup Overhead:** Config stored in `%APPDATA%\pyRevit\R2R\ai_config.json`, keeping pyRevit rocket mode assembly caches intact.
+  - **Graceful Offline Fallback:** If no API key is provided or the machine is offline, clicking **Run AI Semantic Assist** automatically uses the curated offline architectural lexicon.
 - Global Execution Mode Selector:
   - **Native BIM Mode:** Prioritizes native Revit elements (`Floor`, `Wall`, `Ceiling`, `Roof`).
   - **Hybrid Mode (Recommended):** Native elements for orthogonal walls/floors, Adaptive Components for facade panels, DirectShape for complex organic surfaces.
   - **Geometry-First Mode:** DirectShape with assigned Category & Material for maximum 3D fidelity.
 - Auto-BUA / GFA Area Boundary Line generator toggle.
 - `Load Profile` and `Save Profile` to synchronize rule changes to `Transfer_Profile.json`.
-- `Run AI Semantic Assist` (`ai_assistant.py`) to parse ambiguous architectural layer names.
 
 ### Stage 4: TRANSFER (`conversion_router.py`)
 Dispatches across specialized RIR creation pipelines under a single `DB.TransactionGroup`:
