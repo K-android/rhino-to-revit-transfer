@@ -569,6 +569,51 @@ class TestR2RPipeline(unittest.TestCase):
         symbols = router.pre_generate_families([obj], {})
         self.assertIsInstance(symbols, dict)
 
+    def test_origin_shift_calculation_and_centering(self):
+        """Tests that calculate_and_set_origin_shift centers far-from-origin models at Revit (0,0,0)."""
+        from conversion_router import ConversionRouter
+        from scanner import ScannedObject
+
+        router = ConversionRouter(None, global_mode="Hybrid", unit_scale=3.28084)  # Meters to Feet
+
+        # Simulate 2 objects at GIS coordinates (X: 500,000m to 500,100m, Y: 2,000,000m to 2,000,080m, Z: 1200m to 1250m)
+        obj1 = ScannedObject("obj-gis-1")
+        obj1.bbox_min = (500000.0, 2000000.0, 1200.0)
+        obj1.bbox_max = (500050.0, 2000040.0, 1250.0)
+        obj1.centroid = (500025.0, 2000020.0, 1225.0)
+        obj1.is_far_from_origin = True
+        obj1.origin_distance = 2061552.0
+
+        obj2 = ScannedObject("obj-gis-2")
+        obj2.bbox_min = (500050.0, 2000040.0, 1200.0)
+        obj2.bbox_max = (500100.0, 2000080.0, 1240.0)
+        obj2.centroid = (500075.0, 2000060.0, 1220.0)
+        obj2.is_far_from_origin = True
+        obj2.origin_distance = 2061575.0
+
+        # Run automatic origin shift calculation
+        dx, dy, dz = router.calculate_and_set_origin_shift([obj1, obj2], force_center=True)
+
+        self.assertTrue(router.has_origin_shift)
+        # Global bounding box mid-point is (500050, 2000040), so shift should negate this
+        self.assertAlmostEqual(dx, -500050.0, places=1)
+        self.assertAlmostEqual(dy, -2000040.0, places=1)
+        # Base Z is 1200m, so shift should negate this to place base at 0.0
+        self.assertAlmostEqual(dz, -1200.0, places=1)
+
+        # Transformed coordinates in Revit
+        new_mid_x = (500050.0 + dx)
+        new_mid_y = (2000040.0 + dy)
+        new_base_z = (1200.0 + dz)
+        self.assertAlmostEqual(new_mid_x, 0.0, places=2)
+        self.assertAlmostEqual(new_mid_y, 0.0, places=2)
+        self.assertAlmostEqual(new_base_z, 0.0, places=2)
+
+        # Check feet conversion
+        self.assertAlmostEqual(router.origin_shift_feet[0], dx * 3.28084, places=1)
+        self.assertAlmostEqual(router.origin_shift_feet[1], dy * 3.28084, places=1)
+        self.assertAlmostEqual(router.origin_shift_feet[2], dz * 3.28084, places=1)
+
 
 if __name__ == "__main__":
     unittest.main()

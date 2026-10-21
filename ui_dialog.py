@@ -895,6 +895,11 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.chk_gen_bua.Text = "Auto-Generate BUA / GFA Area Boundary Lines"
         self.chk_gen_bua.Checked = True
 
+        self.chk_move_to_origin = ef.CheckBox()
+        self.chk_move_to_origin.Text = "Move Model to Revit Origin (0,0,0)"
+        self.chk_move_to_origin.Checked = True
+        self.chk_move_to_origin.ToolTip = "Automatically centers model XY at Revit (0,0) and normalizes base elevation even if outside bounds in Rhino (>16km)"
+
         btn_select_all = ef.Button()
         btn_select_all.Text = "Select All"
         btn_select_all.Click += self._on_select_all_layers
@@ -926,6 +931,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         opts_layout.Add(self.dd_global_mode)
         opts_layout.Add(lbl_units)
         opts_layout.Add(self.dd_unit_scale)
+        opts_layout.Add(self.chk_move_to_origin)
         opts_layout.Add(self.chk_gen_bua)
         opts_layout.Add(btn_select_all)
         opts_layout.Add(btn_deselect_all)
@@ -1329,7 +1335,10 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             if pf.total_duplicates > 0:
                 warn_text.append("[WARNING] Found {} duplicate objects with identical geometry hashes.".format(pf.total_duplicates))
             if pf.total_far_from_origin > 0:
-                warn_text.append("[CAUTION] Found {} objects beyond Revit's 16km origin boundary limit.".format(pf.total_far_from_origin))
+                warn_text.append(
+                    "[CAUTION] Found {} object(s) beyond Revit's 16km origin limit. "
+                    "'Move Model to Revit Origin (0,0,0)' is active and will center the model at (0,0,0) in Revit.".format(pf.total_far_from_origin)
+                )
             if pf.total_non_closed_loops > 0:
                 warn_text.append("[NOTICE] Found {} objects with non-closed boundary loops.".format(pf.total_non_closed_loops))
             if getattr(pf, 'warnings', None):
@@ -1843,11 +1852,14 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         scale_label = str(self.dd_unit_scale.SelectedValue) if hasattr(self, "dd_unit_scale") else "Auto-Detect"
         self.txt_exec_log.Text = "Beginning R2R Transfer TransactionGroup (Unit Scale: {})...\n".format(scale_label)
 
+        move_to_origin = self.chk_move_to_origin.Checked if hasattr(self, "chk_move_to_origin") else True
+
         router = ConversionRouter(
             self.revit_doc,
             global_mode=str(self.dd_global_mode.SelectedValue),
             generate_bua=self.chk_gen_bua.Checked or False,
-            unit_scale=chosen_scale
+            unit_scale=chosen_scale,
+            move_to_origin=move_to_origin
         )
 
         # Collect objects to transfer
@@ -1855,6 +1867,15 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         for r in self.layer_rows:
             if r.checked:
                 approved_objs.extend(r.objects)
+
+        # Auto-align model to Revit (0,0,0)
+        shift = router.calculate_and_set_origin_shift(approved_objs, force_center=move_to_origin)
+        if router.has_origin_shift:
+            self.txt_exec_log.Text += "Origin Alignment Active: Model moved to Revit (0,0,0).\n"
+            self.txt_exec_log.Text += "  Rhino Shift: ΔX = {:.2f}, ΔY = {:.2f}, ΔZ = {:.2f}\n".format(shift[0], shift[1], shift[2])
+            self.txt_exec_log.Text += "  Revit Offset: ΔX = {:.2f}ft, ΔY = {:.2f}ft, ΔZ = {:.2f}ft\n\n".format(
+                router.origin_shift_feet[0], router.origin_shift_feet[1], router.origin_shift_feet[2]
+            )
 
         layer_to_row = {}
         for r in self.layer_rows:

@@ -103,6 +103,10 @@ Computes an evidence-based classification score ($0\%$ to $100\%$) using weighte
   - **Hybrid Mode (Recommended):** Native elements for orthogonal walls/floors, Adaptive Components for facade panels, DirectShape for complex organic surfaces.
   - **Geometry-First Mode:** DirectShape with assigned Category & Material for maximum 3D fidelity.
 - Auto-BUA / GFA Area Boundary Line generator toggle.
+- **Move Model to Revit Origin (0,0,0) & GIS Normalization:**
+  - Auto-centers the model footprint at Revit's Internal Origin `(X=0, Y=0)` and normalizes base elevation to `Z=0.0`.
+  - Automatically activates if geometry in Rhino exceeds Revit's 16 km (10-mile) origin boundary limit or uses real-world GIS/UTM coordinate systems.
+  - Preserves exact relative inter-element spacing, heights, and orientation while preventing Revit coordinate overflow, graphics jitter, and view clipping errors.
 - `Load Profile` and `Save Profile` to synchronize rule changes to `Transfer_Profile.json`.
 
 ### Stage 4: TRANSFER (`conversion_router.py`)

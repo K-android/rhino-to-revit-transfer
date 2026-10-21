@@ -129,12 +129,14 @@ class ConversionResult(object):
 class ConversionRouter(object):
     """10-pipeline dispatcher coordinating Rhino.Inside.Revit element generation."""
 
-    def __init__(self, revit_doc, global_mode="Hybrid", generate_bua=True, unit_scale=None):
+    def __init__(self, revit_doc, global_mode="Hybrid", generate_bua=True, unit_scale=None, origin_shift=None, move_to_origin=False):
         """
         :param revit_doc: Autodesk.Revit.DB.Document
         :param global_mode: "Native BIM" | "Hybrid" | "Geometry-First"
         :param generate_bua: Boolean toggle for Auto-BUA Area Plan generation
         :param unit_scale: Optional float override for Rhino-to-Revit foot scale
+        :param origin_shift: Optional tuple (dx, dy, dz) in Rhino units to translate geometry to Revit (0,0,0)
+        :param move_to_origin: If True, automatically centers geometry at Revit (0,0,0)
         """
         self.doc = revit_doc
         self.global_mode = global_mode
@@ -142,6 +144,15 @@ class ConversionRouter(object):
         self.failures_preprocessor = TransferFailuresPreprocessor() if REVIT_AVAILABLE else None
         self.natural_unit_scale = self._calc_rhino_to_revit_scale()
         self.unit_scale = float(unit_scale) if unit_scale is not None else self.natural_unit_scale
+        self.move_to_origin = move_to_origin
+
+        # Origin shift vector in Rhino coordinates and Revit internal feet
+        self.origin_shift_rhino = (0.0, 0.0, 0.0)
+        self.origin_shift_feet = (0.0, 0.0, 0.0)
+        self.has_origin_shift = False
+
+        if origin_shift:
+            self.set_origin_shift(origin_shift[0], origin_shift[1], origin_shift[2])
 
         # Cache Revit Level and Type IDs for performance
         self.level_cache = {}
@@ -150,6 +161,86 @@ class ConversionRouter(object):
         self.app = revit_doc.Application if revit_doc and hasattr(revit_doc, "Application") else None
         if REVIT_AVAILABLE and self.doc:
             self._cache_revit_data()
+
+    def set_origin_shift(self, dx_rhino, dy_rhino, dz_rhino):
+        """Sets translation vector (in Rhino units) applied to all transferred geometry to align with Revit (0,0,0)."""
+        self.origin_shift_rhino = (float(dx_rhino), float(dy_rhino), float(dz_rhino))
+        self.origin_shift_feet = (
+            float(dx_rhino) * self.unit_scale,
+            float(dy_rhino) * self.unit_scale,
+            float(dz_rhino) * self.unit_scale
+        )
+        self.has_origin_shift = (
+            abs(dx_rhino) > 0.001 or abs(dy_rhino) > 0.001 or abs(dz_rhino) > 0.001
+        )
+
+    def calculate_and_set_origin_shift(self, objects, force_center=False):
+        """Computes global bounding box across objects and calculates the shift vector to Revit (0,0,0).
+
+        If any object is far from origin (>16 km) or force_center is True:
+          - Shifts XY center of the model to (0.0, 0.0)
+          - If base Z is far from 0 (>30m) or outside bounds, shifts lowest point to Z = 0.0
+        Returns (dx, dy, dz) in Rhino units.
+        """
+        if not objects:
+            return (0.0, 0.0, 0.0)
+
+        min_x = float("inf")
+        min_y = float("inf")
+        min_z = float("inf")
+        max_x = float("-inf")
+        max_y = float("-inf")
+        max_z = float("-inf")
+
+        has_far_objects = False
+
+        for o in objects:
+            if getattr(o, "is_far_from_origin", False) or getattr(o, "origin_distance", 0) > 16000.0:
+                has_far_objects = True
+
+            b_min = getattr(o, "bbox_min", None)
+            b_max = getattr(o, "bbox_max", None)
+            if b_min and b_max:
+                if b_min[0] < min_x: min_x = b_min[0]
+                if b_min[1] < min_y: min_y = b_min[1]
+                if b_min[2] < min_z: min_z = b_min[2]
+                if b_max[0] > max_x: max_x = b_max[0]
+                if b_max[1] > max_y: max_y = b_max[1]
+                if b_max[2] > max_z: max_z = b_max[2]
+            elif getattr(o, "centroid", None):
+                c = o.centroid
+                if c[0] < min_x: min_x = c[0]
+                if c[1] < min_y: min_y = c[1]
+                if c[2] < min_z: min_z = c[2]
+                if c[0] > max_x: max_x = c[0]
+                if c[1] > max_y: max_y = c[1]
+                if c[2] > max_z: max_z = c[2]
+
+        if min_x == float("inf"):
+            return (0.0, 0.0, 0.0)
+
+        mid_x = 0.5 * (min_x + max_x)
+        mid_y = 0.5 * (min_y + max_y)
+
+        # Distance of center from Rhino origin
+        center_dist = math.sqrt(mid_x * mid_x + mid_y * mid_y)
+        # Check if shift should be applied: forced, far objects (>16km), or center substantially offset (>500m)
+        should_shift = force_center or has_far_objects or (center_dist > 500.0)
+
+        if should_shift:
+            dx = -mid_x
+            dy = -mid_y
+
+            # For Z: if base Z is far from ground plane (>30m) or outside 16km, shift base to 0.0
+            # Otherwise preserve relative Z so Level 1 at 0.0 is respected.
+            dz = 0.0
+            if abs(min_z) > 30.0 or has_far_objects:
+                dz = -min_z
+
+            self.set_origin_shift(dx, dy, dz)
+            return (dx, dy, dz)
+
+        return (0.0, 0.0, 0.0)
 
     def _calc_rhino_to_revit_scale(self):
         """Calculates scale factor from Rhino document units to Revit internal feet."""
@@ -333,6 +424,8 @@ class ConversionRouter(object):
 
             geom_feet = rh_geom.Duplicate()
             geom_feet.Scale(self.unit_scale)
+            if self.has_origin_shift and hasattr(geom_feet, "Translate"):
+                geom_feet.Translate(self.origin_shift_feet[0], self.origin_shift_feet[1], self.origin_shift_feet[2])
 
             # Match Level
             level_id = self._resolve_level_id(scanned_obj)
@@ -704,9 +797,16 @@ class ConversionRouter(object):
             res.warnings.append("AdaptiveComponent: Object has {} placement points (requires 2, 3, or 4). Falling back to DirectShape.".format(num_pts))
             return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res)
 
-        # Scale coordinates into Revit internal feet
+        # Scale coordinates into Revit internal feet and apply origin shift
         scale = self.unit_scale
-        pts_feet = [DB.XYZ(p[0] * scale, p[1] * scale, p[2] * scale) for p in pts_rhino]
+        pts_feet = [
+            DB.XYZ(
+                (p[0] + self.origin_shift_rhino[0]) * scale,
+                (p[1] + self.origin_shift_rhino[1]) * scale,
+                (p[2] + self.origin_shift_rhino[2]) * scale
+            )
+            for p in pts_rhino
+        ]
 
         requested_type = profile_rule.revit_type if (profile_rule and profile_rule.revit_type) else ""
         target_sym = self._find_adaptive_symbol_with_point_count(num_pts, requested_type)
@@ -740,13 +840,16 @@ class ConversionRouter(object):
     # PIPELINE 8B: Repetitive Family Instancing (Blocks & Repeated Signatures)
     # =========================================================================
     def _rhino_xform_to_revit_transform(self, xform):
-        """Converts a Rhino.Geometry.Transform into an Autodesk.Revit.DB.Transform."""
+        """Converts a Rhino.Geometry.Transform into an Autodesk.Revit.DB.Transform with origin shift."""
         if not REVIT_AVAILABLE or not xform:
             return None
         try:
             scale = self.unit_scale
             tf = DB.Transform.Identity
-            tf.Origin = DB.XYZ(xform.M03 * scale, xform.M13 * scale, xform.M23 * scale)
+            ox = (xform.M03 + self.origin_shift_rhino[0]) * scale
+            oy = (xform.M13 + self.origin_shift_rhino[1]) * scale
+            oz = (xform.M23 + self.origin_shift_rhino[2]) * scale
+            tf.Origin = DB.XYZ(ox, oy, oz)
             tf.BasisX = DB.XYZ(xform.M00, xform.M10, xform.M20)
             tf.BasisY = DB.XYZ(xform.M01, xform.M11, xform.M21)
             tf.BasisZ = DB.XYZ(xform.M02, xform.M12, xform.M22)
@@ -779,9 +882,9 @@ class ConversionRouter(object):
             try:
                 if not sym.IsActive:
                     sym.Activate()
-                cx = scanned_obj.centroid[0] * self.unit_scale
-                cy = scanned_obj.centroid[1] * self.unit_scale
-                cz = scanned_obj.centroid[2] * self.unit_scale
+                cx = (scanned_obj.centroid[0] + self.origin_shift_rhino[0]) * self.unit_scale
+                cy = (scanned_obj.centroid[1] + self.origin_shift_rhino[1]) * self.unit_scale
+                cz = (scanned_obj.centroid[2] + self.origin_shift_rhino[2]) * self.unit_scale
                 pt = DB.XYZ(cx, cy, cz)
                 level_elem = self.doc.GetElement(level_id) if level_id and level_id != DB.ElementId.InvalidElementId else None
                 inst = None
@@ -856,9 +959,9 @@ class ConversionRouter(object):
                             abs(scanned_obj.dz - canon_dims[2]) < 0.05
                         )
                         if is_pure_translation:
-                            cx = scanned_obj.centroid[0] * self.unit_scale
-                            cy = scanned_obj.centroid[1] * self.unit_scale
-                            cz = scanned_obj.centroid[2] * self.unit_scale
+                            cx = (scanned_obj.centroid[0] + self.origin_shift_rhino[0]) * self.unit_scale
+                            cy = (scanned_obj.centroid[1] + self.origin_shift_rhino[1]) * self.unit_scale
+                            cz = (scanned_obj.centroid[2] + self.origin_shift_rhino[2]) * self.unit_scale
                             tf = DB.Transform.CreateTranslation(DB.XYZ(cx, cy, cz))
                             inst = DB.DirectShape.CreateElementInstance(self.doc, type_id, cat_id, type_key, tf)
                             return inst
@@ -868,9 +971,9 @@ class ConversionRouter(object):
                             return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=cat_id)
 
                     # Default translation placement if no baseline check was needed
-                    cx = scanned_obj.centroid[0] * self.unit_scale
-                    cy = scanned_obj.centroid[1] * self.unit_scale
-                    cz = scanned_obj.centroid[2] * self.unit_scale
+                    cx = (scanned_obj.centroid[0] + self.origin_shift_rhino[0]) * self.unit_scale
+                    cy = (scanned_obj.centroid[1] + self.origin_shift_rhino[1]) * self.unit_scale
+                    cz = (scanned_obj.centroid[2] + self.origin_shift_rhino[2]) * self.unit_scale
                     tf = DB.Transform.CreateTranslation(DB.XYZ(cx, cy, cz))
                     if scanned_obj.rotation_angle:
                         rot = DB.Transform.CreateRotation(DB.XYZ.BasisZ, scanned_obj.rotation_angle)
@@ -923,9 +1026,9 @@ class ConversionRouter(object):
             try:
                 if not target_sym.IsActive:
                     target_sym.Activate()
-                cx = scanned_obj.centroid[0] * self.unit_scale
-                cy = scanned_obj.centroid[1] * self.unit_scale
-                cz = scanned_obj.centroid[2] * self.unit_scale
+                cx = (scanned_obj.centroid[0] + self.origin_shift_rhino[0]) * self.unit_scale
+                cy = (scanned_obj.centroid[1] + self.origin_shift_rhino[1]) * self.unit_scale
+                cz = (scanned_obj.centroid[2] + self.origin_shift_rhino[2]) * self.unit_scale
                 pt = DB.XYZ(cx, cy, cz)
 
                 level_elem = self.doc.GetElement(level_id) if level_id and level_id != DB.ElementId.InvalidElementId else None
@@ -1153,6 +1256,13 @@ class ConversionRouter(object):
             working_geom = rh_geom.Duplicate()
             if hasattr(working_geom, "Scale"):
                 working_geom.Scale(scale_ratio)
+
+        # Apply origin shift to native Rhino geometry if translating to Revit (0,0,0)
+        if self.has_origin_shift:
+            if working_geom is rh_geom:
+                working_geom = rh_geom.Duplicate()
+            if hasattr(working_geom, "Translate"):
+                working_geom.Translate(self.origin_shift_rhino[0], self.origin_shift_rhino[1], self.origin_shift_rhino[2])
 
         # Normalize Extrusions, Surfaces, SubDs to Brep if needed
         if not isinstance(working_geom, (rg.Brep, rg.Mesh)) and hasattr(working_geom, "ToBrep"):
