@@ -371,13 +371,31 @@ class RhinoScanner(object):
                 except Exception:
                     pass
             elif isinstance(geom, rg.InstanceReferenceGeometry):
-                idef = self.doc.InstanceDefinitions.FindId(geom.ParentIdefId)
+                idef = self.doc.InstanceDefinitions.FindId(geom.ParentIdefId) if hasattr(self.doc, "InstanceDefinitions") else None
                 scanned.block_name = idef.Name if idef else ""
                 try:
                     scanned.instance_transform = geom.Xform
                     scanned.rotation_angle = math.atan2(geom.Xform.M10, geom.Xform.M00)
                 except Exception:
                     pass
+
+            # Extract real 3D geometry from block definition for accurate conversion and volume
+            try:
+                target_idef = instance_def if isinstance(obj, rd.InstanceObject) else (self.doc.InstanceDefinitions.FindId(geom.ParentIdefId) if hasattr(self.doc, "InstanceDefinitions") else None)
+                if target_idef and hasattr(target_idef, "GetObjects"):
+                    sub_objs = target_idef.GetObjects()
+                    if sub_objs and len(sub_objs) > 0:
+                        for sub in sub_objs:
+                            sub_g = getattr(sub, "Geometry", None)
+                            if sub_g and isinstance(sub_g, (rg.Brep, rg.Mesh, rg.Extrusion, rg.Surface, rg.SubD)):
+                                dup = sub_g.Duplicate()
+                                if scanned.instance_transform and hasattr(dup, "Transform"):
+                                    dup.Transform(scanned.instance_transform)
+                                scanned.raw_geometry = dup
+                                geom = dup
+                                break
+            except Exception:
+                pass
         elif isinstance(geom, rg.Brep):
             scanned.object_type = "Brep"
         elif isinstance(geom, rg.Extrusion):

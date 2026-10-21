@@ -189,6 +189,8 @@ class LayerRowItem(object):
             self.revit_type = "OST_Windows"
         elif "furniture" in cat_lower:
             self.revit_type = "OST_Furniture"
+        elif "plant" in cat_lower:
+            self.revit_type = "OST_Planting"
         elif "site" in cat_lower:
             self.revit_type = "OST_Site"
         elif "stair" in cat_lower:
@@ -232,6 +234,132 @@ class ValidationRowItem(object):
         self.section = val_report.view_matrix.get("Section", "PASS")
         self.issues = "; ".join(val_report.issues) if val_report.issues else "None"
         self.raw_report = val_report
+
+
+class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
+    """Direct modal dialog to inspect and edit category, strategy, and transfer inclusion for a layer."""
+
+    def __init__(self, layer_row, parent=None):
+        if not ETO_AVAILABLE:
+            return
+
+        super(LayerConfigDialog, self).__init__()
+        self.layer_row = layer_row
+        self.Title = "Edit Layer Mapping: {}".format(layer_row.layer_name)
+        self.ClientSize = ed.Size(480, 320)
+        self.Resizable = False
+        self.Padding = ed.Padding(16)
+
+        layout = ef.DynamicLayout()
+        layout.Spacing = ed.Size(10, 8)
+
+        lbl_header = ef.Label()
+        lbl_header.Text = "Configure Layer: {}".format(layer_row.layer_name)
+        try:
+            lbl_header.Font = ed.Font(ed.SystemFont.Bold, 12)
+        except Exception:
+            pass
+        layout.Add(lbl_header)
+
+        lbl_info = ef.Label()
+        lbl_info.Text = "Objects: {} | Geometry: {}".format(
+            layer_row.object_count, getattr(layer_row, "pattern_tag", "Standard")
+        )
+        try:
+            lbl_info.TextColor = ed.Colors.DimGray
+        except Exception:
+            pass
+        layout.Add(lbl_info)
+
+        # Category Dropdown
+        lbl_cat = ef.Label()
+        lbl_cat.Text = "Revit Category:"
+        self.dd_cat = ef.DropDown()
+        categories = ["Floors", "Walls", "Roofs", "Ceilings", "Columns", "Toposolid", "Furniture", "Planting", "Doors", "Windows", "Curtain Panels", "Site", "Mass", "Generic Models"]
+        for c in categories:
+            self.dd_cat.Items.Add(c)
+
+        curr_cat = layer_row.inferred_category or ""
+        match_idx = next((i for i, c in enumerate(categories) if c.lower() in curr_cat.lower()), 0)
+        self.dd_cat.SelectedIndex = match_idx
+
+        row_cat = ef.DynamicLayout()
+        row_cat.Spacing = ed.Size(8, 5)
+        row_cat.BeginHorizontal()
+        row_cat.Add(lbl_cat)
+        row_cat.Add(self.dd_cat, True)
+        row_cat.EndHorizontal()
+        layout.Add(row_cat)
+
+        # Strategy Dropdown
+        lbl_strat = ef.Label()
+        lbl_strat.Text = "Conversion Strategy:"
+        self.dd_strat = ef.DropDown()
+        strategies = ["DirectShape", "FamilyInstance", "RepetitiveFamily", "ParametricFamily", "AdaptiveComponent", "FloorNative", "WallByCurve", "RoofNative", "Toposolid"]
+        for s in strategies:
+            self.dd_strat.Items.Add(s)
+
+        curr_strat = layer_row.proposed_strategy or ""
+        match_strat_idx = next((i for i, s in enumerate(strategies) if s.lower() == curr_strat.lower()), 0)
+        self.dd_strat.SelectedIndex = match_strat_idx
+
+        row_strat = ef.DynamicLayout()
+        row_strat.Spacing = ed.Size(8, 5)
+        row_strat.BeginHorizontal()
+        row_strat.Add(lbl_strat)
+        row_strat.Add(self.dd_strat, True)
+        row_strat.EndHorizontal()
+        layout.Add(row_strat)
+
+        # Checkbox
+        self.chk_include = ef.CheckBox()
+        self.chk_include.Text = "Include this layer in Revit transfer"
+        self.chk_include.Checked = bool(layer_row.checked)
+        layout.Add(self.chk_include)
+
+        # Buttons
+        btn_apply = ef.Button()
+        btn_apply.Text = "Apply Changes"
+        btn_apply.Click += self._on_apply
+
+        btn_cancel = ef.Button()
+        btn_cancel.Text = "Cancel"
+        btn_cancel.Click += self._on_cancel
+
+        btn_layout = ef.DynamicLayout()
+        btn_layout.Spacing = ed.Size(10, 5)
+        btn_layout.BeginHorizontal()
+        btn_layout.Add(None, True)
+        btn_layout.Add(btn_apply)
+        btn_layout.Add(btn_cancel)
+        btn_layout.EndHorizontal()
+
+        layout.Add(None, True)
+        layout.Add(btn_layout)
+
+        self.Content = layout
+
+    def _on_apply(self, sender, e):
+        sel_cat = str(self.dd_cat.SelectedValue or "Generic Models")
+        sel_strat = str(self.dd_strat.SelectedValue or "DirectShape")
+
+        self.layer_row.checked = bool(self.chk_include.Checked)
+        self.layer_row.update_category(sel_cat)
+        self.layer_row.update_strategy(sel_strat)
+
+        for obj in self.layer_row.objects:
+            c = getattr(obj, "classification", None)
+            if c:
+                c.inferred_category = self.layer_row.inferred_category
+                c.revit_category_name = self.layer_row.revit_type
+                c.proposed_strategy = self.layer_row.proposed_strategy
+                c.confidence_score = self.layer_row.confidence_score
+                c.confidence_tier = self.layer_row.confidence_tier
+
+        self.Close(True)
+
+    def _on_cancel(self, sender, e):
+        self.Close(False)
 
 
 class AISettingsDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
@@ -947,6 +1075,49 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         col_pattern.Width = 140
         self.grid_review.Columns.Add(col_pattern)
 
+        # Wire Double-Click to open LayerConfigDialog
+        try:
+            self.grid_review.CellDoubleClick += self._on_grid_cell_double_click
+        except Exception:
+            pass
+
+        # Wire Right-Click Context Menu for quick layer category/strategy editing
+        try:
+            ctx_menu = ef.ContextMenu()
+
+            item_edit = ef.ButtonMenuItem()
+            item_edit.Text = "Edit Layer Category & Strategy (Double-Click)..."
+            item_edit.Click += self._on_ctx_edit_layer
+            ctx_menu.Items.Add(item_edit)
+
+            ctx_menu.Items.Add(ef.SeparatorMenuItem())
+
+            cat_menu = ef.ButtonMenuItem()
+            cat_menu.Text = "Quick Set Category"
+            for q_cat in ["Floors", "Walls", "Roofs", "Ceilings", "Columns", "Toposolid", "Furniture", "Planting", "Doors", "Windows", "Curtain Panels", "Generic Models"]:
+                q_item = ef.ButtonMenuItem()
+                q_item.Text = q_cat
+                def _make_cat_cb(c_name):
+                    return lambda s, e: self._quick_set_category(c_name)
+                q_item.Click += _make_cat_cb(q_cat)
+                cat_menu.Items.Add(q_item)
+            ctx_menu.Items.Add(cat_menu)
+
+            strat_menu = ef.ButtonMenuItem()
+            strat_menu.Text = "Quick Set Strategy"
+            for q_strat in ["DirectShape", "FamilyInstance", "RepetitiveFamily", "ParametricFamily", "AdaptiveComponent", "FloorNative", "WallByCurve"]:
+                q_item = ef.ButtonMenuItem()
+                q_item.Text = q_strat
+                def _make_strat_cb(s_name):
+                    return lambda s, e: self._quick_set_strategy(s_name)
+                q_item.Click += _make_strat_cb(q_strat)
+                strat_menu.Items.Add(q_item)
+            ctx_menu.Items.Add(strat_menu)
+
+            self.grid_review.ContextMenu = ctx_menu
+        except Exception:
+            pass
+
         layout.Add(self.grid_review, True, True)
         return layout
 
@@ -1378,57 +1549,161 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.lbl_prev_review.Text = "Elements in REVIEW QUEUE (<60% Confidence): {}".format(cnt_review)
         self.lbl_prev_missing.Text = "Revit Elements MISSING in Rhino (Preserved): {}".format(len(self.missing_in_rhino))
 
-    def _on_apply_strategy_override(self, sender, e):
-        """Overrides proposed strategy for all currently checked layers."""
+    def _get_target_review_rows(self):
+        """Returns the list of LayerRowItem objects to target for overrides.
+        Prioritizes user-highlighted rows in GridView; falls back to checked rows.
+        """
         self._sync_grid_check_states()
+        target_rows = []
+        is_highlighted_selection = False
+
+        try:
+            sel_rows = []
+            if hasattr(self.grid_review, "SelectedRows") and self.grid_review.SelectedRows:
+                sel_rows = [int(i) for i in self.grid_review.SelectedRows]
+            elif hasattr(self.grid_review, "SelectedRow") and self.grid_review.SelectedRow >= 0:
+                sel_rows = [int(self.grid_review.SelectedRow)]
+
+            for idx in sel_rows:
+                if 0 <= idx < len(self.filtered_layer_rows):
+                    target_rows.append(self.filtered_layer_rows[idx])
+
+            if target_rows:
+                is_highlighted_selection = True
+        except Exception:
+            pass
+
+        if not target_rows:
+            target_rows = [r for r in self.filtered_layer_rows if r.checked]
+            if not target_rows:
+                target_rows = [r for r in self.layer_rows if r.checked]
+
+        return target_rows, is_highlighted_selection
+
+    def _on_apply_strategy_override(self, sender, e):
+        """Overrides proposed strategy for highlighted row(s) or all checked layers."""
         selected_strat = str(self.dd_strat_override.SelectedValue or "").strip()
         if not selected_strat:
             return
 
-        updated_count = 0
-        for r in self.layer_rows:
-            if r.checked:
-                r.update_strategy(selected_strat)
-                for obj in r.objects:
-                    c = self.classifications.get(obj.rhino_guid)
-                    if c:
-                        c.proposed_strategy = r.proposed_strategy
-                        c.confidence_score = r.confidence_score
-                        c.confidence_tier = r.confidence_tier
-                updated_count += 1
+        targets, is_highlighted = self._get_target_review_rows()
+        if not targets:
+            self.lbl_global_status.Text = "Please select or check at least one layer to apply strategy override."
+            return
+
+        for r in targets:
+            r.update_strategy(selected_strat)
+            for obj in r.objects:
+                c = self.classifications.get(obj.rhino_guid)
+                if c:
+                    c.proposed_strategy = r.proposed_strategy
+                    c.confidence_score = r.confidence_score
+                    c.confidence_tier = r.confidence_tier
 
         self._refresh_review_grid_datastore()
         self._update_preview_kpis()
-        self.lbl_global_status.Text = "Applied strategy override '{}' to {} checked layer(s). Confidence updated dynamically.".format(
-            selected_strat, updated_count
+        target_desc = "highlighted layer(s)" if is_highlighted else "checked layer(s)"
+        self.lbl_global_status.Text = "Applied strategy override '{}' to {} {}. Confidence updated dynamically.".format(
+            selected_strat, len(targets), target_desc
         )
 
     def _on_apply_category_override(self, sender, e):
-        """Overrides Revit category for all currently checked layers."""
-        self._sync_grid_check_states()
+        """Overrides Revit category for highlighted row(s) or all checked layers."""
         selected_cat = str(self.dd_cat_override.SelectedValue or "").strip()
         if not selected_cat:
             return
 
-        updated_count = 0
-        for r in self.layer_rows:
-            if r.checked:
-                r.update_category(selected_cat)
-                for obj in r.objects:
-                    c = self.classifications.get(obj.rhino_guid)
-                    if c:
-                        c.inferred_category = r.inferred_category
-                        c.revit_category_name = r.revit_type
-                        c.proposed_strategy = r.proposed_strategy
-                        c.confidence_score = r.confidence_score
-                        c.confidence_tier = r.confidence_tier
-                updated_count += 1
+        targets, is_highlighted = self._get_target_review_rows()
+        if not targets:
+            self.lbl_global_status.Text = "Please select or check at least one layer to apply category override."
+            return
+
+        for r in targets:
+            r.update_category(selected_cat)
+            for obj in r.objects:
+                c = self.classifications.get(obj.rhino_guid)
+                if c:
+                    c.inferred_category = r.inferred_category
+                    c.revit_category_name = r.revit_type
+                    c.proposed_strategy = r.proposed_strategy
+                    c.confidence_score = r.confidence_score
+                    c.confidence_tier = r.confidence_tier
 
         self._refresh_review_grid_datastore()
         self._update_preview_kpis()
-        self.lbl_global_status.Text = "Applied category override '{}' to {} checked layer(s). Updated target Revit types and confidence.".format(
-            selected_cat, updated_count
+        target_desc = "highlighted layer(s)" if is_highlighted else "checked layer(s)"
+        self.lbl_global_status.Text = "Applied category override '{}' to {} {}. Target Revit type: {}.".format(
+            selected_cat, len(targets), target_desc, targets[0].revit_type if targets else ""
         )
+
+    def _on_grid_cell_double_click(self, sender, e):
+        """Opens LayerConfigDialog modal when user double-clicks any row in the review grid."""
+        try:
+            sel_idx = -1
+            if hasattr(e, "Row") and e.Row >= 0:
+                sel_idx = int(e.Row)
+            elif hasattr(self.grid_review, "SelectedRow") and self.grid_review.SelectedRow >= 0:
+                sel_idx = int(self.grid_review.SelectedRow)
+
+            if 0 <= sel_idx < len(self.filtered_layer_rows):
+                row = self.filtered_layer_rows[sel_idx]
+                dlg = LayerConfigDialog(row, parent=self)
+                if dlg.ShowModal(self):
+                    self._refresh_review_grid_datastore()
+                    self._update_preview_kpis()
+                    self.lbl_global_status.Text = "Updated layer '{}' -> Category: {}, Strategy: {} (Confidence: {:.0f}%).".format(
+                        row.layer_name, row.inferred_category, row.proposed_strategy, row.confidence_score
+                    )
+        except Exception as ex:
+            self.lbl_global_status.Text = "Layer config dialog notice: {}".format(ex)
+
+    def _on_ctx_edit_layer(self, sender, e):
+        """Context menu handler to edit selected layer."""
+        self._on_grid_cell_double_click(sender, e)
+
+    def _quick_set_category(self, cat_name):
+        """Quick sets category for selected or checked rows via context menu."""
+        targets, is_highlighted = self._get_target_review_rows()
+        if not targets:
+            self.lbl_global_status.Text = "No layers selected to set category."
+            return
+
+        for r in targets:
+            r.update_category(cat_name)
+            for obj in r.objects:
+                c = self.classifications.get(obj.rhino_guid)
+                if c:
+                    c.inferred_category = r.inferred_category
+                    c.revit_category_name = r.revit_type
+                    c.proposed_strategy = r.proposed_strategy
+                    c.confidence_score = r.confidence_score
+                    c.confidence_tier = r.confidence_tier
+
+        self._refresh_review_grid_datastore()
+        self._update_preview_kpis()
+        desc = "highlighted" if is_highlighted else "checked"
+        self.lbl_global_status.Text = "Set category '{}' on {} {} layer(s).".format(cat_name, len(targets), desc)
+
+    def _quick_set_strategy(self, strat_name):
+        """Quick sets strategy for selected or checked rows via context menu."""
+        targets, is_highlighted = self._get_target_review_rows()
+        if not targets:
+            self.lbl_global_status.Text = "No layers selected to set strategy."
+            return
+
+        for r in targets:
+            r.update_strategy(strat_name)
+            for obj in r.objects:
+                c = self.classifications.get(obj.rhino_guid)
+                if c:
+                    c.proposed_strategy = r.proposed_strategy
+                    c.confidence_score = r.confidence_score
+                    c.confidence_tier = r.confidence_tier
+
+        self._refresh_review_grid_datastore()
+        self._update_preview_kpis()
+        desc = "highlighted" if is_highlighted else "checked"
+        self.lbl_global_status.Text = "Set strategy '{}' on {} {} layer(s).".format(strat_name, len(targets), desc)
 
     def _on_repetition_threshold_changed(self, sender, e):
         """Updates classifier repetition threshold and re-evaluates review grid."""

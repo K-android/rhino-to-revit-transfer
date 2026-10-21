@@ -513,6 +513,62 @@ class TestR2RPipeline(unittest.TestCase):
         ok_local, msg_local = ai.test_connection(api_key="", api_endpoint="http://localhost:11434/v1/chat/completions", provider="Local Ollama")
         self.assertNotIn("API Key is required", msg_local)
 
+    def test_layer_config_dialog_and_selection_targeting(self):
+        """Tests that LayerConfigDialog and LayerRowItem category/strategy updates operate cleanly."""
+        from ui_dialog import LayerRowItem, LayerConfigDialog
+        from classifier import ClassificationResult
+
+        class MockObj(object):
+            def __init__(self):
+                self.is_horizontal = False
+                self.is_vertical = False
+                self.adaptive_point_count = 0
+                self.repetition_count = 1
+                self.parametric_dims = {"Width": 2.0, "Depth": 1.0, "Height": 0.8}
+                self.classification = None
+
+        mock_obj = MockObj()
+        c_res = ClassificationResult("test-guid-123")
+        c_res.inferred_category = "Furniture"
+        c_res.proposed_strategy = "FamilyInstance"
+        c_res.confidence_score = 90.0
+        c_res.confidence_tier = "AUTO_READY"
+        c_res.revit_category_name = "OST_Furniture"
+
+        row = LayerRowItem("A-FURN-PLANTERS", [mock_obj], c_res, None, checked=True)
+        self.assertEqual(row.inferred_category, "Furniture")
+
+        # Update category to Planting
+        row.update_category("Planting")
+        self.assertEqual(row.inferred_category, "Planting")
+        self.assertEqual(row.revit_type, "OST_Planting")
+
+        # Update strategy to DirectShape
+        row.update_strategy("DirectShape")
+        self.assertEqual(row.proposed_strategy, "DirectShape")
+        self.assertEqual(row.confidence_score, 100.0)
+
+        # Update strategy to ParametricFamily
+        row.update_strategy("ParametricFamily")
+        self.assertEqual(row.proposed_strategy, "ParametricFamily")
+        self.assertEqual(row.confidence_score, 95.0)
+
+    def test_family_instance_strategy_pre_generation(self):
+        """Tests that ConversionRouter pre_generate_families handles FamilyInstance and ParametricFamily without throwing."""
+        from conversion_router import ConversionRouter
+        from scanner import ScannedObject
+
+        router = ConversionRouter(None, global_mode="Hybrid")
+        obj = ScannedObject("test-family-guid")
+        obj.layer_name = "A-FURN-CHAIR"
+        obj.dx = 1.0
+        obj.dy = 1.0
+        obj.dz = 0.9
+
+        # pre_generate_families should safely return empty dict when revit app is None
+        symbols = router.pre_generate_families([obj], {})
+        self.assertIsInstance(symbols, dict)
+
 
 if __name__ == "__main__":
     unittest.main()

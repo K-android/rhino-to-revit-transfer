@@ -210,12 +210,12 @@ class ConversionRouter(object):
             strat = rule.strategy if rule else (c_res.proposed_strategy if c_res else "DirectShape")
             inferred_cat = rule.revit_category if rule else (c_res.inferred_category if c_res else "GenericModel")
 
-            if strat == "ParametricFamily":
-                fam_key = "R2R_Parametric_{}".format(re.sub(r'[^a-zA-Z0-9_]', '_', obj.layer_name))
-                if fam_key not in self.family_symbol_cache:
-                    w = max(0.2, (obj.dx or 1.0) * self.unit_scale)
-                    d = max(0.2, (obj.dy or 1.0) * self.unit_scale)
-                    h = max(0.2, (obj.dz or 1.0) * self.unit_scale)
+            if strat in ("ParametricFamily", "FamilyInstance"):
+                clean_layer = re.sub(r'[^a-zA-Z0-9_]', '_', obj.layer_name)
+                fam_key_param = "R2R_Parametric_{}".format(clean_layer)
+                fam_key_gen = "R2R_Family_{}".format(clean_layer)
+
+                if fam_key_param not in self.family_symbol_cache and fam_key_gen not in self.family_symbol_cache:
                     target_bic_id = self._category_str_to_id(inferred_cat)
                     target_bic = None
                     try:
@@ -223,18 +223,53 @@ class ConversionRouter(object):
                     except Exception:
                         pass
 
-                    sym = FamilyFactory.create_parametric_box_or_profile_family(
-                        self.app,
-                        self.doc,
-                        family_name=fam_key,
-                        width=w,
-                        depth=d,
-                        height=h,
-                        category_hint=inferred_cat,
-                        target_bic=target_bic
-                    )
+                    sym = None
+                    # Try native FreeFormElement family first if real Brep/Mesh exists
+                    if obj.raw_geometry and hasattr(FamilyFactory, "create_native_freeform_family"):
+                        try:
+                            cx_raw = obj.centroid[0]
+                            cy_raw = obj.centroid[1]
+                            cz_raw = obj.centroid[2]
+                            canonical_raw = obj.raw_geometry.Duplicate()
+                            if hasattr(canonical_raw, "Translate"):
+                                canonical_raw.Translate(-cx_raw, -cy_raw, -cz_raw)
+                            if hasattr(canonical_raw, "Scale"):
+                                canonical_raw.Scale(self.unit_scale)
+
+                            sym = FamilyFactory.create_native_freeform_family(
+                                self.app,
+                                self.doc,
+                                family_name=fam_key_gen,
+                                rh_brep_or_solid=canonical_raw,
+                                subcategory_name=obj.layer_name,
+                                category_hint=inferred_cat,
+                                target_bic=target_bic
+                            )
+                        except Exception as ex_ff:
+                            pass
+
+                    # Fallback to dimension-driven parametric family if freeform was not created
+                    if not sym and hasattr(FamilyFactory, "create_parametric_box_or_profile_family"):
+                        try:
+                            w = max(0.2, (obj.dx or 1.0) * self.unit_scale)
+                            d = max(0.2, (obj.dy or 1.0) * self.unit_scale)
+                            h = max(0.2, (obj.dz or 1.0) * self.unit_scale)
+                            sym = FamilyFactory.create_parametric_box_or_profile_family(
+                                self.app,
+                                self.doc,
+                                family_name=fam_key_param,
+                                width=w,
+                                depth=d,
+                                height=h,
+                                category_hint=inferred_cat,
+                                target_bic=target_bic
+                            )
+                        except Exception:
+                            pass
+
                     if sym:
-                        self.family_symbol_cache[fam_key] = sym
+                        self.family_symbol_cache[fam_key_param] = sym
+                        self.family_symbol_cache[fam_key_gen] = sym
 
             elif strat == "RepetitiveFamily":
                 is_block = (obj.object_type == "InstanceReference")
@@ -748,8 +783,18 @@ class ConversionRouter(object):
                 cy = scanned_obj.centroid[1] * self.unit_scale
                 cz = scanned_obj.centroid[2] * self.unit_scale
                 pt = DB.XYZ(cx, cy, cz)
-                level_elem = self.doc.GetElement(level_id)
-                inst = self.doc.Create.NewFamilyInstance(pt, sym, level_elem, DB.Structure.StructuralType.NonStructural)
+                level_elem = self.doc.GetElement(level_id) if level_id and level_id != DB.ElementId.InvalidElementId else None
+                inst = None
+                if level_elem:
+                    try:
+                        inst = self.doc.Create.NewFamilyInstance(pt, sym, level_elem, DB.Structure.StructuralType.NonStructural)
+                    except Exception:
+                        inst = None
+                if not inst:
+                    try:
+                        inst = self.doc.Create.NewFamilyInstance(pt, sym, DB.Structure.StructuralType.NonStructural)
+                    except Exception:
+                        pass
 
                 if scanned_obj.rotation_angle and inst:
                     axis = DB.Line.CreateBound(pt, DB.XYZ(pt.X, pt.Y, pt.Z + 1.0))
@@ -851,9 +896,14 @@ class ConversionRouter(object):
         target_sym = None
 
         # 1. Check Phase 1 Pre-Generated Native .rfa FamilySymbol cache
-        fam_key = "R2R_Parametric_{}".format(re.sub(r'[^a-zA-Z0-9_]', '_', scanned_obj.layer_name))
-        if fam_key in self.family_symbol_cache:
-            target_sym = self.family_symbol_cache[fam_key]
+        clean_layer = re.sub(r'[^a-zA-Z0-9_]', '_', scanned_obj.layer_name)
+        fam_key_param = "R2R_Parametric_{}".format(clean_layer)
+        fam_key_gen = "R2R_Family_{}".format(clean_layer)
+
+        if fam_key_gen in self.family_symbol_cache:
+            target_sym = self.family_symbol_cache[fam_key_gen]
+        elif fam_key_param in self.family_symbol_cache:
+            target_sym = self.family_symbol_cache[fam_key_param]
 
         # 2. Check project symbols if not found in pre-generated cache
         if not target_sym:
@@ -877,12 +927,28 @@ class ConversionRouter(object):
                 cy = scanned_obj.centroid[1] * self.unit_scale
                 cz = scanned_obj.centroid[2] * self.unit_scale
                 pt = DB.XYZ(cx, cy, cz)
-                level_elem = self.doc.GetElement(level_id)
-                inst = self.doc.Create.NewFamilyInstance(pt, target_sym, level_elem, DB.Structure.StructuralType.NonStructural)
+
+                level_elem = self.doc.GetElement(level_id) if level_id and level_id != DB.ElementId.InvalidElementId else None
+                inst = None
+
+                # Try level-hosted placement first
+                if level_elem:
+                    try:
+                        inst = self.doc.Create.NewFamilyInstance(pt, target_sym, level_elem, DB.Structure.StructuralType.NonStructural)
+                    except Exception:
+                        inst = None
+
+                # Fallback to direct XYZ unhosted placement
+                if not inst:
+                    try:
+                        inst = self.doc.Create.NewFamilyInstance(pt, target_sym, DB.Structure.StructuralType.NonStructural)
+                    except Exception as ex_unhosted:
+                        res.warnings.append("Unhosted placement notice: {}".format(ex_unhosted))
 
                 # Rotate if needed
                 if scanned_obj.rotation_angle and inst:
                     axis = DB.Line.CreateBound(pt, DB.XYZ(pt.X, pt.Y, pt.Z + 1.0))
+                    DB.ElementTransformUtils.RotateElement(self.doc, inst.Id, axis, scanned_obj.rotation_angle)
                     DB.ElementTransformUtils.RotateElement(self.doc, inst.Id, axis, scanned_obj.rotation_angle)
 
                 # Drive instance/type dimensional parameters with multilingual aliases
@@ -1249,6 +1315,10 @@ class ConversionRouter(object):
             "Window": DB.BuiltInCategory.OST_Windows,
             "OST_Furniture": DB.BuiltInCategory.OST_Furniture,
             "Furniture": DB.BuiltInCategory.OST_Furniture,
+            "OST_Planting": DB.BuiltInCategory.OST_Planting,
+            "Planting": DB.BuiltInCategory.OST_Planting,
+            "Planters": DB.BuiltInCategory.OST_Planting,
+            "Planter": DB.BuiltInCategory.OST_Planting,
             "OST_GenericModel": DB.BuiltInCategory.OST_GenericModel,
             "Generic Model": DB.BuiltInCategory.OST_GenericModel,
             "Generic Models": DB.BuiltInCategory.OST_GenericModel,
