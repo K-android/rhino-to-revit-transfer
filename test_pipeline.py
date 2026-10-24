@@ -614,6 +614,185 @@ class TestR2RPipeline(unittest.TestCase):
         self.assertAlmostEqual(router.origin_shift_feet[1], dy * 3.28084, places=1)
         self.assertAlmostEqual(router.origin_shift_feet[2], dz * 3.28084, places=1)
 
+    def test_full_category_coverage_layer_row(self):
+        """Tests that LayerRowItem.update_category correctly maps all architectural, structural, MEP, and site categories."""
+        from ui_dialog import LayerRowItem, STANDARD_REVIT_CATEGORIES
+
+        class MockObj(object):
+            def __init__(self):
+                self.classification = None
+
+        row = LayerRowItem("TEST_LAYER", [MockObj()], None, None)
+
+        test_mappings = [
+            ("Floors", "OST_Floors"),
+            ("Walls", "OST_Walls"),
+            ("Roofs", "OST_Roofs"),
+            ("Ceilings", "OST_Ceilings"),
+            ("Columns", "OST_Columns"),
+            ("Structural Columns", "OST_StructuralColumns"),
+            ("Doors", "OST_Doors"),
+            ("Windows", "OST_Windows"),
+            ("Curtain Panels", "OST_CurtainWallPanels"),
+            ("Curtain Wall Mullions", "OST_CurtainWallMullions"),
+            ("Stairs", "OST_Stairs"),
+            ("Railings", "OST_StairsRailing"),
+            ("Ramps", "OST_Ramps"),
+            ("Furniture", "OST_Furniture"),
+            ("Furniture Systems", "OST_FurnitureSystems"),
+            ("Casework", "OST_Casework"),
+            ("Specialty Equipment", "OST_SpecialityEquipment"),
+            ("Plumbing Fixtures", "OST_PlumbingFixtures"),
+            ("Mechanical Equipment", "OST_MechanicalEquipment"),
+            ("Electrical Equipment", "OST_ElectricalEquipment"),
+            ("Electrical Fixtures", "OST_ElectricalFixtures"),
+            ("Lighting Fixtures", "OST_LightingFixtures"),
+            ("Structural Framing", "OST_StructuralFraming"),
+            ("Structural Foundation", "OST_StructuralFoundation"),
+            ("Toposolid", "OST_Toposolid"),
+            ("Site", "OST_Site"),
+            ("Planting", "OST_Planting"),
+            ("Parking", "OST_Parking"),
+            ("Roads", "OST_Roads"),
+            ("Hardscape", "OST_Hardscape"),
+            ("Mass", "OST_Mass"),
+            ("Entourage", "OST_Entourage"),
+            ("Signage", "OST_Signage"),
+            ("Generic Models", "OST_GenericModel"),
+            ("OST_CommunicationDevices", "OST_CommunicationDevices"),
+            ("OST_SecurityDevices", "OST_SecurityDevices"),
+        ]
+
+        for input_cat, expected_ost in test_mappings:
+            row.update_category(input_cat)
+            self.assertEqual(row.revit_type, expected_ost, "Failed mapping for '{}'".format(input_cat))
+
+        # Verify STANDARD_REVIT_CATEGORIES includes all required AEC categories
+        self.assertIn("Casework", STANDARD_REVIT_CATEGORIES)
+        self.assertIn("Plumbing Fixtures", STANDARD_REVIT_CATEGORIES)
+        self.assertIn("Mechanical Equipment", STANDARD_REVIT_CATEGORIES)
+        self.assertIn("Lighting Fixtures", STANDARD_REVIT_CATEGORIES)
+        self.assertIn("Structural Foundation", STANDARD_REVIT_CATEGORIES)
+        self.assertIn("Railings", STANDARD_REVIT_CATEGORIES)
+        self.assertIn("Ramps", STANDARD_REVIT_CATEGORIES)
+
+    def test_conversion_router_category_str_to_id_mocked(self):
+        """Tests that ConversionRouter._category_str_to_id resolves all friendly and BuiltInCategory names."""
+        import conversion_router
+
+        class MockBuiltInCategory(object):
+            OST_Floors = 1
+            OST_Walls = 2
+            OST_Roofs = 3
+            OST_Ceilings = 4
+            OST_Columns = 5
+            OST_StructuralColumns = 6
+            OST_Doors = 7
+            OST_Windows = 8
+            OST_CurtainWallPanels = 9
+            OST_CurtainWallMullions = 10
+            OST_Stairs = 11
+            OST_StairsRailing = 12
+            OST_Ramps = 13
+            OST_Furniture = 14
+            OST_FurnitureSystems = 15
+            OST_Casework = 16
+            OST_SpecialityEquipment = 17
+            OST_PlumbingFixtures = 18
+            OST_MechanicalEquipment = 19
+            OST_ElectricalEquipment = 20
+            OST_ElectricalFixtures = 21
+            OST_LightingFixtures = 22
+            OST_StructuralFraming = 23
+            OST_StructuralFoundation = 24
+            OST_Toposolid = 25
+            OST_Topography = 26
+            OST_Site = 27
+            OST_Planting = 28
+            OST_Parking = 29
+            OST_Roads = 30
+            OST_Hardscape = 31
+            OST_Mass = 32
+            OST_Entourage = 33
+            OST_Signage = 34
+            OST_GenericModel = 99
+            OST_SecurityDevices = 101
+
+        class MockDB(object):
+            BuiltInCategory = MockBuiltInCategory
+            class ElementId(object):
+                def __init__(self, val):
+                    self.val = val
+                def __repr__(self):
+                    return "ElementId({})".format(self.val)
+
+        orig_revit_avail = conversion_router.REVIT_AVAILABLE
+        orig_db = getattr(conversion_router, "DB", None)
+        try:
+            conversion_router.REVIT_AVAILABLE = True
+            conversion_router.DB = MockDB
+
+            router = conversion_router.ConversionRouter(None)
+
+            # Test friendly names
+            self.assertEqual(router._category_str_to_id("Casework").val, MockBuiltInCategory.OST_Casework)
+            self.assertEqual(router._category_str_to_id("Plumbing Fixtures").val, MockBuiltInCategory.OST_PlumbingFixtures)
+            self.assertEqual(router._category_str_to_id("Mechanical Equipment").val, MockBuiltInCategory.OST_MechanicalEquipment)
+            self.assertEqual(router._category_str_to_id("Lighting Fixtures").val, MockBuiltInCategory.OST_LightingFixtures)
+            self.assertEqual(router._category_str_to_id("Specialty Equipment").val, MockBuiltInCategory.OST_SpecialityEquipment)
+            self.assertEqual(router._category_str_to_id("Railings").val, MockBuiltInCategory.OST_StairsRailing)
+            self.assertEqual(router._category_str_to_id("Ramps").val, MockBuiltInCategory.OST_Ramps)
+            self.assertEqual(router._category_str_to_id("Structural Foundation").val, MockBuiltInCategory.OST_StructuralFoundation)
+            self.assertEqual(router._category_str_to_id("Structural Framing").val, MockBuiltInCategory.OST_StructuralFraming)
+            self.assertEqual(router._category_str_to_id("Parking").val, MockBuiltInCategory.OST_Parking)
+            self.assertEqual(router._category_str_to_id("Roads").val, MockBuiltInCategory.OST_Roads)
+            self.assertEqual(router._category_str_to_id("Planting").val, MockBuiltInCategory.OST_Planting)
+
+            # Test direct OST_ strings
+            self.assertEqual(router._category_str_to_id("OST_Casework").val, MockBuiltInCategory.OST_Casework)
+            self.assertEqual(router._category_str_to_id("OST_PlumbingFixtures").val, MockBuiltInCategory.OST_PlumbingFixtures)
+
+            # Test dynamic fallback for arbitrary category (e.g. SecurityDevices)
+            self.assertEqual(router._category_str_to_id("Security Devices").val, MockBuiltInCategory.OST_SecurityDevices)
+            self.assertEqual(router._category_str_to_id("OST_SecurityDevices").val, MockBuiltInCategory.OST_SecurityDevices)
+
+            # Test safe fallback to GenericModel for non-existent category
+            self.assertEqual(router._category_str_to_id("UnknownCustomLayer").val, MockBuiltInCategory.OST_GenericModel)
+
+        finally:
+            conversion_router.REVIT_AVAILABLE = orig_revit_avail
+            if orig_db is not None:
+                conversion_router.DB = orig_db
+
+    def test_classifier_refine_comprehensive_categories(self):
+        """Tests that AecClassifier._refine_family_category handles all 3D model categories."""
+        from classifier import AecClassifier
+        from scanner import ScannedObject
+
+        clf = AecClassifier()
+
+        cases = [
+            ("A-CASE-CABINETS::Base_Unit", "Cabinet", "OST_Casework"),
+            ("P-PLUM-FIXT::Washbasin", "Lavabo", "OST_PlumbingFixtures"),
+            ("M-MECH-HVAC::Air_Handler", "Clima", "OST_MechanicalEquipment"),
+            ("E-LITE-FIXT::Downlight", "Luminaria", "OST_LightingFixtures"),
+            ("E-ELEC-DEVC::Switch", "Endoll", "OST_ElectricalFixtures"),
+            ("A-RAIL::Balustrade_Glass", "Barana", "OST_StairsRailing"),
+            ("A-RAMP::Access_Ramp", "Rampa", "OST_Ramps"),
+            ("S-FNDN::Footing_Pad", "Zapata", "OST_StructuralFoundation"),
+            ("S-FRAM::Girder_Steel", "Viga", "OST_StructuralFraming"),
+            ("C-PARK::Stall_01", "Aparcament", "OST_Parking"),
+            ("L-PLNT::Olive_Tree", "Arbre", "OST_Planting"),
+            ("A-EQUP::Passenger_Lift", "Ascensor", "OST_SpecialityEquipment"),
+        ]
+
+        for layer, name, expected_cat in cases:
+            obj = ScannedObject("test-guid")
+            obj.layer_full_path = layer
+            obj.object_name = name
+            cat = clf._refine_family_category(obj)
+            self.assertEqual(cat, expected_cat, "Failed refining '{}' / '{}'".format(layer, name))
+
 
 if __name__ == "__main__":
     unittest.main()

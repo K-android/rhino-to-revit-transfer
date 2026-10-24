@@ -1110,6 +1110,14 @@ class ConversionRouter(object):
             else:
                 category_id = DB.ElementId(DB.BuiltInCategory.OST_GenericModel)
 
+        # Ensure category is valid for DirectShape; fallback to OST_GenericModel if unsupported in current Revit version
+        if hasattr(DB.DirectShape, "IsValidCategoryId"):
+            try:
+                if not DB.DirectShape.IsValidCategoryId(category_id, self.doc):
+                    category_id = DB.ElementId(DB.BuiltInCategory.OST_GenericModel)
+            except Exception:
+                pass
+
         # Convert Rhino geometry to Revit DB.GeometryObject without double scaling
         revit_geoms = self._convert_rhino_to_revit_geometry(scanned_obj.raw_geometry, geom_feet=geom_feet)
         if not revit_geoms or len(revit_geoms) == 0:
@@ -1392,17 +1400,22 @@ class ConversionRouter(object):
         return arr
 
     def _category_str_to_id(self, cat_name):
-        """Maps category name string to Revit ElementId with Toposolid and full friendly name support."""
+        """Maps category name string to Revit ElementId with Toposolid, all 3D model categories, and dynamic BuiltInCategory resolution."""
         if not REVIT_AVAILABLE or not hasattr(DB, "BuiltInCategory"):
             return None
 
-        # Resolve Toposolid BuiltInCategory safely (Revit 2024+)
+        # Resolve version-dependent BuiltInCategory safely
         toposolid_bic = getattr(DB.BuiltInCategory, "OST_Toposolid", DB.BuiltInCategory.OST_Topography)
+        hardscape_bic = getattr(DB.BuiltInCategory, "OST_Hardscape", DB.BuiltInCategory.OST_Site)
 
+        # Comprehensive map covering architectural, structural, MEP, and site categories
         cat_map = {
+            # Architecture - Core Systems & Openings
             "OST_Floors": DB.BuiltInCategory.OST_Floors,
             "Floors": DB.BuiltInCategory.OST_Floors,
             "Floor": DB.BuiltInCategory.OST_Floors,
+            "Slab": DB.BuiltInCategory.OST_Floors,
+            "Slabs": DB.BuiltInCategory.OST_Floors,
             "OST_Walls": DB.BuiltInCategory.OST_Walls,
             "Walls": DB.BuiltInCategory.OST_Walls,
             "Wall": DB.BuiltInCategory.OST_Walls,
@@ -1415,47 +1428,156 @@ class ConversionRouter(object):
             "OST_Columns": DB.BuiltInCategory.OST_Columns,
             "Columns": DB.BuiltInCategory.OST_Columns,
             "Column": DB.BuiltInCategory.OST_Columns,
-            "OST_StructuralColumns": DB.BuiltInCategory.OST_StructuralColumns,
-            "Structural Columns": DB.BuiltInCategory.OST_StructuralColumns,
             "OST_Doors": DB.BuiltInCategory.OST_Doors,
             "Doors": DB.BuiltInCategory.OST_Doors,
             "Door": DB.BuiltInCategory.OST_Doors,
             "OST_Windows": DB.BuiltInCategory.OST_Windows,
             "Windows": DB.BuiltInCategory.OST_Windows,
             "Window": DB.BuiltInCategory.OST_Windows,
+            "OST_CurtainWallPanels": DB.BuiltInCategory.OST_CurtainWallPanels,
+            "Curtain Panels": DB.BuiltInCategory.OST_CurtainWallPanels,
+            "Curtain Wall Panels": DB.BuiltInCategory.OST_CurtainWallPanels,
+            "CurtainPanel": DB.BuiltInCategory.OST_CurtainWallPanels,
+            "CurtainPanels": DB.BuiltInCategory.OST_CurtainWallPanels,
+            "OST_CurtainWallMullions": DB.BuiltInCategory.OST_CurtainWallMullions,
+            "Curtain Wall Mullions": DB.BuiltInCategory.OST_CurtainWallMullions,
+            "Curtain Mullions": DB.BuiltInCategory.OST_CurtainWallMullions,
+            "Mullions": DB.BuiltInCategory.OST_CurtainWallMullions,
+            "Mullion": DB.BuiltInCategory.OST_CurtainWallMullions,
+            "OST_Stairs": DB.BuiltInCategory.OST_Stairs,
+            "Stairs": DB.BuiltInCategory.OST_Stairs,
+            "Stair": DB.BuiltInCategory.OST_Stairs,
+            "OST_StairsRailing": DB.BuiltInCategory.OST_StairsRailing,
+            "Railings": DB.BuiltInCategory.OST_StairsRailing,
+            "Railing": DB.BuiltInCategory.OST_StairsRailing,
+            "OST_Ramps": DB.BuiltInCategory.OST_Ramps,
+            "Ramps": DB.BuiltInCategory.OST_Ramps,
+            "Ramp": DB.BuiltInCategory.OST_Ramps,
+
+            # Furniture, Casework & Equipment
             "OST_Furniture": DB.BuiltInCategory.OST_Furniture,
             "Furniture": DB.BuiltInCategory.OST_Furniture,
-            "OST_Planting": DB.BuiltInCategory.OST_Planting,
-            "Planting": DB.BuiltInCategory.OST_Planting,
-            "Planters": DB.BuiltInCategory.OST_Planting,
-            "Planter": DB.BuiltInCategory.OST_Planting,
-            "OST_GenericModel": DB.BuiltInCategory.OST_GenericModel,
-            "Generic Model": DB.BuiltInCategory.OST_GenericModel,
-            "Generic Models": DB.BuiltInCategory.OST_GenericModel,
-            "Generic": DB.BuiltInCategory.OST_GenericModel,
+            "OST_FurnitureSystems": getattr(DB.BuiltInCategory, "OST_FurnitureSystems", DB.BuiltInCategory.OST_Furniture),
+            "Furniture Systems": getattr(DB.BuiltInCategory, "OST_FurnitureSystems", DB.BuiltInCategory.OST_Furniture),
+            "FurnitureSystems": getattr(DB.BuiltInCategory, "OST_FurnitureSystems", DB.BuiltInCategory.OST_Furniture),
+            "OST_Casework": DB.BuiltInCategory.OST_Casework,
+            "Casework": DB.BuiltInCategory.OST_Casework,
+            "Cabinets": DB.BuiltInCategory.OST_Casework,
+            "Cabinet": DB.BuiltInCategory.OST_Casework,
+            "OST_SpecialityEquipment": DB.BuiltInCategory.OST_SpecialityEquipment,
+            "Specialty Equipment": DB.BuiltInCategory.OST_SpecialityEquipment,
+            "Speciality Equipment": DB.BuiltInCategory.OST_SpecialityEquipment,
+            "SpecialtyEquipment": DB.BuiltInCategory.OST_SpecialityEquipment,
+            "Equipment": DB.BuiltInCategory.OST_SpecialityEquipment,
+            "OST_Entourage": DB.BuiltInCategory.OST_Entourage,
+            "Entourage": DB.BuiltInCategory.OST_Entourage,
+            "OST_Signage": getattr(DB.BuiltInCategory, "OST_Signage", DB.BuiltInCategory.OST_GenericModel),
+            "Signage": getattr(DB.BuiltInCategory, "OST_Signage", DB.BuiltInCategory.OST_GenericModel),
+
+            # Site, Topo & Landscape
             "OST_Toposolid": toposolid_bic,
             "Toposolid": toposolid_bic,
             "Topography": DB.BuiltInCategory.OST_Topography,
             "OST_Topography": DB.BuiltInCategory.OST_Topography,
-            "Site": DB.BuiltInCategory.OST_Site,
             "OST_Site": DB.BuiltInCategory.OST_Site,
-            "Curtain Panels": DB.BuiltInCategory.OST_CurtainWallPanels,
-            "Curtain Wall Panels": DB.BuiltInCategory.OST_CurtainWallPanels,
-            "OST_CurtainWallPanels": DB.BuiltInCategory.OST_CurtainWallPanels,
-            "Stairs": DB.BuiltInCategory.OST_Stairs,
-            "OST_Stairs": DB.BuiltInCategory.OST_Stairs,
-            "Mass": DB.BuiltInCategory.OST_Mass,
-            "OST_Mass": DB.BuiltInCategory.OST_Mass,
-            "Structural Framing": DB.BuiltInCategory.OST_StructuralFraming,
+            "Site": DB.BuiltInCategory.OST_Site,
+            "OST_Planting": DB.BuiltInCategory.OST_Planting,
+            "Planting": DB.BuiltInCategory.OST_Planting,
+            "Planters": DB.BuiltInCategory.OST_Planting,
+            "Planter": DB.BuiltInCategory.OST_Planting,
+            "Landscape": DB.BuiltInCategory.OST_Planting,
+            "OST_Parking": DB.BuiltInCategory.OST_Parking,
+            "Parking": DB.BuiltInCategory.OST_Parking,
+            "OST_Roads": DB.BuiltInCategory.OST_Roads,
+            "Roads": DB.BuiltInCategory.OST_Roads,
+            "Road": DB.BuiltInCategory.OST_Roads,
+            "OST_Hardscape": hardscape_bic,
+            "Hardscape": hardscape_bic,
+
+            # Structure
+            "OST_StructuralColumns": DB.BuiltInCategory.OST_StructuralColumns,
+            "Structural Columns": DB.BuiltInCategory.OST_StructuralColumns,
+            "Structural Column": DB.BuiltInCategory.OST_StructuralColumns,
             "OST_StructuralFraming": DB.BuiltInCategory.OST_StructuralFraming,
+            "Structural Framing": DB.BuiltInCategory.OST_StructuralFraming,
+            "Beams": DB.BuiltInCategory.OST_StructuralFraming,
+            "Beam": DB.BuiltInCategory.OST_StructuralFraming,
+            "Framing": DB.BuiltInCategory.OST_StructuralFraming,
+            "OST_StructuralFoundation": DB.BuiltInCategory.OST_StructuralFoundation,
+            "Structural Foundation": DB.BuiltInCategory.OST_StructuralFoundation,
+            "Structural Foundations": DB.BuiltInCategory.OST_StructuralFoundation,
+            "Foundation": DB.BuiltInCategory.OST_StructuralFoundation,
+            "Foundations": DB.BuiltInCategory.OST_StructuralFoundation,
+            "Footing": DB.BuiltInCategory.OST_StructuralFoundation,
+            "Footings": DB.BuiltInCategory.OST_StructuralFoundation,
+            "OST_StructuralStiffener": getattr(DB.BuiltInCategory, "OST_StructuralStiffener", DB.BuiltInCategory.OST_StructuralFraming),
+            "Structural Stiffener": getattr(DB.BuiltInCategory, "OST_StructuralStiffener", DB.BuiltInCategory.OST_StructuralFraming),
+
+            # MEP (Mechanical, Electrical, Plumbing)
+            "OST_PlumbingFixtures": DB.BuiltInCategory.OST_PlumbingFixtures,
+            "Plumbing Fixtures": DB.BuiltInCategory.OST_PlumbingFixtures,
+            "Plumbing": DB.BuiltInCategory.OST_PlumbingFixtures,
+            "PlumbingFixture": DB.BuiltInCategory.OST_PlumbingFixtures,
+            "OST_MechanicalEquipment": DB.BuiltInCategory.OST_MechanicalEquipment,
+            "Mechanical Equipment": DB.BuiltInCategory.OST_MechanicalEquipment,
+            "Mechanical": DB.BuiltInCategory.OST_MechanicalEquipment,
+            "HVAC": DB.BuiltInCategory.OST_MechanicalEquipment,
+            "OST_ElectricalEquipment": DB.BuiltInCategory.OST_ElectricalEquipment,
+            "Electrical Equipment": DB.BuiltInCategory.OST_ElectricalEquipment,
+            "OST_ElectricalFixtures": DB.BuiltInCategory.OST_ElectricalFixtures,
+            "Electrical Fixtures": DB.BuiltInCategory.OST_ElectricalFixtures,
+            "Electrical": DB.BuiltInCategory.OST_ElectricalFixtures,
+            "OST_LightingFixtures": DB.BuiltInCategory.OST_LightingFixtures,
+            "Lighting Fixtures": DB.BuiltInCategory.OST_LightingFixtures,
+            "Lighting": DB.BuiltInCategory.OST_LightingFixtures,
+            "Lights": DB.BuiltInCategory.OST_LightingFixtures,
+            "Light": DB.BuiltInCategory.OST_LightingFixtures,
+            "OST_LightingDevices": getattr(DB.BuiltInCategory, "OST_LightingDevices", DB.BuiltInCategory.OST_LightingFixtures),
+            "Lighting Devices": getattr(DB.BuiltInCategory, "OST_LightingDevices", DB.BuiltInCategory.OST_LightingFixtures),
+            "OST_CommunicationDevices": getattr(DB.BuiltInCategory, "OST_CommunicationDevices", DB.BuiltInCategory.OST_ElectricalFixtures),
+            "Communication Devices": getattr(DB.BuiltInCategory, "OST_CommunicationDevices", DB.BuiltInCategory.OST_ElectricalFixtures),
+            "OST_FireAlarmDevices": getattr(DB.BuiltInCategory, "OST_FireAlarmDevices", DB.BuiltInCategory.OST_ElectricalFixtures),
+            "Fire Alarm Devices": getattr(DB.BuiltInCategory, "OST_FireAlarmDevices", DB.BuiltInCategory.OST_ElectricalFixtures),
+            "OST_SecurityDevices": getattr(DB.BuiltInCategory, "OST_SecurityDevices", DB.BuiltInCategory.OST_ElectricalFixtures),
+            "Security Devices": getattr(DB.BuiltInCategory, "OST_SecurityDevices", DB.BuiltInCategory.OST_ElectricalFixtures),
+            "OST_DuctCurves": getattr(DB.BuiltInCategory, "OST_DuctCurves", DB.BuiltInCategory.OST_MechanicalEquipment),
+            "Ducts": getattr(DB.BuiltInCategory, "OST_DuctCurves", DB.BuiltInCategory.OST_MechanicalEquipment),
+            "OST_PipeCurves": getattr(DB.BuiltInCategory, "OST_PipeCurves", DB.BuiltInCategory.OST_PlumbingFixtures),
+            "Pipes": getattr(DB.BuiltInCategory, "OST_PipeCurves", DB.BuiltInCategory.OST_PlumbingFixtures),
+
+            # Mass & Generic Models
+            "OST_Mass": DB.BuiltInCategory.OST_Mass,
+            "Mass": DB.BuiltInCategory.OST_Mass,
+            "OST_GenericModel": DB.BuiltInCategory.OST_GenericModel,
+            "Generic Model": DB.BuiltInCategory.OST_GenericModel,
+            "Generic Models": DB.BuiltInCategory.OST_GenericModel,
+            "Generic": DB.BuiltInCategory.OST_GenericModel,
         }
         clean_name = str(cat_name or "").strip()
         bic = cat_map.get(clean_name)
+
+        # Dynamic fallback: check direct attribute, OST_ prefix, or case-insensitive match
         if bic is None:
-            if clean_name.startswith("OST_") and hasattr(DB.BuiltInCategory, clean_name):
-                bic = getattr(DB.BuiltInCategory, clean_name)
+            stripped = re.sub(r'[^a-zA-Z0-9_]', '', clean_name)
+            ost_cand = "OST_" + stripped if not stripped.startswith("OST_") else stripped
+            if hasattr(DB.BuiltInCategory, ost_cand):
+                bic = getattr(DB.BuiltInCategory, ost_cand)
+            elif hasattr(DB.BuiltInCategory, stripped):
+                bic = getattr(DB.BuiltInCategory, stripped)
             else:
-                bic = DB.BuiltInCategory.OST_GenericModel
+                ost_cand_lower = ost_cand.lower()
+                stripped_lower = stripped.lower()
+                for attr in dir(DB.BuiltInCategory):
+                    if attr.startswith("_"):
+                        continue
+                    attr_lower = attr.lower()
+                    if attr_lower == ost_cand_lower or attr_lower == stripped_lower:
+                        bic = getattr(DB.BuiltInCategory, attr)
+                        break
+
+        if bic is None:
+            bic = DB.BuiltInCategory.OST_GenericModel
+
         return DB.ElementId(bic)
 
     def _get_or_create_bua_area_scheme(self):

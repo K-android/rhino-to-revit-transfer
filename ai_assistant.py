@@ -168,8 +168,35 @@ class AISemanticInterpreter(object):
         "banc": ("Bench / Seating", "Family", "OST_Furniture", "Fixed or loose bench seating"),
         "cadira": ("Chair", "Family", "OST_Furniture", "Seating furniture"),
         "taula": ("Table", "Family", "OST_Furniture", "Surface furniture"),
-        "fusteria": ("Joinery / Millwork", "Family", "Architectural Millwork", "Custom wood joinery / cabinetry"),
-        "carpinteria": ("Joinery / Millwork", "Family", "Architectural Millwork", "Custom joinery / casework")
+        "fusteria": ("Joinery / Millwork", "Family", "OST_Casework", "Custom wood joinery / cabinetry"),
+        "carpinteria": ("Joinery / Millwork", "Family", "OST_Casework", "Custom joinery / casework"),
+        "armari": ("Cabinet / Closet", "Family", "OST_Casework", "Built-in wardrobe or casework"),
+        "armario": ("Cabinet / Closet", "Family", "OST_Casework", "Built-in wardrobe or casework"),
+        "cuina": ("Kitchen Casework", "Family", "OST_Casework", "Kitchen cabinetry and counter"),
+        "cocina": ("Kitchen Casework", "Family", "OST_Casework", "Kitchen cabinetry and counter"),
+        "sanitari": ("Plumbing Fixture", "Family", "OST_PlumbingFixtures", "Bathroom sanitary fixture"),
+        "sanitario": ("Plumbing Fixture", "Family", "OST_PlumbingFixtures", "Bathroom sanitary fixture"),
+        "lavabo": ("Washbasin", "Family", "OST_PlumbingFixtures", "Bathroom sink / washbasin"),
+        "inodoro": ("Water Closet / Toilet", "Family", "OST_PlumbingFixtures", "Toilet fixture"),
+        "clima": ("HVAC Equipment", "Family", "OST_MechanicalEquipment", "Air conditioning / mechanical equipment"),
+        "climatizacion": ("HVAC Equipment", "Family", "OST_MechanicalEquipment", "Mechanical climate control equipment"),
+        "conducte": ("HVAC Ductwork", "Family", "OST_MechanicalEquipment", "Ventilation ductwork"),
+        "conducto": ("HVAC Ductwork", "Family", "OST_MechanicalEquipment", "Ventilation ductwork"),
+        "llum": ("Lighting Fixture", "Family", "OST_LightingFixtures", "Architectural luminaire / light"),
+        "luz": ("Lighting Fixture", "Family", "OST_LightingFixtures", "Architectural luminaire / light"),
+        "luminaria": ("Lighting Fixture", "Family", "OST_LightingFixtures", "Ceiling or wall luminaire"),
+        "electricitat": ("Electrical Fixture", "Family", "OST_ElectricalFixtures", "Electrical device / receptacle"),
+        "electricidad": ("Electrical Fixture", "Family", "OST_ElectricalFixtures", "Electrical device / receptacle"),
+        "barana": ("Railing / Balustrade", "Family", "OST_StairsRailing", "Safety guardrail or handrail"),
+        "barandilla": ("Railing / Balustrade", "Family", "OST_StairsRailing", "Safety guardrail or handrail"),
+        "rampa": ("Ramp", "Family", "OST_Ramps", "Access ramp assembly"),
+        "aparcament": ("Parking", "Family", "OST_Parking", "Parking bay / stall"),
+        "aparcamiento": ("Parking", "Family", "OST_Parking", "Parking bay / stall"),
+        "viga": ("Structural Beam", "Family", "OST_StructuralFraming", "Horizontal structural framing beam"),
+        "jassera": ("Structural Girder", "Family", "OST_StructuralFraming", "Primary loadbearing concrete girder"),
+        "fonament": ("Foundation Footing", "Family", "OST_StructuralFoundation", "Concrete pad / strip footing"),
+        "zapata": ("Foundation Footing", "Family", "OST_StructuralFoundation", "Concrete foundation footing"),
+        "ascensor": ("Elevator / Lift", "Family", "OST_SpecialityEquipment", "Passenger or service elevator cab")
     }
 
     def __init__(self, api_key=None, api_endpoint=None, model=None, provider=None):
@@ -348,7 +375,7 @@ class AISemanticInterpreter(object):
             "You are an AEC BIM architect. Decode this architectural CAD/Rhino layer name:\n"
             "Layer: '{}'\n"
             "Return strictly valid JSON with keys: 'english_translation', 'inferred_category' "
-            "(one of: Floors, Walls, Roofs, Ceilings, Columns, Toposolid, Planting, Furniture, Site, Family, DirectShape), "
+            "(one of: Floors, Walls, Roofs, Ceilings, Columns, Structural Columns, Doors, Windows, Curtain Panels, Stairs, Railings, Ramps, Furniture, Furniture Systems, Casework, Specialty Equipment, Plumbing Fixtures, Mechanical Equipment, Electrical Fixtures, Lighting Fixtures, Structural Framing, Structural Foundation, Toposolid, Site, Planting, Parking, Roads, Mass, Entourage, Signage, Generic Models), "
             "'suggested_revit_type', and 'architectural_intent'."
         ).format(raw_name)
 

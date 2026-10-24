@@ -171,7 +171,7 @@ class LayerRowItem(object):
             self.revit_type = "OST_Roofs"
             if self.proposed_strategy in ("FloorNative", "CeilingNative", "Toposolid"):
                 self.proposed_strategy = "RoofNative"
-        elif "wall" in cat_lower:
+        elif "wall" in cat_lower and "curtain" not in cat_lower:
             self.revit_type = "OST_Walls"
             if self.proposed_strategy in ("FloorNative", "RoofNative", "Toposolid"):
                 self.proposed_strategy = "WallByCurve"
@@ -179,22 +179,60 @@ class LayerRowItem(object):
             self.revit_type = "OST_Ceilings"
             if self.proposed_strategy in ("FloorNative", "RoofNative", "Toposolid"):
                 self.proposed_strategy = "CeilingNative"
-        elif "column" in cat_lower or "pillar" in cat_lower:
+        elif "structural col" in cat_lower:
+            self.revit_type = "OST_StructuralColumns"
+        elif "column" in cat_lower or "pillar" in cat_lower or "pilar" in cat_lower:
             self.revit_type = "OST_Columns"
+        elif "mullion" in cat_lower:
+            self.revit_type = "OST_CurtainWallMullions"
         elif "curtain" in cat_lower or "panel" in cat_lower:
             self.revit_type = "OST_CurtainWallPanels"
-        elif "door" in cat_lower:
+        elif "door" in cat_lower or "puerta" in cat_lower or "porta" in cat_lower:
             self.revit_type = "OST_Doors"
-        elif "window" in cat_lower:
+        elif "window" in cat_lower or "ventana" in cat_lower or "finestra" in cat_lower:
             self.revit_type = "OST_Windows"
-        elif "furniture" in cat_lower:
+        elif "furniture system" in cat_lower:
+            self.revit_type = "OST_FurnitureSystems"
+        elif "furniture" in cat_lower or "mobiliari" in cat_lower or "sofa" in cat_lower or "chair" in cat_lower or "table" in cat_lower:
             self.revit_type = "OST_Furniture"
-        elif "plant" in cat_lower:
+        elif "casework" in cat_lower or "cabinet" in cat_lower or "closet" in cat_lower or "armario" in cat_lower or "cocina" in cat_lower:
+            self.revit_type = "OST_Casework"
+        elif "plumb" in cat_lower or "sanit" in cat_lower or "lavabo" in cat_lower or "toilet" in cat_lower or "sink" in cat_lower:
+            self.revit_type = "OST_PlumbingFixtures"
+        elif "mechanic" in cat_lower or "hvac" in cat_lower or "clima" in cat_lower or "duct" in cat_lower:
+            self.revit_type = "OST_MechanicalEquipment"
+        elif "light" in cat_lower or "lamp" in cat_lower or "lum" in cat_lower or "llum" in cat_lower:
+            self.revit_type = "OST_LightingFixtures"
+        elif "electric" in cat_lower and "equip" in cat_lower:
+            self.revit_type = "OST_ElectricalEquipment"
+        elif "electric" in cat_lower:
+            self.revit_type = "OST_ElectricalFixtures"
+        elif "special" in cat_lower or "elevator" in cat_lower or "ascensor" in cat_lower or "equip" in cat_lower:
+            self.revit_type = "OST_SpecialityEquipment"
+        elif "railing" in cat_lower or "barandilla" in cat_lower or "barana" in cat_lower or "balustrade" in cat_lower:
+            self.revit_type = "OST_StairsRailing"
+        elif "ramp" in cat_lower or "rampa" in cat_lower:
+            self.revit_type = "OST_Ramps"
+        elif "park" in cat_lower or "aparcam" in cat_lower:
+            self.revit_type = "OST_Parking"
+        elif "road" in cat_lower or "street" in cat_lower or "vial" in cat_lower:
+            self.revit_type = "OST_Roads"
+        elif "hardscape" in cat_lower:
+            self.revit_type = "OST_Hardscape"
+        elif "plant" in cat_lower or "tree" in cat_lower or "vegetat" in cat_lower or "jardin" in cat_lower:
             self.revit_type = "OST_Planting"
         elif "site" in cat_lower:
             self.revit_type = "OST_Site"
-        elif "stair" in cat_lower:
+        elif "foundat" in cat_lower or "footing" in cat_lower or "zapata" in cat_lower or "ciment" in cat_lower:
+            self.revit_type = "OST_StructuralFoundation"
+        elif "framing" in cat_lower or "beam" in cat_lower or "viga" in cat_lower or "truss" in cat_lower:
+            self.revit_type = "OST_StructuralFraming"
+        elif "stair" in cat_lower or "escala" in cat_lower:
             self.revit_type = "OST_Stairs"
+        elif "entourage" in cat_lower or "person" in cat_lower or "people" in cat_lower or "coche" in cat_lower:
+            self.revit_type = "OST_Entourage"
+        elif "sign" in cat_lower:
+            self.revit_type = "OST_Signage"
         elif "mass" in cat_lower:
             self.revit_type = "OST_Mass"
         elif "generic" in cat_lower:
@@ -202,7 +240,11 @@ class LayerRowItem(object):
         elif self.inferred_category.startswith("OST_"):
             self.revit_type = self.inferred_category
         else:
-            self.revit_type = "OST_GenericModel"
+            clean_tok = re.sub(r'[^a-zA-Z0-9_]', '', self.inferred_category)
+            if clean_tok:
+                self.revit_type = "OST_" + clean_tok if not clean_tok.startswith("OST_") else clean_tok
+            else:
+                self.revit_type = "OST_GenericModel"
 
         if self.classification:
             self.classification.inferred_category = self.inferred_category
@@ -234,6 +276,24 @@ class ValidationRowItem(object):
         self.section = val_report.view_matrix.get("Section", "PASS")
         self.issues = "; ".join(val_report.issues) if val_report.issues else "None"
         self.raw_report = val_report
+
+
+STANDARD_REVIT_CATEGORIES = [
+    # Architecture - Core Systems
+    "Floors", "Walls", "Roofs", "Ceilings", "Columns", "Structural Columns",
+    "Doors", "Windows", "Curtain Panels", "Curtain Wall Mullions",
+    "Stairs", "Railings", "Ramps",
+    # FF&E, Casework & Specialties
+    "Furniture", "Furniture Systems", "Casework", "Specialty Equipment",
+    # MEP (Services)
+    "Plumbing Fixtures", "Mechanical Equipment", "Electrical Equipment", "Electrical Fixtures", "Lighting Fixtures",
+    # Structure
+    "Structural Framing", "Structural Foundation",
+    # Site, Topo & Civil
+    "Toposolid", "Site", "Planting", "Parking", "Roads", "Hardscape",
+    # Mass, Context & Generic
+    "Mass", "Entourage", "Signage", "Generic Models"
+]
 
 
 class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
@@ -275,12 +335,12 @@ class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         lbl_cat = ef.Label()
         lbl_cat.Text = "Revit Category:"
         self.dd_cat = ef.DropDown()
-        categories = ["Floors", "Walls", "Roofs", "Ceilings", "Columns", "Toposolid", "Furniture", "Planting", "Doors", "Windows", "Curtain Panels", "Site", "Mass", "Generic Models"]
+        categories = list(STANDARD_REVIT_CATEGORIES)
         for c in categories:
             self.dd_cat.Items.Add(c)
 
         curr_cat = layer_row.inferred_category or ""
-        match_idx = next((i for i, c in enumerate(categories) if c.lower() in curr_cat.lower()), 0)
+        match_idx = next((i for i, c in enumerate(categories) if c.lower() in curr_cat.lower() or curr_cat.lower() in c.lower()), 0)
         self.dd_cat.SelectedIndex = match_idx
 
         row_cat = ef.DynamicLayout()
@@ -973,7 +1033,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         lbl_cat_override.VerticalAlignment = ef.VerticalAlignment.Center
 
         self.dd_cat_override = ef.DropDown()
-        for cat_opt in ["Floors", "Walls", "Roofs", "Ceilings", "Columns", "Toposolid", "Curtain Panels", "Doors", "Windows", "Furniture", "Site", "Mass", "Generic Models"]:
+        for cat_opt in STANDARD_REVIT_CATEGORIES:
             self.dd_cat_override.Items.Add(cat_opt)
         self.dd_cat_override.SelectedIndex = 0
 
@@ -1100,7 +1160,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
             cat_menu = ef.ButtonMenuItem()
             cat_menu.Text = "Quick Set Category"
-            for q_cat in ["Floors", "Walls", "Roofs", "Ceilings", "Columns", "Toposolid", "Furniture", "Planting", "Doors", "Windows", "Curtain Panels", "Generic Models"]:
+            for q_cat in STANDARD_REVIT_CATEGORIES:
                 q_item = ef.ButtonMenuItem()
                 q_item.Text = q_cat
                 def _make_cat_cb(c_name):

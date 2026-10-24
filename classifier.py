@@ -89,7 +89,7 @@ class AecClassifier(object):
             re.IGNORECASE
         ),
         "Family": re.compile(
-            r"\b(block|blocks|col|cols|pilar|pilars|column|columns|mullion|mullions|montante|montantes|door|doors|puerta|puertas|window|windows|ventana|ventanas|furniture|module|modules|porta|portes|finestra|finestres|mobiliari|columna|columnes|carpinteria|fusteria)\b",
+            r"\b(block|blocks|col|cols|pilar|pilars|column|columns|mullion|mullions|montante|montantes|door|doors|puerta|puertas|window|windows|ventana|ventanas|furniture|module|modules|porta|portes|finestra|finestres|mobiliari|columna|columnes|carpinteria|fusteria|casework|cabinet|armario|armari|cuina|cocina|plumbing|sanitari|sanitario|lavabo|inodoro|sink|toilet|faucet|mechanical|climatizacion|conducto|duct|hvac|electric|electrico|llum|lum|luz|lamp|luminaria|lighting|specialty|ascensor|elevator|lift|railing|barandilla|barana|balustrade|ramp|rampa|parking|aparcamiento|aparcament|foundation|zapata|cimentacion|fonament|beam|viga|framing|encavallada|cercha|plant|planta|arbol|arbre|jardinera|planter)\b",
             re.IGNORECASE
         ),
         "DirectShape": re.compile(
@@ -368,6 +368,8 @@ class AecClassifier(object):
     def _refine_family_category(self, obj):
         """Determines specific Revit category for a Family item based on name."""
         name = "{} {}".format(obj.layer_full_path, obj.object_name).lower()
+        if "structural col" in name:
+            return "OST_StructuralColumns"
         if any(k in name for k in ["col", "pilar", "column"]):
             return "OST_Columns"
         if any(k in name for k in ["door", "puerta", "porta"]):
@@ -376,8 +378,44 @@ class AecClassifier(object):
             return "OST_Windows"
         if any(k in name for k in ["mullion", "montante"]):
             return "OST_CurtainWallMullions"
-        if any(k in name for k in ["furniture", "mobiliari"]):
+        if any(k in name for k in ["furniture system", "workstation"]):
+            return "OST_FurnitureSystems"
+        if any(k in name for k in ["furniture", "mobiliari", "sofa", "cadira", "chair", "taula", "table", "banc", "bench"]):
             return "OST_Furniture"
+        if any(k in name for k in ["casework", "cabinet", "closet", "armario", "armari", "cuina", "cocina", "fusteria", "carpinteria"]):
+            return "OST_Casework"
+        if any(k in name for k in ["plumb", "sanitar", "lavabo", "inodoro", "toilet", "sink", "faucet", "grifo", "aixeta"]):
+            return "OST_PlumbingFixtures"
+        if any(k in name for k in ["mechanic", "hvac", "climatiz", "clima", "conducto", "duct", "fan"]):
+            return "OST_MechanicalEquipment"
+        if any(k in name for k in ["light", "lighting", "lum", "llum", "luz", "lamp", "luminaria", "aplique"]):
+            return "OST_LightingFixtures"
+        if ("electric" in name or "electr" in name) and "equip" in name or any(k in name for k in ["switchboard", "cuadro"]):
+            return "OST_ElectricalEquipment"
+        if any(k in name for k in ["electric", "endoll", "enchufe"]):
+            return "OST_ElectricalFixtures"
+        if any(k in name for k in ["special", "ascensor", "elevator", "lift", "equip"]):
+            return "OST_SpecialityEquipment"
+        if any(k in name for k in ["plant", "arbol", "arbre", "vegetat", "jardinera", "planter"]):
+            return "OST_Planting"
+        if any(k in name for k in ["railing", "barandilla", "barana", "balustrade"]):
+            return "OST_StairsRailing"
+        if any(k in name for k in ["ramp", "rampa"]):
+            return "OST_Ramps"
+        if any(k in name for k in ["park", "aparcament", "aparcamiento"]):
+            return "OST_Parking"
+        if any(k in name for k in ["road", "vial", "carretera"]):
+            return "OST_Roads"
+        if any(k in name for k in ["foundat", "zapata", "cimentacion", "fonament", "footing"]):
+            return "OST_StructuralFoundation"
+        if any(k in name for k in ["beam", "viga", "framing", "cercha", "encavallada", "truss"]):
+            return "OST_StructuralFraming"
+        if any(k in name for k in ["stair", "escala", "escalera"]):
+            return "OST_Stairs"
+        if any(k in name for k in ["entourage", "persona", "people", "coche", "cotxe", "car"]):
+            return "OST_Entourage"
+        if any(k in name for k in ["signage", "senyal", "senal"]):
+            return "OST_Signage"
         return "OST_GenericModel"
 
     def _select_strategy(self, obj, category):
