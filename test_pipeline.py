@@ -1628,7 +1628,9 @@ class TestR2RPipeline(unittest.TestCase):
                     @staticmethod
                     def NewCategorySet():
                         class _CatSet(object):
-                            def Insert(self, c): pass
+                            Size = 1
+                            def Insert(self, c):
+                                self.Size += 1
                         return _CatSet()
                     @staticmethod
                     def NewInstanceBinding(cat_set):
@@ -1659,6 +1661,12 @@ class TestR2RPipeline(unittest.TestCase):
                 CeilingType = type("CeilingType", (), {})
                 ElementTypeGroup = type("ETG", (), {"FloorType": 1, "WallType": 2, "RoofType": 3, "CeilingType": 4})
                 ElementId = type("EID", (), {"InvalidElementId": -1})
+                class Category(object):
+                    @staticmethod
+                    def GetCategory(doc, bic):
+                        class _Cat(object):
+                            AllowsBoundParameters = True
+                        return _Cat()
                 @staticmethod
                 def FilteredElementCollector(doc):
                     class _Col(object):
@@ -1710,6 +1718,12 @@ class TestR2RPipeline(unittest.TestCase):
                 ShowGrandTotal = False
                 ShowGrandTotalTitle = False
                 ShowGrandTotalCount = False
+                @staticmethod
+                def GetFieldCount():
+                    return len(fields_added)
+                @staticmethod
+                def GetField(idx):
+                    return fields_added[idx]
                 @staticmethod
                 def GetSchedulableFields():
                     class _SF(object):
