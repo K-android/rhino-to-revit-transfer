@@ -816,18 +816,18 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.chk_include_locked.Text = "Include Locked Layers"
         self.chk_include_locked.Checked = False
 
-        btn_scan = ef.Button()
-        btn_scan.Text = "Scan Active Rhino Document"
-        self._set_bold_font(btn_scan, 11)
-        btn_scan.Size = ed.Size(260, 36)
-        btn_scan.Click += self._on_scan_clicked
+        self.btn_scan = ef.Button()
+        self.btn_scan.Text = "Scan Active Rhino Document"
+        self._set_bold_font(self.btn_scan, 11)
+        self.btn_scan.Size = ed.Size(260, 36)
+        self.btn_scan.Click += self._on_scan_clicked
 
         layout.Add(desc)
         layout.BeginHorizontal()
         layout.Add(self.chk_include_hidden)
         layout.Add(self.chk_include_locked)
         layout.EndHorizontal()
-        layout.Add(btn_scan)
+        layout.Add(self.btn_scan)
         layout.Add(self._create_separator())
 
         # Preflight KPI Cards Box
@@ -1358,9 +1358,12 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
     # EVENT HANDLERS & LOGIC
     # =========================================================================
     def _on_scan_clicked(self, sender, e):
-        """Executes full scan of active Rhino document and updates UI."""
+        """Executes full scan of active Rhino document and updates UI with re-entrancy protection."""
+        if hasattr(self, "btn_scan") and self.btn_scan:
+            self.btn_scan.Enabled = False
+            self.btn_scan.Text = "Scanning In Progress..."
         try:
-            self.lbl_global_status.Text = "Scanning Rhino document..."
+            self.lbl_global_status.Text = "Step 1/4: Scanning Rhino document objects..."
 
             # Query Revit Levels if doc is available
             revit_levels = []
@@ -1412,13 +1415,16 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
             self.txt_scan_warnings.Text = "\n".join(warn_text) if warn_text else "Preflight clean. No geometric anomalies detected."
 
-            # Run Classification & Sync Evaluation
+            # Step 2: Run Classification & Sync Evaluation
+            self.lbl_global_status.Text = "Step 2/4: Classifying elements and matching sync records..."
             self._run_classification_and_sync()
 
-            # Populate Review Grid
+            # Step 3: Populate Review Grid
+            self.lbl_global_status.Text = "Step 3/4: Populating review grid..."
             self._populate_review_grid()
 
-            # Update Preview Tab KPIs
+            # Step 4: Update Preview Tab KPIs
+            self.lbl_global_status.Text = "Step 4/4: Calculating preview KPIs..."
             self._update_preview_kpis()
 
             self.lbl_global_status.Text = "Scan complete. {} objects ready for review.".format(len(self.scanned_objects))
@@ -1430,6 +1436,10 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             print("[R2R Scan Error]:\n" + err_details)
             self.lbl_global_status.Text = "Scan error: {}. See warnings tab for details.".format(ex)
             self.txt_scan_warnings.Text = "Scan Exception:\n{}\n{}".format(ex, err_details)
+        finally:
+            if hasattr(self, "btn_scan") and self.btn_scan:
+                self.btn_scan.Enabled = True
+                self.btn_scan.Text = "Scan Active Rhino Document"
 
     def _run_classification_and_sync(self):
         """Runs classifier and sync engine on scanned objects."""

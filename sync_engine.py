@@ -185,14 +185,43 @@ class SyncEngine(object):
         if not REVIT_AVAILABLE or not self.doc or not self.schema:
             return records
 
-        collector = DB.FilteredElementCollector(self.doc).WhereElementIsNotElementType()
-        for elem in collector:
-            try:
-                rec = self.read_sync_record(elem)
-                if rec and rec.rhino_guid:
-                    records[rec.rhino_guid] = rec
-            except Exception:
-                continue
+        # 1. High-speed C++ ExtensibleStorageFilter (Revit 2016-2027)
+        # Directly queries ONLY elements possessing this Schema GUID in Revit internal database
+        try:
+            if hasattr(DB, "ExtensibleStorage") and hasattr(DB.ExtensibleStorage, "ExtensibleStorageFilter") and hasattr(self.schema, "GUID"):
+                es_filter = DB.ExtensibleStorage.ExtensibleStorageFilter(self.schema.GUID)
+                collector = DB.FilteredElementCollector(self.doc).WherePasses(es_filter)
+                for elem in collector:
+                    try:
+                        rec = self.read_sync_record(elem)
+                        if rec and rec.rhino_guid:
+                            records[rec.rhino_guid] = rec
+                    except Exception:
+                        continue
+                return records
+        except Exception:
+            pass
+
+        # 2. Fast Fallback: Filter for model elements only, skipping internal views, sheets, phases, sketches
+        try:
+            collector = DB.FilteredElementCollector(self.doc).WhereElementIsNotElementType()
+            for elem in collector:
+                try:
+                    if not getattr(elem, "IsValidObject", True):
+                        continue
+                    cat = getattr(elem, "Category", None)
+                    if not cat or getattr(cat, "CategoryType", None) != getattr(DB.CategoryType, "Model", None):
+                        continue
+                    if getattr(elem, "ViewSpecific", False):
+                        continue
+
+                    rec = self.read_sync_record(elem)
+                    if rec and rec.rhino_guid:
+                        records[rec.rhino_guid] = rec
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
         return records
 

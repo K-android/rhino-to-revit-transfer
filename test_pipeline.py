@@ -1403,6 +1403,111 @@ class TestR2RPipeline(unittest.TestCase):
             if orig_db is not None:
                 conversion_router.DB = orig_db
 
+    def test_scanner_heavy_brep_guard(self):
+        """Tests that a Brep with >1000 faces bypasses MassProperties.Compute and uses safe bounding fallback."""
+        import scanner as sc
+        scanner_inst = RhinoScanner()
+        scanned = ScannedObject("heavy-brep-1")
+        scanned.dx = 10.0
+        scanned.dy = 10.0
+        scanned.dz = 2.0
+
+        # Mock heavy Brep
+        class MockFaces(object):
+            Count = 1500
+            def __getitem__(self, idx):
+                class MockFace(object):
+                    def TryGetPlane(self, tol):
+                        class MockPlane(object):
+                            class Normal(object):
+                                X = 0.0
+                                Y = 0.0
+                                Z = 1.0
+                                Length = 1.0
+                                @staticmethod
+                                def Unitize():
+                                    pass
+                        return True, MockPlane()
+                    Loops = []
+                return MockFace()
+
+        class MockHeavyBrep(sc.rg.Brep):
+            IsValid = True
+            IsSolid = True
+            Faces = MockFaces()
+
+        scanner_inst._compute_topology_fingerprint(scanned, MockHeavyBrep(), scale_to_m=1.0)
+        self.assertTrue(scanned.is_closed)
+        self.assertAlmostEqual(scanned.volume, 200.0, places=1)
+        self.assertTrue(any("Mass properties approximated" in w for w in scanned.preflight_warnings))
+
+    def test_scanner_heavy_mesh_guard(self):
+        """Tests that a Mesh with >30000 faces bypasses mesh area/volume integrals and uses bounding box fallback."""
+        import scanner as sc
+        scanner_inst = RhinoScanner()
+        scanned = ScannedObject("heavy-mesh-1")
+        scanned.dx = 5.0
+        scanned.dy = 5.0
+        scanned.dz = 3.0
+
+        class MockMesh(sc.rg.Mesh):
+            IsValid = True
+            IsClosed = True
+            class Faces(object):
+                Count = 50000
+            class Vertices(object):
+                Count = 25000
+
+        scanner_inst._compute_topology_fingerprint(scanned, MockMesh(), scale_to_m=1.0)
+        self.assertTrue(scanned.is_closed)
+        self.assertAlmostEqual(scanned.volume, 75.0, places=1)
+        self.assertTrue(any("Heavy mesh" in w for w in scanned.preflight_warnings))
+
+    def test_sync_engine_extensible_storage_filter(self):
+        """Tests that scan_revit_sync_records applies ExtensibleStorageFilter natively when available."""
+        import sync_engine
+        orig_revit = sync_engine.REVIT_AVAILABLE
+        orig_db = getattr(sync_engine, "DB", None)
+        try:
+            sync_engine.REVIT_AVAILABLE = True
+
+            filter_applied = []
+
+            class MockExtensibleStorageFilter(object):
+                def __init__(self, guid):
+                    self.guid = guid
+
+            class MockFilteredCollector(object):
+                def __init__(self, doc):
+                    self.doc = doc
+                def WherePasses(self, flt):
+                    filter_applied.append(flt)
+                    return self
+                def __iter__(self):
+                    return iter([])
+
+            class MockExtensibleStorage(object):
+                ExtensibleStorageFilter = MockExtensibleStorageFilter
+
+            class MockDB(object):
+                ExtensibleStorage = MockExtensibleStorage
+                FilteredElementCollector = MockFilteredCollector
+                CategoryType = type("CategoryType", (), {"Model": 1})
+
+            sync_engine.DB = MockDB
+
+            engine = sync_engine.SyncEngine(object())
+            engine.schema = type("MockSchema", (), {"GUID": "mock-guid-1234"})()
+            recs = engine.scan_revit_sync_records()
+
+            self.assertEqual(len(filter_applied), 1)
+            self.assertEqual(filter_applied[0].guid, "mock-guid-1234")
+            self.assertEqual(recs, {})
+        finally:
+            sync_engine.REVIT_AVAILABLE = orig_revit
+            if orig_db is not None:
+                sync_engine.DB = orig_db
+
 
 if __name__ == "__main__":
     unittest.main()

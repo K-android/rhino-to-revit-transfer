@@ -233,7 +233,26 @@ class RhinoScanner(object):
         settings.HiddenObjects = include_hidden
         settings.LockedObjects = include_locked
 
-        rhino_objects = list(self.doc.Objects.GetObjectList(settings))
+        # Filter for 3D physical transferable geometry types at C++ kernel level
+        # Skips annotations, dimensions, text, hatches, leaders, centermarks, point clouds, clipping planes
+        try:
+            settings.ObjectTypeFilter = (
+                rd.ObjectType.Brep |
+                rd.ObjectType.Extrusion |
+                rd.ObjectType.Mesh |
+                rd.ObjectType.Surface |
+                rd.ObjectType.SubD |
+                rd.ObjectType.Curve |
+                rd.ObjectType.InstanceReference
+            )
+        except Exception:
+            pass
+
+        try:
+            rhino_objects = list(self.doc.Objects.GetObjectList(settings))
+        except Exception as ex_enum:
+            self.preflight.warnings.append("Notice: Document object enumeration fallback triggered: {}".format(ex_enum))
+            rhino_objects = list(self.doc.Objects)
         scanned_list = []
         hash_registry = {}  # geo_hash -> ScannedObject for duplicate detection
 
@@ -244,28 +263,43 @@ class RhinoScanner(object):
         # Initial pass: gather raw objects and determine project height envelope
         valid_objs = []
         for obj in rhino_objects:
-            if not obj or not obj.Geometry:
+            if not obj:
                 continue
 
-            # Layer visibility / locked filter check
-            layer_idx = obj.Attributes.LayerIndex
-            layer = self.doc.Layers[layer_idx]
-            if not include_hidden and (not layer.IsVisible or obj.IsHidden):
-                continue
-            if not include_locked and (layer.IsLocked or obj.IsLocked):
-                continue
+            try:
+                # Safe layer validation check
+                layer_idx = obj.Attributes.LayerIndex
+                if layer_idx < 0 or layer_idx >= self.doc.Layers.Count:
+                    continue
+                layer = self.doc.Layers[layer_idx]
+                if not layer:
+                    continue
+                if not include_hidden and (not layer.IsVisible or obj.IsHidden):
+                    continue
+                if not include_locked and (layer.IsLocked or obj.IsLocked):
+                    continue
 
-            geom = obj.Geometry
-            bbox = geom.GetBoundingBox(True)
-            if not bbox.IsValid:
+                geom = obj.Geometry
+                if not geom:
+                    continue
+
+                # Skip invalid/corrupt geometry upfront to prevent OpenNURBS unmanaged C++ crashes
+                if not getattr(geom, "IsValid", True):
+                    self.preflight.warnings.append("Notice: Skipped invalid/corrupted object ID {}".format(getattr(obj, "Id", "Unknown")))
+                    continue
+
+                bbox = geom.GetBoundingBox(True)
+                if not bbox.IsValid:
+                    continue
+
+                if bbox.Min.Z < min_doc_z:
+                    min_doc_z = bbox.Min.Z
+                if bbox.Max.Z > max_doc_z:
+                    max_doc_z = bbox.Max.Z
+
+                valid_objs.append(obj)
+            except Exception:
                 continue
-
-            if bbox.Min.Z < min_doc_z:
-                min_doc_z = bbox.Min.Z
-            if bbox.Max.Z > max_doc_z:
-                max_doc_z = bbox.Max.Z
-
-            valid_objs.append(obj)
 
         total_height = max(1.0, max_doc_z - min_doc_z) if valid_objs else 1.0
 
@@ -392,12 +426,14 @@ class RhinoScanner(object):
             # Extract real 3D geometry from block definition for accurate conversion and volume
             try:
                 target_idef = instance_def if isinstance(obj, rd.InstanceObject) else (self.doc.InstanceDefinitions.FindId(geom.ParentIdefId) if hasattr(self.doc, "InstanceDefinitions") else None)
-                if target_idef and hasattr(target_idef, "GetObjects"):
+                if target_idef and not getattr(target_idef, "IsDeleted", False) and hasattr(target_idef, "GetObjects"):
                     sub_objs = target_idef.GetObjects()
                     if sub_objs and len(sub_objs) > 0:
                         for sub in sub_objs:
+                            if not sub:
+                                continue
                             sub_g = getattr(sub, "Geometry", None)
-                            if sub_g and isinstance(sub_g, (rg.Brep, rg.Mesh, rg.Extrusion, rg.Surface, rg.SubD)):
+                            if sub_g and getattr(sub_g, "IsValid", True) and isinstance(sub_g, (rg.Brep, rg.Mesh, rg.Extrusion, rg.Surface, rg.SubD)):
                                 dup = sub_g.Duplicate()
                                 if scanned.instance_transform and hasattr(dup, "Transform"):
                                     dup.Transform(scanned.instance_transform)
@@ -447,7 +483,7 @@ class RhinoScanner(object):
             )
 
         # Topological Fingerprinting
-        self._compute_topology_fingerprint(scanned, geom)
+        self._compute_topology_fingerprint(scanned, geom, scale_to_m)
 
         # Spatial Level Mapping
         self._compute_level_relationship(scanned, revit_levels)
@@ -460,87 +496,109 @@ class RhinoScanner(object):
 
         return scanned
 
-    def _compute_topology_fingerprint(self, scanned, geom):
-        """Analyzes topological orientation, thickness, planarity, and loop count."""
+    def _compute_topology_fingerprint(self, scanned, geom, scale_to_m=1.0):
+        """Analyzes topological orientation, thickness, planarity, and loop count with native C++ guards."""
+        try:
+            scale_to_m = float(scale_to_m) if scale_to_m else self.get_unit_scale_to_meters()
+        except Exception:
+            scale_to_m = 1.0
+
         # Brep / Extrusion
         working_brep = None
         if isinstance(geom, rg.Brep):
             working_brep = geom
         elif isinstance(geom, rg.Extrusion):
-            working_brep = geom.ToBrep()
+            try:
+                working_brep = geom.ToBrep()
+            except Exception:
+                working_brep = None
 
         if working_brep:
-            scanned.is_closed = bool(working_brep.IsSolid)
-            # Approximate volume and area
             try:
-                mp = rg.MassProperties.Compute(working_brep)
-                if mp:
-                    scanned.area = round(mp.Area, 3)
-                    scanned.volume = round(mp.Volume, 3) if working_brep.IsSolid else 0.0
+                is_valid_brep = bool(getattr(working_brep, "IsValid", True))
+                face_count = working_brep.Faces.Count if hasattr(working_brep, "Faces") else 0
             except Exception:
-                scanned.area = 0.0
-                scanned.volume = 0.0
+                is_valid_brep = False
+                face_count = 0
 
-            # Orientation analysis: inspect face normals
+            scanned.is_closed = bool(getattr(working_brep, "IsSolid", False))
+
+            # Approximate volume and area - SAFE OPENNURBS GUARDS
+            # Only run MassProperties.Compute if the Brep is valid and face count is reasonable (<= 1000)
+            if is_valid_brep and face_count <= 1000:
+                try:
+                    mp = rg.MassProperties.Compute(working_brep)
+                    if mp:
+                        scanned.area = round(mp.Area, 3)
+                        scanned.volume = round(mp.Volume, 3) if scanned.is_closed else 0.0
+                except Exception:
+                    scanned.area = 0.0
+                    scanned.volume = 0.0
+            else:
+                # Fast fallback for massive Breps (>1000 faces) or degenerate Breps: bounding box estimate
+                if scanned.is_closed:
+                    scanned.volume = round(scanned.dx * scanned.dy * scanned.dz, 3)
+                scanned.area = round(2.0 * (scanned.dx * scanned.dy + scanned.dy * scanned.dz + scanned.dx * scanned.dz), 3)
+                if face_count > 1000:
+                    scanned.preflight_warnings.append(
+                        "Complex Brep ({} faces): Mass properties approximated to prevent unmanaged OpenNURBS crash.".format(face_count)
+                    )
+
+            # Orientation analysis: inspect face normals safely (sample at most 50 faces)
             horiz_face_count = 0
             vert_face_count = 0
-            face_count = 0
+            sample_count = 0
             try:
-                face_count = working_brep.Faces.Count
-                for face in working_brep.Faces:
-                    # Sample center uv normal
-                    u_mid = 0.5 * (face.Domain(0).Min + face.Domain(0).Max)
-                    v_mid = 0.5 * (face.Domain(1).Min + face.Domain(1).Max)
-                    normal = face.NormalAt(u_mid, v_mid)
-                    normal.Unitize()
+                if face_count > 0:
+                    step = max(1, face_count // 50)
+                    for i in range(0, face_count, step):
+                        face = working_brep.Faces[i]
+                        sample_count += 1
+                        # Fast planar normal check first
+                        plane_success, plane = face.TryGetPlane(0.01) if hasattr(face, "TryGetPlane") else (False, None)
+                        if plane_success and plane:
+                            normal = plane.Normal
+                        else:
+                            d0 = face.Domain(0)
+                            d1 = face.Domain(1)
+                            if d0.Length <= 0 or d1.Length <= 0:
+                                continue
+                            u_mid = 0.5 * (d0.Min + d0.Max)
+                            v_mid = 0.5 * (d1.Min + d1.Max)
+                            normal = face.NormalAt(u_mid, v_mid)
 
-                    # Parallel to World Z (Horizontal plane)
-                    if abs(normal.Z) > 0.95:
-                        horiz_face_count += 1
-                    # Perpendicular to World Z (Vertical wall)
-                    elif abs(normal.Z) < 0.05:
-                        vert_face_count += 1
+                        if normal.Length > 0.0001:
+                            normal.Unitize()
+                            # Parallel to World Z (Horizontal plane)
+                            if abs(normal.Z) > 0.95:
+                                horiz_face_count += 1
+                            # Perpendicular to World Z (Vertical wall)
+                            elif abs(normal.Z) < 0.05:
+                                vert_face_count += 1
             except Exception:
                 pass
 
-            if face_count > 0:
-                scanned.is_horizontal = (horiz_face_count / float(face_count)) > 0.3 or (scanned.dz < min(scanned.dx, scanned.dy) * 0.4 and horiz_face_count >= 1)
-                scanned.is_vertical = (vert_face_count / float(face_count)) > 0.3 or (scanned.dz >= 1.5 and vert_face_count >= 1)
+            if sample_count > 0:
+                scanned.is_horizontal = (horiz_face_count / float(sample_count)) > 0.3 or (scanned.dz < min(scanned.dx, scanned.dy) * 0.4 and horiz_face_count >= 1)
+                scanned.is_vertical = (vert_face_count / float(sample_count)) > 0.3 or (scanned.dz >= 1.5 and vert_face_count >= 1)
 
-            # For solid 3D Breps (irregular/planar slabs and walls), extract architectural surface area
-            if working_brep.IsSolid and face_count > 1:
-                try:
-                    top_area = 0.0
-                    vert_area = 0.0
-                    for face in working_brep.Faces:
-                        u_mid = 0.5 * (face.Domain(0).Min + face.Domain(0).Max)
-                        v_mid = 0.5 * (face.Domain(1).Min + face.Domain(1).Max)
-                        norm = face.NormalAt(u_mid, v_mid)
-                        norm.Unitize()
-                        f_mp = rg.MassProperties.Compute(face)
-                        f_area = f_mp.Area if f_mp else 0.0
-                        if norm.Z > 0.5:
-                            top_area += f_area
-                        elif abs(norm.Z) < 0.3:
-                            vert_area += f_area
-                    if scanned.is_horizontal and top_area > 0:
-                        scanned.area = round(top_area, 3)
-                    elif scanned.is_vertical and vert_area > 0:
-                        scanned.area = round(vert_area / 2.0, 3)
-                except Exception:
-                    pass
+            # Architectural surface area adjustment for solid slabs/walls:
+            # Half of the total 3D Brep surface area is the standard architectural single-face area!
+            if scanned.is_closed and face_count > 1 and scanned.area > 0:
+                scanned.area = round(scanned.area / 2.0, 3)
 
             # Planarity check
             try:
-                scanned.is_planar = working_brep.Faces.Count == 1 and working_brep.Faces[0].IsPlanar(0.01)
+                scanned.is_planar = (face_count == 1) and bool(working_brep.Faces[0].IsPlanar(0.01))
             except Exception:
                 scanned.is_planar = False
 
-            # Loop count (outer + inner holes)
+            # Loop count (outer + inner holes) - guard against corrupt loop structures
             total_loops = 0
             try:
                 for face in working_brep.Faces:
-                    total_loops += face.Loops.Count
+                    if hasattr(face, "Loops"):
+                        total_loops += face.Loops.Count
             except Exception:
                 pass
             scanned.loop_count = total_loops
@@ -554,34 +612,50 @@ class RhinoScanner(object):
                 scanned.preflight_warnings.append("Non-manifold or open Brep edges detected.")
 
         elif isinstance(geom, rg.Mesh):
-            scanned.is_closed = bool(geom.IsClosed)
+            mesh_faces = geom.Faces.Count if hasattr(geom, "Faces") else 0
+            mesh_verts = geom.Vertices.Count if hasattr(geom, "Vertices") else 0
+            is_valid_mesh = bool(getattr(geom, "IsValid", True))
+            scanned.is_closed = bool(getattr(geom, "IsClosed", False))
             scanned.is_planar = False
-            try:
-                amp = rg.AreaMassProperties.Compute(geom)
-                scanned.area = round(amp.Area, 3) if amp else 0.0
-            except Exception:
-                scanned.area = 0.0
-            try:
-                if geom.IsClosed:
-                    vmp = rg.VolumeMassProperties.Compute(geom)
-                    scanned.volume = round(vmp.Volume, 3) if vmp else 0.0
-                else:
+
+            # Safe Mesh Mass Properties (cap at 30,000 faces to prevent OpenNURBS freeze/crash)
+            if is_valid_mesh and mesh_faces <= 30000:
+                try:
+                    amp = rg.AreaMassProperties.Compute(geom)
+                    scanned.area = round(amp.Area, 3) if amp else 0.0
+                except Exception:
+                    scanned.area = 0.0
+                try:
+                    if scanned.is_closed:
+                        vmp = rg.VolumeMassProperties.Compute(geom)
+                        scanned.volume = round(vmp.Volume, 3) if vmp else 0.0
+                    else:
+                        scanned.volume = 0.0
+                except Exception:
                     scanned.volume = 0.0
-            except Exception:
-                scanned.volume = 0.0
+            else:
+                # Heavy mesh fallback (> 30k faces or corrupted)
+                scanned.area = round(2.0 * (scanned.dx * scanned.dy + scanned.dy * scanned.dz + scanned.dx * scanned.dz), 3)
+                scanned.volume = round(scanned.dx * scanned.dy * scanned.dz, 3) if scanned.is_closed else 0.0
+                if mesh_faces > 30000:
+                    scanned.preflight_warnings.append(
+                        "Heavy mesh ({} faces): Mass properties approximated via bounding envelope to prevent crash.".format(mesh_faces)
+                    )
+
             scanned.thickness = min(scanned.dx, scanned.dy, scanned.dz)
-            scanned.repetition_signature = "Mesh_V{}_F{}".format(geom.Vertices.Count, geom.Faces.Count)
+            scanned.repetition_signature = "Mesh_V{}_F{}".format(mesh_verts, mesh_faces)
 
         elif isinstance(geom, rg.Curve):
-            scanned.is_closed = bool(geom.IsClosed)
+            is_valid_crv = bool(getattr(geom, "IsValid", True))
+            scanned.is_closed = bool(getattr(geom, "IsClosed", False))
             try:
-                scanned.is_planar = bool(geom.IsPlanar(0.001))
+                scanned.is_planar = bool(geom.IsPlanar(0.001)) if is_valid_crv else False
             except Exception:
                 scanned.is_planar = False
-            scanned.loop_count = 1 if geom.IsClosed else 0
+            scanned.loop_count = 1 if scanned.is_closed else 0
             scanned.area = 0.0
             scanned.volume = 0.0
-            if not geom.IsClosed:
+            if not scanned.is_closed:
                 scanned.has_open_loops = True
                 scanned.preflight_warnings.append("Open curve detected (cannot form closed boundary).")
 
@@ -848,10 +922,18 @@ class RhinoScanner(object):
             hasher.update(scanned.block_name.encode("utf-8"))
         elif geom is not None:
             if isinstance(geom, rg.Brep):
-                hasher.update("Faces{}_Edges{}".format(geom.Faces.Count, geom.Edges.Count).encode("utf-8"))
+                fc = geom.Faces.Count if hasattr(geom, "Faces") else 0
+                ec = geom.Edges.Count if hasattr(geom, "Edges") else 0
+                hasher.update("Faces{}_Edges{}".format(fc, ec).encode("utf-8"))
             elif isinstance(geom, rg.Mesh):
-                hasher.update("V{}_F{}".format(geom.Vertices.Count, geom.Faces.Count).encode("utf-8"))
+                vc = geom.Vertices.Count if hasattr(geom, "Vertices") else 0
+                fc = geom.Faces.Count if hasattr(geom, "Faces") else 0
+                hasher.update("V{}_F{}".format(vc, fc).encode("utf-8"))
             elif isinstance(geom, rg.Curve):
-                hasher.update("Len{:.2f}".format(geom.GetLength()).encode("utf-8"))
+                try:
+                    crv_len = geom.GetLength() if getattr(geom, "IsValid", True) else 0.0
+                except Exception:
+                    crv_len = 0.0
+                hasher.update("Len{:.2f}".format(crv_len).encode("utf-8"))
 
         return hasher.hexdigest()
