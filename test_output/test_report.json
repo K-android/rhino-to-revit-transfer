@@ -1,6 +1,6 @@
 {
   "project_name": "Architectural Project",
-  "timestamp": "2026-10-28 14:19:46",
+  "timestamp": "2026-10-28 19:34:47",
   "execution_mode": "Hybrid",
   "unit_system": "Meters",
   "preflight": {
@@ -21,7 +21,24 @@
     "rhino_slab_area_sqm": 250.0,
     "revit_floor_area_sqm": 250.0,
     "discrepancy_sqm": 0.0,
-    "discrepancy_pct": 0.0
+    "discrepancy_pct": 0.0,
+    "rhino_slab_volume_cum": 0.0,
+    "revit_floor_volume_cum": 0.0,
+    "floor_volume_discrepancy_pct": 0.0,
+    "rhino_wall_area_sqm": 0,
+    "revit_wall_area_sqm": 0,
+    "wall_area_discrepancy_pct": 0.0,
+    "rhino_wall_volume_cum": 0,
+    "revit_wall_volume_cum": 0,
+    "wall_volume_discrepancy_pct": 0.0,
+    "total_material_volume_cum": 0.0,
+    "material_takeoff": {
+      "Default": {
+        "total_volume_cum": 0.0,
+        "total_area_sqm": 250.0,
+        "element_count": 1
+      }
+    }
   },
   "elements": [
     {

@@ -1591,6 +1591,27 @@ class TestR2RPipeline(unittest.TestCase):
             self.assertAlmostEqual(params_set["R2R_Volume"], 85.0 / 0.028316846592, places=1)
             self.assertAlmostEqual(params_set["R2R_Material_Volume"], 85.0 / 0.028316846592, places=1)
             self.assertAlmostEqual(params_set["R2R_Thickness"], 0.45 / 0.3048, places=1)
+
+            # DirectShape fallback test: LookupParameter returns None, but Parameters collection search succeeds
+            params_set.clear()
+            class MockDirectShapeElem(object):
+                def __init__(self):
+                    self.Parameters = [
+                        MockParam("R2R_Area"),
+                        MockParam("R2R_Volume"),
+                        MockParam("R2R_Material")
+                    ]
+                def get_Parameter(self, arg):
+                    return None
+                def LookupParameter(self, name):
+                    return None
+
+            ds_elem = MockDirectShapeElem()
+            router._write_parameters_to_element(ds_elem, scanned, res)
+            self.assertIn("R2R_Area", params_set)
+            self.assertIn("R2R_Volume", params_set)
+            self.assertIn("R2R_Material", params_set)
+            self.assertEqual(params_set["R2R_Material"], "Carved Sandstone")
         finally:
             cr.REVIT_AVAILABLE = orig_revit
             if orig_db is not None:
@@ -1598,6 +1619,7 @@ class TestR2RPipeline(unittest.TestCase):
 
     def test_ensure_shared_parameters_bound(self):
         """Tests programmatic creation of shared parameter file and binding to model categories."""
+        import tempfile
         import conversion_router as cr
         orig_revit = cr.REVIT_AVAILABLE
         orig_db = getattr(cr, "DB", None)
@@ -1694,6 +1716,13 @@ class TestR2RPipeline(unittest.TestCase):
             self.assertEqual(inserted_bindings[0][0], "R2R_Area")
             self.assertEqual(inserted_bindings[1][0], "R2R_Volume")
             self.assertEqual(inserted_bindings[2][0], "R2R_Material")
+
+            # Verify UTF-16 LE file encoding with BOM required by Autodesk Revit API
+            sp_path = os.path.join(tempfile.gettempdir(), "R2R_SharedParameters.txt")
+            self.assertTrue(os.path.exists(sp_path))
+            with open(sp_path, "rb") as f:
+                header_bytes = f.read(2)
+                self.assertEqual(header_bytes, b'\xff\xfe')
         finally:
             cr.REVIT_AVAILABLE = orig_revit
             if orig_db is not None:

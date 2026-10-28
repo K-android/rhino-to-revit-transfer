@@ -2014,10 +2014,12 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         try:
             with DB.Transaction(self.revit_doc, "Bind R2R Shared Parameters") as trans_sp:
                 trans_sp.Start()
-                sp_bound = router.ensure_shared_parameters_bound()
+                sp_bound = router.ensure_shared_parameters_bound(log_fn=lambda msg: setattr(self.txt_exec_log, "Text", self.txt_exec_log.Text + msg + "\n"))
                 trans_sp.Commit()
                 if sp_bound:
                     self.txt_exec_log.Text += "Phase 2A: R2R Schedulable Shared Parameters successfully bound to model categories.\n"
+                else:
+                    self.txt_exec_log.Text += "Phase 2A Notice: Shared Parameters could not be bound to all categories; falling back to direct shape properties and Built-In Comments.\n"
         except Exception as ex_sp:
             self.txt_exec_log.Text += "Phase 2A Notice: Shared Parameter registration notice: {}. Continuing...\n".format(ex_sp)
 

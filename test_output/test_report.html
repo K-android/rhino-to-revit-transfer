@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>R2R Transfer QA & Validation Report</title>
+  <title>R2R Transfer QA & Material Takeoff Report</title>
   <style>
     :root {
       --bg: #0f141c;
@@ -34,32 +34,34 @@
     .meta { color: var(--text-muted); font-size: 14px; }
     .kpi-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 20px;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 18px;
       margin-bottom: 30px;
     }
     .kpi-card {
       background: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 20px;
+      padding: 18px;
       box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
     }
-    .kpi-title { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 8px; }
-    .kpi-value { font-size: 28px; font-weight: 700; color: #fff; }
+    .kpi-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 8px; }
+    .kpi-value { font-size: 24px; font-weight: 700; color: #fff; }
+    .kpi-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
     .kpi-value.green { color: var(--pass); }
     .kpi-value.amber { color: var(--warn); }
     .kpi-value.blue { color: var(--accent); }
+    .section-title { font-size: 16px; font-weight: 600; color: #fff; margin-top: 30px; margin-bottom: 12px; }
     .table-container {
       background: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 8px;
-      overflow: hidden;
-      margin-top: 25px;
+      overflow-x: auto;
+      margin-bottom: 25px;
     }
     table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
-    th { background: #1e293b; padding: 12px 16px; font-weight: 600; color: #cbd5e1; border-bottom: 1px solid var(--border); }
-    td { padding: 12px 16px; border-bottom: 1px solid #1e293b; }
+    th { background: #1e293b; padding: 12px 14px; font-weight: 600; color: #cbd5e1; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    td { padding: 10px 14px; border-bottom: 1px solid #1e293b; }
     tr:hover { background: #1a2638; }
     .badge-pass { background: rgba(34,197,94,0.15); color: var(--pass); padding: 4px 8px; border-radius: 4px; font-weight: 600; }
     .badge-warn { background: rgba(245,158,11,0.15); color: var(--warn); padding: 4px 8px; border-radius: 4px; font-weight: 600; }
@@ -71,8 +73,8 @@
 <body>
   <div class="header">
     <div>
-      <h1>R2R ONE-CLICK TRANSFER - QA & VALIDATION REPORT</h1>
-      <div class="meta">Project: Architectural Project | Mode: Hybrid | Generated: 2026-10-28 14:19:46</div>
+      <h1>R2R ONE-CLICK TRANSFER - QUANTITY TAKEOFF & QA AUDIT</h1>
+      <div class="meta">Project: Architectural Project | Mode: Hybrid | Unit System: Meters | Generated: 2026-10-28 19:34:47</div>
     </div>
     <div>
       <span class="badge-pass" style="font-size:14px; padding: 6px 12px;">SYSTEM READY</span>
@@ -81,32 +83,59 @@
 
   <div class="kpi-grid">
     <div class="kpi-card">
-      <div class="kpi-title">Total Scanned</div>
-      <div class="kpi-value">0</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-title">Created Elements</div>
+      <div class="kpi-title">Total Elements</div>
       <div class="kpi-value green">0</div>
+      <div class="kpi-sub">Scanned: 0 | Skipped: 0</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-title">Updated / Modified</div>
-      <div class="kpi-value blue">0</div>
+      <div class="kpi-title">Total Material Volume</div>
+      <div class="kpi-value blue">0.0 m³</div>
+      <div class="kpi-sub">Native Revit Solid Volume</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-title">Skipped (Unchanged)</div>
-      <div class="kpi-value">0</div>
+      <div class="kpi-title">Floor Slab Quantities</div>
+      <div class="kpi-value">250.0 m²</div>
+      <div class="kpi-sub">Volume: 0.0 m³ (Var: 0.0%)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-title">Wall Quantities</div>
+      <div class="kpi-value">0 m²</div>
+      <div class="kpi-sub">Volume: 0 m³</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-title">Review / Warnings</div>
       <div class="kpi-value amber">0</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-title">BUA Area Variance</div>
-      <div class="kpi-value">0.0%</div>
+      <div class="kpi-sub">Exceptions requiring audit</div>
     </div>
   </div>
 
-  <h3>Dual-Status Verification & View Graphics Audit</h3>
+  <div class="section-title">Compound Material Takeoff Schedule</div>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Material Name</th>
+          <th>Element Count</th>
+          <th>Total Surface Area (m²)</th>
+          <th>Total Material Volume (m³)</th>
+          <th>Share of Total Volume</th>
+        </tr>
+      </thead>
+      <tbody>
+
+            <tr>
+              <td><strong>Default</strong></td>
+              <td>1</td>
+              <td>250.00 m²</td>
+              <td><strong style="color: var(--accent);">0.00 m³</strong></td>
+              <td><span class="category-pill">0.0%</span></td>
+            </tr>
+            
+      </tbody>
+    </table>
+  </div>
+
+  <div class="section-title">Element-by-Element Volumetric & Dual-Status Audit</div>
   <div class="table-container">
     <table>
       <thead>
@@ -116,11 +145,15 @@
           <th>Layer</th>
           <th>Category</th>
           <th>Strategy</th>
-          <th>Sync State</th>
-          <th>Confidence</th>
-          <th>Overall Status</th>
-          <th>Plan View</th>
-          <th>Section View</th>
+          <th>Sync</th>
+          <th>Conf</th>
+          <th>Overall</th>
+          <th>Area (m²)</th>
+          <th>Volume (m³)</th>
+          <th>Primary Material</th>
+          <th>Material Vol</th>
+          <th>Plan</th>
+          <th>Section</th>
           <th>Issues / Notes</th>
         </tr>
       </thead>
@@ -135,6 +168,10 @@
               <td>CREATE</td>
               <td><strong>95.0%</strong></td>
               <td><span class="badge-pass">COMPLETE</span></td>
+              <td>250.00 m²</td>
+              <td><strong style="color: var(--accent);">0.00 m³</strong></td>
+              <td>-</td>
+              <td>0.00 m³</td>
               <td><span class="badge-pass">PASS</span></td>
               <td><span class="badge-pass">PASS</span></td>
               <td>None</td>

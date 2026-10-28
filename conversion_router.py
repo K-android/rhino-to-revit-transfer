@@ -37,13 +37,8 @@ try:
     clr.AddReference("System.Collections")
     import System
     from System.Collections.Generic import List
-
-    # RhinoCommon
-    import Rhino
-    import Rhino.Geometry as rg
-    RHINO_AVAILABLE = True
-except (ImportError, Exception):
-    RHINO_AVAILABLE = False
+except Exception:
+    System = None
     class _MockGenericList(object):
         def __getitem__(self, item):
             class _TypedList(list):
@@ -54,6 +49,14 @@ except (ImportError, Exception):
                     return len(self)
             return _TypedList
     List = _MockGenericList()
+
+try:
+    # RhinoCommon
+    import Rhino
+    import Rhino.Geometry as rg
+    RHINO_AVAILABLE = True
+except (ImportError, Exception):
+    RHINO_AVAILABLE = False
 
 try:
     # Revit API
@@ -79,6 +82,20 @@ except (ImportError, ValueError):
     except Exception:
         FamilyFactory = None
         FamilyLoadOptions = None
+
+R2R_PARAM_GUIDS = {
+    "R2R_Area": "e1a2b3c4-1111-2222-3333-444455550001",
+    "R2R_Volume": "e1a2b3c4-1111-2222-3333-444455550002",
+    "R2R_Material": "e1a2b3c4-1111-2222-3333-444455550003",
+    "R2R_Material_Volume": "e1a2b3c4-1111-2222-3333-444455550004",
+    "R2R_Source_Layer": "e1a2b3c4-1111-2222-3333-444455550005",
+    "R2R_Rhino_GUID": "e1a2b3c4-1111-2222-3333-444455550006",
+    "R2R_Thickness": "e1a2b3c4-1111-2222-3333-444455550007",
+    "R2R_Building_Zone": "e1a2b3c4-1111-2222-3333-444455550008",
+    "R2R_Category": "e1a2b3c4-1111-2222-3333-444455550009",
+    "R2R_Area_sqm": "e1a2b3c4-1111-2222-3333-444455550010",
+    "R2R_Volume_cum": "e1a2b3c4-1111-2222-3333-444455550011",
+}
 
 
 class TransferFailuresPreprocessor(DB.IFailuresPreprocessor if REVIT_AVAILABLE else object):
@@ -2241,70 +2258,160 @@ class ConversionRouter(object):
         st_cls = getattr(DB, "StorageType", None)
         st_str = getattr(st_cls, "String", None)
         st_dbl = getattr(st_cls, "Double", None)
+        st_int = getattr(st_cls, "Integer", None)
 
+        params_set_count = 0
         for p_name, p_val in param_assignments:
             try:
-                p_obj = created_elem.LookupParameter(p_name)
+                p_obj = None
+                p_guid = R2R_PARAM_GUIDS.get(p_name)
+                # Tier 1: Look up by GUID (Language-agnostic and most reliable for DirectShapes)
+                sys_obj = globals().get("System")
+                if p_guid and sys_obj and hasattr(sys_obj, "Guid"):
+                    try:
+                        p_obj = created_elem.get_Parameter(sys_obj.Guid(p_guid))
+                    except Exception:
+                        p_obj = None
+
+                # Tier 2: LookupParameter by display name
+                if not p_obj and hasattr(created_elem, "LookupParameter"):
+                    try:
+                        p_obj = created_elem.LookupParameter(p_name)
+                    except Exception:
+                        p_obj = None
+
+                # Tier 3: Search all parameters on element if still unresolved
+                if not p_obj and hasattr(created_elem, "Parameters"):
+                    try:
+                        for p in created_elem.Parameters:
+                            p_def = getattr(p, "Definition", None)
+                            cand_name = getattr(p_def, "Name", "") if p_def else getattr(p, "name", "")
+                            if cand_name == p_name:
+                                p_obj = p
+                                break
+                    except Exception:
+                        pass
+
                 if p_obj and not p_obj.IsReadOnly:
                     st = getattr(p_obj, "StorageType", None)
                     if (st is not None and st == st_str) or isinstance(p_val, str):
                         p_obj.Set(str(p_val))
+                        params_set_count += 1
                     elif (st is not None and st == st_dbl) or isinstance(p_val, (int, float)):
                         p_obj.Set(float(p_val))
+                        params_set_count += 1
+                    elif st is not None and st == st_int:
+                        p_obj.Set(int(p_val))
+                        params_set_count += 1
                     else:
                         try:
                             p_obj.Set(float(p_val))
+                            params_set_count += 1
                         except Exception:
-                            p_obj.Set(str(p_val))
+                            try:
+                                p_obj.Set(str(p_val))
+                                params_set_count += 1
+                            except Exception:
+                                pass
             except Exception:
                 pass
 
-    def ensure_shared_parameters_bound(self):
+        res.parameters_written_count = params_set_count
+
+    def ensure_shared_parameters_bound(self, log_fn=None):
         """Binds R2R Shared Parameters to target categories in active Revit document for scheduling.
 
         Uses deterministic GUIDs to ensure parameters appear in Revit Schedule Fields.
         Must be executed inside an active Revit Transaction.
         """
         if not REVIT_AVAILABLE or not self.doc or not hasattr(self.doc, "Application"):
+            if log_fn:
+                log_fn("[R2R Bind Notice]: Revit document or Application unavailable.")
             return False
 
         app = self.doc.Application
         orig_sp_path = getattr(app, "SharedParametersFilename", "")
         sp_temp_path = os.path.join(tempfile.gettempdir(), "R2R_SharedParameters.txt")
 
-        # Deterministic Shared Parameter definition file format (standard 9 tab-separated columns)
-        sp_content = (
-            "# This is a Revit shared parameter file.\n"
-            "# Do not edit manually.\n"
-            "*META\tVERSION\tMINVERS\n"
-            "META\t2\t1\n"
-            "*GROUP\tID\tNAME\n"
-            "GROUP\t1\tRhinoToRevit\n"
-            "*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE\n"
-            "PARAM\te1a2b3c4-1111-2222-3333-444455550001\tR2R_Area\tAREA\t\t1\t1\tR2R Computed Surface Area\t1\n"
-            "PARAM\te1a2b3c4-1111-2222-3333-444455550002\tR2R_Volume\tVOLUME\t\t1\t1\tR2R Computed Solid Volume\t1\n"
-            "PARAM\te1a2b3c4-1111-2222-3333-444455550003\tR2R_Material\tTEXT\t\t1\t1\tR2R Material Takeoff Name\t1\n"
-            "PARAM\te1a2b3c4-1111-2222-3333-444455550004\tR2R_Material_Volume\tVOLUME\t\t1\t1\tR2R Material Takeoff Volume\t1\n"
-            "PARAM\te1a2b3c4-1111-2222-3333-444455550005\tR2R_Source_Layer\tTEXT\t\t1\t1\tR2R Source Rhino Layer\t1\n"
-            "PARAM\te1a2b3c4-1111-2222-3333-444455550006\tR2R_Rhino_GUID\tTEXT\t\t1\t1\tR2R Source Rhino Object GUID\t1\n"
-            "PARAM\te1a2b3c4-1111-2222-3333-444455550007\tR2R_Thickness\tLENGTH\t\t1\t1\tR2R Structural Thickness\t1\n"
-            "PARAM\te1a2b3c4-1111-2222-3333-444455550008\tR2R_Building_Zone\tTEXT\t\t1\t1\tR2R Building Zone\t1\n"
-            "PARAM\te1a2b3c4-1111-2222-3333-444455550009\tR2R_Category\tTEXT\t\t1\t1\tR2R Inferred Revit Category\t1\n"
-            "PARAM\te1a2b3c4-1111-2222-3333-444455550010\tR2R_Area_sqm\tTEXT\t\t1\t1\tR2R Area in sqm\t1\n"
-            "PARAM\te1a2b3c4-1111-2222-3333-444455550011\tR2R_Volume_cum\tTEXT\t\t1\t1\tR2R Volume in cum\t1\n"
-        )
+        # Determine Revit release year for 10-column (2022+) vs 9-column (<2022) format
+        revit_year = 2024
+        try:
+            ver_str = getattr(app, "VersionNumber", "2024")
+            revit_year = int(re.sub(r'[^0-9]', '', str(ver_str)) or "2024")
+        except Exception:
+            revit_year = 2024
+
+        use_10_cols = (revit_year >= 2022)
+
+        if use_10_cols:
+            sp_content = (
+                "# This is a Revit shared parameter file.\n"
+                "# Do not edit manually.\n"
+                "*META\tVERSION\tMINVERS\n"
+                "META\t2\t1\n"
+                "*GROUP\tID\tNAME\n"
+                "GROUP\t1\tRhinoToRevit\n"
+                "*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE\tHIDEWHENNOVALUE\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550001\tR2R_Area\tAREA\t\t1\t1\tR2R Computed Surface Area\t1\t0\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550002\tR2R_Volume\tVOLUME\t\t1\t1\tR2R Computed Solid Volume\t1\t0\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550003\tR2R_Material\tTEXT\t\t1\t1\tR2R Material Takeoff Name\t1\t0\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550004\tR2R_Material_Volume\tVOLUME\t\t1\t1\tR2R Material Takeoff Volume\t1\t0\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550005\tR2R_Source_Layer\tTEXT\t\t1\t1\tR2R Source Rhino Layer\t1\t0\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550006\tR2R_Rhino_GUID\tTEXT\t\t1\t1\tR2R Source Rhino Object GUID\t1\t0\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550007\tR2R_Thickness\tLENGTH\t\t1\t1\tR2R Structural Thickness\t1\t0\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550008\tR2R_Building_Zone\tTEXT\t\t1\t1\tR2R Building Zone\t1\t0\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550009\tR2R_Category\tTEXT\t\t1\t1\tR2R Inferred Revit Category\t1\t0\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550010\tR2R_Area_sqm\tTEXT\t\t1\t1\tR2R Area in sqm\t1\t0\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550011\tR2R_Volume_cum\tTEXT\t\t1\t1\tR2R Volume in cum\t1\t0\n"
+            )
+        else:
+            sp_content = (
+                "# This is a Revit shared parameter file.\n"
+                "# Do not edit manually.\n"
+                "*META\tVERSION\tMINVERS\n"
+                "META\t2\t1\n"
+                "*GROUP\tID\tNAME\n"
+                "GROUP\t1\tRhinoToRevit\n"
+                "*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550001\tR2R_Area\tAREA\t\t1\t1\tR2R Computed Surface Area\t1\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550002\tR2R_Volume\tVOLUME\t\t1\t1\tR2R Computed Solid Volume\t1\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550003\tR2R_Material\tTEXT\t\t1\t1\tR2R Material Takeoff Name\t1\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550004\tR2R_Material_Volume\tVOLUME\t\t1\t1\tR2R Material Takeoff Volume\t1\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550005\tR2R_Source_Layer\tTEXT\t\t1\t1\tR2R Source Rhino Layer\t1\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550006\tR2R_Rhino_GUID\tTEXT\t\t1\t1\tR2R Source Rhino Object GUID\t1\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550007\tR2R_Thickness\tLENGTH\t\t1\t1\tR2R Structural Thickness\t1\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550008\tR2R_Building_Zone\tTEXT\t\t1\t1\tR2R Building Zone\t1\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550009\tR2R_Category\tTEXT\t\t1\t1\tR2R Inferred Revit Category\t1\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550010\tR2R_Area_sqm\tTEXT\t\t1\t1\tR2R Area in sqm\t1\n"
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550011\tR2R_Volume_cum\tTEXT\t\t1\t1\tR2R Volume in cum\t1\n"
+            )
 
         try:
-            with open(sp_temp_path, "w") as f:
-                f.write(sp_content)
+            # Write shared parameter file with strict UTF-16 LE encoding with BOM
+            if sys.version_info[0] >= 3:
+                with open(sp_temp_path, "w", encoding="utf-16") as f:
+                    f.write(sp_content)
+            else:
+                import codecs
+                with codecs.open(sp_temp_path, "w", encoding="utf-16") as f:
+                    f.write(unicode(sp_content))
 
-            app.SharedParametersFilename = sp_temp_path
+            app.SharedParametersFilename = os.path.abspath(sp_temp_path)
             sp_file = app.OpenSharedParameterFile()
             if not sp_file:
+                if log_fn:
+                    log_fn("[SharedParams] Warning: OpenSharedParameterFile returned null.")
                 return False
 
             grp = sp_file.Groups.get_Item("RhinoToRevit")
             if not grp:
+                try:
+                    grp = sp_file.Groups.Create("RhinoToRevit")
+                except Exception:
+                    grp = None
+            if not grp:
+                if log_fn:
+                    log_fn("[SharedParams] Warning: Group 'RhinoToRevit' unavailable.")
                 return False
 
             # Model categories to bind
@@ -2317,84 +2424,142 @@ class ConversionRouter(object):
                 DB.BuiltInCategory.OST_Columns,
                 DB.BuiltInCategory.OST_StructuralColumns,
                 DB.BuiltInCategory.OST_StructuralFraming,
-                DB.BuiltInCategory.OST_Mass,
-                DB.BuiltInCategory.OST_Site,
-                DB.BuiltInCategory.OST_Topography,
-                DB.BuiltInCategory.OST_SpecialityEquipment,
-                DB.BuiltInCategory.OST_Furniture
+                DB.BuiltInCategory.OST_Mass
             ]
             if hasattr(DB.BuiltInCategory, "OST_Toposolid"):
                 target_bics.append(DB.BuiltInCategory.OST_Toposolid)
 
             cat_set = app.Create.NewCategorySet()
             for bic in target_bics:
-                cat = None
                 try:
+                    cat = None
                     if hasattr(DB, "Category") and hasattr(DB.Category, "GetCategory"):
-                        cat = DB.Category.GetCategory(self.doc, bic)
+                        try:
+                            cat = DB.Category.GetCategory(self.doc, bic)
+                        except Exception:
+                            cat = None
+                    if not cat:
+                        try:
+                            cat = self.doc.Settings.Categories.get_Item(bic)
+                        except Exception:
+                            cat = None
+                    if not cat and hasattr(DB, "ElementId"):
+                        try:
+                            cat = DB.Category.GetCategory(self.doc, DB.ElementId(bic))
+                        except Exception:
+                            cat = None
+                    if cat and getattr(cat, "AllowsBoundParameters", False):
+                        cat_set.Insert(cat)
                 except Exception:
                     pass
-                if not cat:
-                    try:
-                        cat = self.doc.Settings.Categories.get_Item(bic)
-                    except Exception:
-                        pass
-                if not cat and hasattr(DB, "ElementId"):
-                    try:
-                        cat = DB.Category.GetCategory(self.doc, DB.ElementId(bic))
-                    except Exception:
-                        pass
-                if cat and getattr(cat, "AllowsBoundParameters", True):
-                    cat_set.Insert(cat)
 
             # Fallback if cat_set is still empty: scan Document Categories directly
-            cats_obj = getattr(getattr(self.doc, "Settings", None), "Categories", None)
-            if getattr(cat_set, "Size", 0) == 0 and cats_obj and not isinstance(cats_obj, type) and hasattr(cats_obj, "__iter__"):
-                for cat in cats_obj:
-                    try:
-                        if cat and getattr(cat, "AllowsBoundParameters", True):
-                            cat_id = getattr(cat, "Id", None)
-                            bic_val = getattr(cat_id, "IntegerValue", None) if cat_id else None
-                            if bic_val in [int(b) for b in target_bics if hasattr(b, "__int__") or isinstance(b, (int, float))]:
-                                cat_set.Insert(cat)
-                    except Exception:
-                        pass
+            if getattr(cat_set, "Size", 0) == 0:
+                cats_obj = getattr(getattr(self.doc, "Settings", None), "Categories", None)
+                if cats_obj and not isinstance(cats_obj, type) and hasattr(cats_obj, "__iter__"):
+                    for cat in cats_obj:
+                        try:
+                            if cat and getattr(cat, "AllowsBoundParameters", False):
+                                cat_id = getattr(cat, "Id", None)
+                                bic_val = None
+                                if hasattr(cat_id, "Value"):
+                                    bic_val = int(cat_id.Value)
+                                elif hasattr(cat_id, "IntegerValue"):
+                                    bic_val = int(cat_id.IntegerValue)
+                                if bic_val in [int(b) for b in target_bics if hasattr(b, "__int__") or isinstance(b, (int, float))]:
+                                    cat_set.Insert(cat)
+                        except Exception:
+                            pass
 
             # Parameter group in properties palette (supports Revit 2024+ GroupTypeId and 2020-2023 BuiltInParameterGroup)
-            p_group = getattr(DB.BuiltInParameterGroup, "PG_GEOMETRY", None)
-            if not p_group and hasattr(DB.BuiltInParameterGroup, "PG_DATA"):
-                p_group = DB.BuiltInParameterGroup.PG_DATA
+            p_group = getattr(DB.BuiltInParameterGroup, "PG_DATA", None)
+            if not p_group and hasattr(DB.BuiltInParameterGroup, "PG_GEOMETRY"):
+                p_group = DB.BuiltInParameterGroup.PG_GEOMETRY
 
             group_type = None
-            if hasattr(DB, "GroupTypeId") and hasattr(DB.GroupTypeId, "Geometry"):
-                group_type = DB.GroupTypeId.Geometry
-            elif hasattr(DB, "GroupTypeId") and hasattr(DB.GroupTypeId, "Data"):
+            if hasattr(DB, "GroupTypeId") and hasattr(DB.GroupTypeId, "Data"):
                 group_type = DB.GroupTypeId.Data
+            elif hasattr(DB, "GroupTypeId") and hasattr(DB.GroupTypeId, "Geometry"):
+                group_type = DB.GroupTypeId.Geometry
             else:
                 group_type = p_group
 
             binding_map = self.doc.ParameterBindings
+            bound_count = 0
             for def_obj in grp.Definitions:
-                try:
-                    new_binding = app.Create.NewInstanceBinding(cat_set)
-                    if binding_map.Contains(def_obj):
-                        try:
-                            binding_map.ReInsert(def_obj, new_binding, group_type)
-                        except Exception:
+                bound_this = False
+                # Attempt 1: Multi-category binding
+                if getattr(cat_set, "Size", 0) > 0:
+                    try:
+                        new_binding = app.Create.NewInstanceBinding(cat_set)
+                        if binding_map.Contains(def_obj):
                             try:
-                                binding_map.ReInsert(def_obj, new_binding, p_group)
+                                binding_map.ReInsert(def_obj, new_binding, group_type)
+                                bound_this = True
                             except Exception:
-                                pass
-                    else:
-                        try:
-                            binding_map.Insert(def_obj, new_binding, group_type)
-                        except Exception:
-                            binding_map.Insert(def_obj, new_binding, p_group)
-                except Exception as ex_bind:
-                    print("[R2R Bind Notice]: {}".format(ex_bind))
+                                try:
+                                    binding_map.ReInsert(def_obj, new_binding, p_group)
+                                    bound_this = True
+                                except Exception:
+                                    pass
+                        else:
+                            try:
+                                binding_map.Insert(def_obj, new_binding, group_type)
+                                bound_this = True
+                            except Exception:
+                                try:
+                                    binding_map.Insert(def_obj, new_binding, p_group)
+                                    bound_this = True
+                                except Exception:
+                                    pass
+                    except Exception as ex_b:
+                        pass
 
-            return True
+                # Attempt 2: Resilient Single-Category Fallback (Directly binds to OST_GenericModel for cave DirectShapes)
+                if not bound_this:
+                    try:
+                        gm_cat = None
+                        if hasattr(DB, "Category") and hasattr(DB.Category, "GetCategory"):
+                            try:
+                                gm_cat = DB.Category.GetCategory(self.doc, DB.BuiltInCategory.OST_GenericModel)
+                            except Exception:
+                                gm_cat = None
+                        if not gm_cat:
+                            try:
+                                gm_cat = self.doc.Settings.Categories.get_Item(DB.BuiltInCategory.OST_GenericModel)
+                            except Exception:
+                                gm_cat = None
+                        if gm_cat:
+                            gm_set = app.Create.NewCategorySet()
+                            gm_set.Insert(gm_cat)
+                            gm_binding = app.Create.NewInstanceBinding(gm_set)
+                            if binding_map.Contains(def_obj):
+                                try:
+                                    binding_map.ReInsert(def_obj, gm_binding, group_type)
+                                    bound_this = True
+                                except Exception:
+                                    binding_map.ReInsert(def_obj, gm_binding, p_group)
+                                    bound_this = True
+                            else:
+                                try:
+                                    binding_map.Insert(def_obj, gm_binding, group_type)
+                                    bound_this = True
+                                except Exception:
+                                    binding_map.Insert(def_obj, gm_binding, p_group)
+                                    bound_this = True
+                    except Exception:
+                        pass
+
+                if bound_this:
+                    bound_count += 1
+
+            if log_fn:
+                log_fn("[SharedParams] Bound {} shared parameter definitions to document.".format(bound_count))
+
+            return bound_count > 0
         except Exception as ex:
+            if log_fn:
+                log_fn("[SharedParams Error]: {}".format(ex))
             print("[R2R Shared Parameters Binding Notice]: {}".format(ex))
             return False
         finally:
@@ -2422,17 +2587,19 @@ class ConversionRouter(object):
                     break
 
             if not sched:
-                # Determine category: Multi-Category (InvalidElementId) or specific BuiltInCategory
+                # Determine category: specific BuiltInCategory, or OST_GenericModel (primary for DirectShapes/Caves),
+                # or Multi-Category fallback
                 if category_bic is not None:
                     cat_id = DB.ElementId(category_bic)
                 else:
-                    cat_id = DB.ElementId.InvalidElementId  # Multi-Category Schedule
+                    # Generic Model schedule is the most robust and universal container for DirectShape cave takeoffs
+                    cat_id = DB.ElementId(DB.BuiltInCategory.OST_GenericModel)
 
                 try:
                     sched = DB.ViewSchedule.CreateSchedule(self.doc, cat_id)
                 except Exception:
-                    # Fallback to Generic Models if Multi-Category creation fails
-                    cat_id = DB.ElementId(DB.BuiltInCategory.OST_GenericModel)
+                    # Fallback to Multi-Category if specific category creation fails
+                    cat_id = DB.ElementId.InvalidElementId
                     sched = DB.ViewSchedule.CreateSchedule(self.doc, cat_id)
 
                 if not sched:
@@ -2443,7 +2610,7 @@ class ConversionRouter(object):
             sched_def = sched.Definition
             available_fields = sched_def.GetSchedulableFields()
 
-            # Inspect existing fields in the schedule
+            # Inspect existing fields currently present in the schedule
             existing_field_names = set()
             try:
                 if hasattr(sched_def, "GetFieldCount") and hasattr(sched_def, "GetField"):
@@ -2470,10 +2637,16 @@ class ConversionRouter(object):
             ]
 
             field_by_name = {}
+            field_by_guid = {}
             for sf in available_fields:
                 try:
                     f_name = sf.GetName(self.doc)
                     field_by_name[f_name] = sf
+                    pid = getattr(sf, "ParameterId", None)
+                    if pid and self.doc and hasattr(self.doc, "GetElement"):
+                        pelem = self.doc.GetElement(pid)
+                        if pelem and hasattr(pelem, "GuidValue"):
+                            field_by_guid[str(pelem.GuidValue)] = sf
                 except Exception:
                     pass
 
@@ -2481,32 +2654,31 @@ class ConversionRouter(object):
             for field_name in desired_order:
                 if field_name in existing_field_names:
                     continue  # Already present in schedule
+
+                sf_to_add = None
                 if field_name in field_by_name:
+                    sf_to_add = field_by_name[field_name]
+                elif field_name in R2R_PARAM_GUIDS and R2R_PARAM_GUIDS[field_name] in field_by_guid:
+                    sf_to_add = field_by_guid[R2R_PARAM_GUIDS[field_name]]
+                elif field_name == "Mark":
+                    for sf in available_fields:
+                        if getattr(sf, "ParameterId", None) == DB.ElementId(DB.BuiltInParameter.ALL_MODEL_MARK):
+                            sf_to_add = sf
+                            break
+                elif field_name == "Comments":
+                    for sf in available_fields:
+                        if getattr(sf, "ParameterId", None) == DB.ElementId(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS):
+                            sf_to_add = sf
+                            break
+
+                if sf_to_add:
                     try:
-                        added_sf = sched_def.AddField(field_by_name[field_name])
+                        added_sf = sched_def.AddField(sf_to_add)
                         added_fields.append((field_name, added_sf))
                     except Exception:
                         pass
-                elif field_name == "Mark" and "Mark" not in existing_field_names:
-                    for sf in available_fields:
-                        if getattr(sf, "ParameterId", None) == DB.ElementId(DB.BuiltInParameter.ALL_MODEL_MARK):
-                            try:
-                                added_sf = sched_def.AddField(sf)
-                                added_fields.append(("Mark", added_sf))
-                            except Exception:
-                                pass
-                            break
-                elif field_name == "Comments" and "Comments" not in existing_field_names:
-                    for sf in available_fields:
-                        if getattr(sf, "ParameterId", None) == DB.ElementId(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS):
-                            try:
-                                added_sf = sched_def.AddField(sf)
-                                added_fields.append(("Comments", added_sf))
-                            except Exception:
-                                pass
-                            break
 
-            # Enable 'Calculate Totals' on Area, Volume, and Material Volume columns directly
+            # Enable 'Calculate Totals' on numeric quantity fields
             for f_name, sf_obj in added_fields:
                 if f_name in ("R2R_Area", "R2R_Volume", "R2R_Material_Volume"):
                     try:
@@ -2515,7 +2687,7 @@ class ConversionRouter(object):
                     except Exception:
                         pass
 
-            # Also enable on all fields in definition if GetFieldCount is available
+            # Also ensure CalculateTotals is active for any existing columns in schedule definition
             try:
                 if hasattr(sched_def, "GetFieldCount") and hasattr(sched_def, "GetField"):
                     for i in range(sched_def.GetFieldCount()):
