@@ -1574,8 +1574,10 @@ class ConversionRouter(object):
         # Resolve material before converting geometry so tessellated faces receive the material ID
         mat_id = None
         mat_name = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
+        obj_color = getattr(scanned_obj, "object_color", None)
+        color_rgb = (int(obj_color[0]), int(obj_color[1]), int(obj_color[2])) if (obj_color and len(obj_color) >= 3) else None
         if mat_name:
-            mat_id = self._get_or_create_material(mat_name)
+            mat_id = self._get_or_create_material(mat_name, color_rgb=color_rgb)
 
         # Convert Rhino geometry to Revit DB.GeometryObject without double scaling
         revit_geoms = self._convert_rhino_to_revit_geometry(scanned_obj.raw_geometry, geom_feet=geom_feet, material_id=mat_id)
@@ -1849,8 +1851,8 @@ class ConversionRouter(object):
                 arr.Append(c)
         return arr
 
-    def _get_or_create_material(self, material_name):
-        """Retrieves existing Material by name or creates a new one in the Revit document."""
+    def _get_or_create_material(self, material_name, color_rgb=None):
+        """Retrieves existing Material by name or creates a new one in the Revit document with matching color."""
         if not REVIT_AVAILABLE or not self.doc or not material_name:
             return None
 
@@ -1866,7 +1868,15 @@ class ConversionRouter(object):
 
             # Create new Material if not found
             if hasattr(DB, "Material") and hasattr(DB.Material, "Create"):
-                return DB.Material.Create(self.doc, clean_name)
+                new_mat_id = DB.Material.Create(self.doc, clean_name)
+                if color_rgb and new_mat_id and hasattr(DB, "Color"):
+                    try:
+                        new_mat = self.doc.GetElement(new_mat_id)
+                        if new_mat and hasattr(new_mat, "Color"):
+                            new_mat.Color = DB.Color(int(color_rgb[0]), int(color_rgb[1]), int(color_rgb[2]))
+                    except Exception:
+                        pass
+                return new_mat_id
         except Exception:
             pass
         return None
