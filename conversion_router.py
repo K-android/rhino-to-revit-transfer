@@ -28,6 +28,7 @@ import sys
 import os
 import re
 import math
+import tempfile
 import traceback
 
 try:
@@ -1570,8 +1571,14 @@ class ConversionRouter(object):
             except Exception:
                 pass
 
+        # Resolve material before converting geometry so tessellated faces receive the material ID
+        mat_id = None
+        mat_name = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
+        if mat_name:
+            mat_id = self._get_or_create_material(mat_name)
+
         # Convert Rhino geometry to Revit DB.GeometryObject without double scaling
-        revit_geoms = self._convert_rhino_to_revit_geometry(scanned_obj.raw_geometry, geom_feet=geom_feet)
+        revit_geoms = self._convert_rhino_to_revit_geometry(scanned_obj.raw_geometry, geom_feet=geom_feet, material_id=mat_id)
         if not revit_geoms or len(revit_geoms) == 0:
             if res:
                 res.status = "FAILED"
@@ -1589,16 +1596,13 @@ class ConversionRouter(object):
             name_param.Set(name)
 
         # Assign Material to DirectShape for scheduling and visual fidelity
-        mat_name = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
-        if mat_name:
-            mat_id = self._get_or_create_material(mat_name)
-            if mat_id and mat_id != DB.ElementId.InvalidElementId:
-                p_mat = ds.get_Parameter(DB.BuiltInParameter.MATERIAL_ID_PARAM)
-                if p_mat and not p_mat.IsReadOnly:
-                    try:
-                        p_mat.Set(mat_id)
-                    except Exception:
-                        pass
+        if mat_id and mat_id != DB.ElementId.InvalidElementId:
+            p_mat = ds.get_Parameter(DB.BuiltInParameter.MATERIAL_ID_PARAM)
+            if p_mat and not p_mat.IsReadOnly:
+                try:
+                    p_mat.Set(mat_id)
+                except Exception:
+                    pass
 
         return ds
 
@@ -1705,7 +1709,7 @@ class ConversionRouter(object):
     # =========================================================================
     # Geometry Helpers & Encoders
     # =========================================================================
-    def _convert_rhino_to_revit_geometry(self, rh_geom, geom_feet=None):
+    def _convert_rhino_to_revit_geometry(self, rh_geom, geom_feet=None, material_id=None):
         """Converts Rhino Brep, Extrusion, Surface, SubD, Mesh, or Curve into IList of Revit DB.GeometryObject.
 
         Prevents double-scaling:
@@ -1809,7 +1813,8 @@ class ConversionRouter(object):
                             loop_pts.Add(v0)
                             loop_pts.Add(v1)
                             loop_pts.Add(v2)
-                            tsb.AddFace(DB.TessellatedFace(loop_pts, DB.ElementId.InvalidElementId))
+                            face_mat_id = material_id if (material_id and material_id != DB.ElementId.InvalidElementId) else DB.ElementId.InvalidElementId
+                            tsb.AddFace(DB.TessellatedFace(loop_pts, face_mat_id))
                             face_added = True
                 tsb.CloseConnectedFaceSet()
                 if face_added:
@@ -2170,26 +2175,282 @@ class ConversionRouter(object):
         res.bua_area = revit_area_sqm
 
         # 8. Write parameters to Revit element for immediate scheduling & property display
-        if REVIT_AVAILABLE and self.doc and hasattr(created_elem, "get_Parameter"):
-            try:
-                p_comm = created_elem.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-                if p_comm and not p_comm.IsReadOnly:
-                    p_comm.Set("R2R | Area: {:.2f} m² | Vol: {:.2f} m³ | Mat: {} ({:.2f} m³)".format(
-                        res.area_sqm, res.volume_cum, res.primary_material, res.material_volume_cum
-                    ))
+        self._write_parameters_to_element(created_elem, scanned_obj, res)
 
-                for param_name, val in [("R2R_Area_sqm", res.area_sqm), ("R2R_Volume_cum", res.volume_cum), ("R2R_Material", res.primary_material)]:
-                    try:
-                        p_custom = created_elem.LookupParameter(param_name)
-                        if p_custom and not p_custom.IsReadOnly:
-                            if isinstance(val, (int, float)):
-                                p_custom.Set(float(val))
-                            else:
-                                p_custom.Set(str(val))
-                    except Exception:
-                        pass
+    def _write_parameters_to_element(self, created_elem, scanned_obj, res):
+        """Writes unit-aware shared parameters and built-in summary comments into created Revit element."""
+        if not REVIT_AVAILABLE or not self.doc or not created_elem:
+            return
+
+        # 1. Built-in Comments Summary (visible in any schedule querying Comments)
+        try:
+            p_comm = created_elem.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+            if p_comm and not p_comm.IsReadOnly:
+                p_comm.Set("R2R | Area: {:.2f} m² | Vol: {:.2f} m³ | Mat: {} ({:.2f} m³)".format(
+                    res.area_sqm, res.volume_cum, res.primary_material, res.material_volume_cum
+                ))
+        except Exception:
+            pass
+
+        # 2. Built-in Mark
+        try:
+            name_val = scanned_obj.object_name or scanned_obj.layer_name or "R2R_Element"
+            p_mark = created_elem.get_Parameter(DB.BuiltInParameter.ALL_MODEL_MARK)
+            if p_mark and not p_mark.IsReadOnly and not p_mark.AsString():
+                p_mark.Set(name_val)
+        except Exception:
+            pass
+
+        # 3. Dedicated R2R Schedulable Parameters
+        # In Revit API, internal storage: AREA in sq ft, VOLUME in cu ft, LENGTH in ft
+        sqft_val = float(res.area_sqm / 0.09290304) if res.area_sqm > 0 else 0.0
+        cuft_val = float(res.volume_cum / 0.028316846592) if res.volume_cum > 0 else 0.0
+        mat_cuft_val = float(res.material_volume_cum / 0.028316846592) if res.material_volume_cum > 0 else cuft_val
+        thick_ft = float(getattr(scanned_obj, "thickness", 0.0) / 0.3048) if getattr(scanned_obj, "thickness", 0.0) > 0 else 0.0
+        layer_str = str(getattr(scanned_obj, "layer_full_path", "") or getattr(scanned_obj, "layer_name", ""))
+        guid_str = str(getattr(scanned_obj, "rhino_guid", ""))
+        mat_str = str(res.primary_material or "")
+        zone_str = str(getattr(scanned_obj, "building_zone", "") or "General")
+        cat_str = str(getattr(res, "category_created", "") or getattr(scanned_obj, "inferred_category", "GenericModel"))
+
+        param_assignments = [
+            ("R2R_Area", sqft_val),
+            ("R2R_Volume", cuft_val),
+            ("R2R_Material", mat_str),
+            ("R2R_Material_Volume", mat_cuft_val),
+            ("R2R_Source_Layer", layer_str),
+            ("R2R_Rhino_GUID", guid_str),
+            ("R2R_Thickness", thick_ft),
+            ("R2R_Building_Zone", zone_str),
+            ("R2R_Category", cat_str),
+            # Numeric/text variants for custom schedules
+            ("R2R_Area_sqm", float(res.area_sqm)),
+            ("R2R_Volume_cum", float(res.volume_cum)),
+        ]
+
+        for p_name, p_val in param_assignments:
+            try:
+                p_obj = created_elem.LookupParameter(p_name)
+                if p_obj and not p_obj.IsReadOnly:
+                    if isinstance(p_val, (int, float)):
+                        p_obj.Set(float(p_val))
+                    else:
+                        p_obj.Set(str(p_val))
             except Exception:
                 pass
+
+    def ensure_shared_parameters_bound(self):
+        """Binds R2R Shared Parameters to target categories in active Revit document for scheduling.
+
+        Uses deterministic GUIDs to ensure parameters appear in Revit Schedule Fields.
+        Must be executed inside an active Revit Transaction.
+        """
+        if not REVIT_AVAILABLE or not self.doc or not hasattr(self.doc, "Application"):
+            return False
+
+        app = self.doc.Application
+        orig_sp_path = getattr(app, "SharedParametersFilename", "")
+        sp_temp_path = os.path.join(tempfile.gettempdir(), "R2R_SharedParameters.txt")
+
+        # Deterministic Shared Parameter definition file format
+        sp_content = (
+            "# This is a Revit shared parameter file.\n"
+            "# Do not edit manually.\n"
+            "*META\tVERSION\tMINVERS\n"
+            "META\t2\t1\n"
+            "*GROUP\tID\tNAME\n"
+            "GROUP\t1\tRhinoToRevit\n"
+            "*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE\tHIDEWHENNOVALUE\n"
+            "PARAM\te1a2b3c4-1111-2222-3333-444455550001\tR2R_Area\tAREA\t\t1\t1\tR2R Computed Surface Area\t1\t0\n"
+            "PARAM\te1a2b3c4-1111-2222-3333-444455550002\tR2R_Volume\tVOLUME\t\t1\t1\tR2R Computed Solid Volume\t1\t0\n"
+            "PARAM\te1a2b3c4-1111-2222-3333-444455550003\tR2R_Material\tTEXT\t\t1\t1\tR2R Material Takeoff Name\t1\t0\n"
+            "PARAM\te1a2b3c4-1111-2222-3333-444455550004\tR2R_Material_Volume\tVOLUME\t\t1\t1\tR2R Material Takeoff Volume\t1\t0\n"
+            "PARAM\te1a2b3c4-1111-2222-3333-444455550005\tR2R_Source_Layer\tTEXT\t\t1\t1\tR2R Source Rhino Layer\t1\t0\n"
+            "PARAM\te1a2b3c4-1111-2222-3333-444455550006\tR2R_Rhino_GUID\tTEXT\t\t1\t1\tR2R Source Rhino Object GUID\t1\t0\n"
+            "PARAM\te1a2b3c4-1111-2222-3333-444455550007\tR2R_Thickness\tLENGTH\t\t1\t1\tR2R Structural Thickness\t1\t0\n"
+            "PARAM\te1a2b3c4-1111-2222-3333-444455550008\tR2R_Building_Zone\tTEXT\t\t1\t1\tR2R Building Zone\t1\t0\n"
+            "PARAM\te1a2b3c4-1111-2222-3333-444455550009\tR2R_Category\tTEXT\t\t1\t1\tR2R Inferred Revit Category\t1\t0\n"
+        )
+
+        try:
+            with open(sp_temp_path, "w") as f:
+                f.write(sp_content)
+
+            app.SharedParametersFilename = sp_temp_path
+            sp_file = app.OpenSharedParameterFile()
+            if not sp_file:
+                return False
+
+            grp = sp_file.Groups.get_Item("RhinoToRevit")
+            if not grp:
+                return False
+
+            # Model categories to bind
+            target_bics = [
+                DB.BuiltInCategory.OST_GenericModel,
+                DB.BuiltInCategory.OST_Floors,
+                DB.BuiltInCategory.OST_Walls,
+                DB.BuiltInCategory.OST_Ceilings,
+                DB.BuiltInCategory.OST_Roofs,
+                DB.BuiltInCategory.OST_Columns,
+                DB.BuiltInCategory.OST_StructuralColumns,
+                DB.BuiltInCategory.OST_StructuralFraming,
+                DB.BuiltInCategory.OST_Mass,
+                DB.BuiltInCategory.OST_Site,
+                DB.BuiltInCategory.OST_Topography,
+                DB.BuiltInCategory.OST_SpecialityEquipment,
+                DB.BuiltInCategory.OST_Furniture
+            ]
+            if hasattr(DB.BuiltInCategory, "OST_Toposolid"):
+                target_bics.append(DB.BuiltInCategory.OST_Toposolid)
+
+            cat_set = app.Create.NewCategorySet()
+            for bic in target_bics:
+                try:
+                    cat = self.doc.Settings.Categories.get_Item(bic)
+                    if cat and getattr(cat, "AllowsBoundParameters", True):
+                        cat_set.Insert(cat)
+                except Exception:
+                    pass
+
+            # Parameter group in properties palette
+            p_group = getattr(DB.BuiltInParameterGroup, "PG_GEOMETRY", None)
+            if not p_group and hasattr(DB.BuiltInParameterGroup, "PG_DATA"):
+                p_group = DB.BuiltInParameterGroup.PG_DATA
+
+            binding_map = self.doc.ParameterBindings
+            for def_obj in grp.Definitions:
+                try:
+                    if binding_map.Contains(def_obj):
+                        continue
+                    new_binding = app.Create.NewInstanceBinding(cat_set)
+                    try:
+                        binding_map.Insert(def_obj, new_binding, p_group)
+                    except Exception:
+                        if hasattr(DB, "GroupTypeId") and hasattr(DB.GroupTypeId, "Geometry"):
+                            binding_map.Insert(def_obj, new_binding, DB.GroupTypeId.Geometry)
+                except Exception:
+                    pass
+
+            return True
+        except Exception as ex:
+            print("[R2R Shared Parameters Binding Notice]: {}".format(ex))
+            return False
+        finally:
+            try:
+                if orig_sp_path:
+                    app.SharedParametersFilename = orig_sp_path
+            except Exception:
+                pass
+
+    def create_r2r_takeoff_schedule(self, schedule_name="R2R Cave & Geometry Takeoff Schedule", category_bic=None):
+        """Creates a dedicated ViewSchedule in Revit with R2R Area, Volume, Material, and Grand Totals.
+
+        Must be executed inside an active Revit Transaction.
+        """
+        if not REVIT_AVAILABLE or not self.doc or not hasattr(DB, "ViewSchedule"):
+            return None
+
+        try:
+            # Check if schedule already exists
+            existing_collector = DB.FilteredElementCollector(self.doc).OfClass(DB.ViewSchedule)
+            for s in existing_collector:
+                if getattr(s, "Name", "") == schedule_name:
+                    return s
+
+            # Determine category: Multi-Category (InvalidElementId) or specific BuiltInCategory
+            if category_bic is not None:
+                cat_id = DB.ElementId(category_bic)
+            else:
+                cat_id = DB.ElementId.InvalidElementId  # Multi-Category Schedule
+
+            sched = None
+            try:
+                sched = DB.ViewSchedule.CreateSchedule(self.doc, cat_id)
+            except Exception:
+                # Fallback to Generic Models if Multi-Category creation fails
+                cat_id = DB.ElementId(DB.BuiltInCategory.OST_GenericModel)
+                sched = DB.ViewSchedule.CreateSchedule(self.doc, cat_id)
+
+            if not sched:
+                return None
+
+            sched.Name = schedule_name
+            sched_def = sched.Definition
+            available_fields = sched_def.GetSchedulableFields()
+
+            desired_order = [
+                "Mark",
+                "R2R_Category",
+                "R2R_Source_Layer",
+                "R2R_Material",
+                "R2R_Area",
+                "R2R_Volume",
+                "R2R_Material_Volume",
+                "R2R_Thickness",
+                "R2R_Building_Zone",
+                "Comments"
+            ]
+
+            field_by_name = {}
+            for sf in available_fields:
+                try:
+                    f_name = sf.GetName(self.doc)
+                    field_by_name[f_name] = sf
+                except Exception:
+                    pass
+
+            added_fields = []
+            for field_name in desired_order:
+                if field_name in field_by_name:
+                    try:
+                        added_sf = sched_def.AddField(field_by_name[field_name])
+                        added_fields.append((field_name, added_sf))
+                    except Exception:
+                        pass
+                elif field_name == "Mark":
+                    for sf in available_fields:
+                        if getattr(sf, "ParameterId", None) == DB.ElementId(DB.BuiltInParameter.ALL_MODEL_MARK):
+                            try:
+                                added_sf = sched_def.AddField(sf)
+                                added_fields.append(("Mark", added_sf))
+                            except Exception:
+                                pass
+                            break
+                elif field_name == "Comments":
+                    for sf in available_fields:
+                        if getattr(sf, "ParameterId", None) == DB.ElementId(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS):
+                            try:
+                                added_sf = sched_def.AddField(sf)
+                                added_fields.append(("Comments", added_sf))
+                            except Exception:
+                                pass
+                            break
+
+            # Enable 'Calculate Totals' on Area, Volume, and Material Volume columns
+            for f_name, sf_obj in added_fields:
+                if f_name in ("R2R_Area", "R2R_Volume", "R2R_Material_Volume"):
+                    try:
+                        if hasattr(sf_obj, "IsCalculateTotals"):
+                            sf_obj.IsCalculateTotals = True
+                    except Exception:
+                        pass
+
+            # Enable Show Grand Totals at bottom of schedule
+            try:
+                if hasattr(sched_def, "ShowGrandTotal"):
+                    sched_def.ShowGrandTotal = True
+                if hasattr(sched_def, "ShowGrandTotalTitle"):
+                    sched_def.ShowGrandTotalTitle = True
+                if hasattr(sched_def, "ShowGrandTotalCount"):
+                    sched_def.ShowGrandTotalCount = True
+            except Exception:
+                pass
+
+            return sched
+        except Exception as ex:
+            print("[R2R Takeoff Schedule Notice]: {}".format(ex))
+            return None
 
     def _category_str_to_id(self, cat_name):
         """Maps category name string to Revit ElementId with Toposolid, all 3D model categories, and dynamic BuiltInCategory resolution."""

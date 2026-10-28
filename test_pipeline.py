@@ -1508,6 +1508,278 @@ class TestR2RPipeline(unittest.TestCase):
             if orig_db is not None:
                 sync_engine.DB = orig_db
 
+    def test_write_parameters_to_element(self):
+        """Tests writing unit-aware shared parameters and comments to Revit element."""
+        import conversion_router as cr
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        try:
+            cr.REVIT_AVAILABLE = True
+
+            class MockBIP(object):
+                ALL_MODEL_INSTANCE_COMMENTS = 1
+                ALL_MODEL_MARK = 2
+
+            class MockDB(object):
+                BuiltInParameter = MockBIP
+                Level = type("Level", (), {})
+                FloorType = type("FloorType", (), {})
+                WallType = type("WallType", (), {})
+                RoofType = type("RoofType", (), {})
+                CeilingType = type("CeilingType", (), {})
+                ElementTypeGroup = type("ETG", (), {"FloorType": 1, "WallType": 2, "RoofType": 3, "CeilingType": 4})
+                ElementId = type("EID", (), {"InvalidElementId": -1})
+                @staticmethod
+                def FilteredElementCollector(doc):
+                    class _Col(object):
+                        def __init__(self, d): pass
+                        def OfClass(self, cls): return self
+                        def FirstElement(self): return None
+                        def __iter__(self): return iter([])
+                    return _Col(doc)
+
+            cr.DB = MockDB
+
+            params_set = {}
+            class MockParam(object):
+                def __init__(self, name):
+                    self.name = name
+                    self.IsReadOnly = False
+                def Set(self, val):
+                    params_set[self.name] = val
+                def AsString(self):
+                    return ""
+
+            class MockElement(object):
+                def get_Parameter(self, bip):
+                    if bip == MockBIP.ALL_MODEL_INSTANCE_COMMENTS:
+                        return MockParam("Comments")
+                    elif bip == MockBIP.ALL_MODEL_MARK:
+                        return MockParam("Mark")
+                    return None
+                def LookupParameter(self, name):
+                    return MockParam(name)
+
+            doc = object()
+            router = cr.ConversionRouter(doc)
+
+            scanned = ScannedObject("cave-obj-1")
+            scanned.object_name = "Cave_Chamber_South"
+            scanned.layer_name = "A-CAVE-VAULT"
+            scanned.thickness = 0.45
+            scanned.building_zone = "Subterranean"
+            scanned.inferred_category = "GenericModel"
+
+            res = cr.ConversionResult("cave-obj-1")
+            res.area_sqm = 120.0
+            res.volume_cum = 85.0
+            res.primary_material = "Carved Sandstone"
+            res.material_volume_cum = 85.0
+            res.category_created = "Generic Models"
+
+            router._write_parameters_to_element(MockElement(), scanned, res)
+
+            # Verify Comments contains summary
+            self.assertTrue("R2R | Area: 120.00 m² | Vol: 85.00 m³" in params_set["Comments"])
+            self.assertEqual(params_set["Mark"], "Cave_Chamber_South")
+            self.assertEqual(params_set["R2R_Material"], "Carved Sandstone")
+            self.assertEqual(params_set["R2R_Source_Layer"], "A-CAVE-VAULT")
+            self.assertEqual(params_set["R2R_Building_Zone"], "Subterranean")
+
+            # Verify internal storage units:
+            self.assertAlmostEqual(params_set["R2R_Area"], 120.0 / 0.09290304, places=1)
+            self.assertAlmostEqual(params_set["R2R_Volume"], 85.0 / 0.028316846592, places=1)
+            self.assertAlmostEqual(params_set["R2R_Material_Volume"], 85.0 / 0.028316846592, places=1)
+            self.assertAlmostEqual(params_set["R2R_Thickness"], 0.45 / 0.3048, places=1)
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            if orig_db is not None:
+                cr.DB = orig_db
+
+    def test_ensure_shared_parameters_bound(self):
+        """Tests programmatic creation of shared parameter file and binding to model categories."""
+        import conversion_router as cr
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        try:
+            cr.REVIT_AVAILABLE = True
+
+            inserted_bindings = []
+
+            class MockDef(object):
+                def __init__(self, name):
+                    self.Name = name
+
+            class MockGroup(object):
+                Definitions = [MockDef("R2R_Area"), MockDef("R2R_Volume"), MockDef("R2R_Material")]
+
+            class MockSPFile(object):
+                class Groups(object):
+                    @staticmethod
+                    def get_Item(name):
+                        return MockGroup()
+
+            class MockApp(object):
+                SharedParametersFilename = ""
+                @staticmethod
+                def OpenSharedParameterFile():
+                    return MockSPFile()
+                class Create(object):
+                    @staticmethod
+                    def NewCategorySet():
+                        class _CatSet(object):
+                            def Insert(self, c): pass
+                        return _CatSet()
+                    @staticmethod
+                    def NewInstanceBinding(cat_set):
+                        return "MockInstanceBinding"
+
+            class MockDoc(object):
+                Application = MockApp()
+                class Settings(object):
+                    class Categories(object):
+                        @staticmethod
+                        def get_Item(bic):
+                            class _Cat(object):
+                                AllowsBoundParameters = True
+                            return _Cat()
+                class ParameterBindings(object):
+                    @staticmethod
+                    def Contains(def_obj):
+                        return False
+                    @staticmethod
+                    def Insert(def_obj, binding, p_group):
+                        inserted_bindings.append((def_obj.Name, binding))
+
+            class MockDB(object):
+                Level = type("Level", (), {})
+                FloorType = type("FloorType", (), {})
+                WallType = type("WallType", (), {})
+                RoofType = type("RoofType", (), {})
+                CeilingType = type("CeilingType", (), {})
+                ElementTypeGroup = type("ETG", (), {"FloorType": 1, "WallType": 2, "RoofType": 3, "CeilingType": 4})
+                ElementId = type("EID", (), {"InvalidElementId": -1})
+                @staticmethod
+                def FilteredElementCollector(doc):
+                    class _Col(object):
+                        def __init__(self, d): pass
+                        def OfClass(self, cls): return self
+                        def FirstElement(self): return None
+                        def __iter__(self): return iter([])
+                    return _Col(doc)
+                BuiltInCategory = type("BIC", (), {
+                    "OST_GenericModel": 1, "OST_Floors": 2, "OST_Walls": 3,
+                    "OST_Ceilings": 4, "OST_Roofs": 5, "OST_Columns": 6,
+                    "OST_StructuralColumns": 7, "OST_StructuralFraming": 8,
+                    "OST_Mass": 9, "OST_Site": 10, "OST_Topography": 11,
+                    "OST_SpecialityEquipment": 12, "OST_Furniture": 13,
+                    "OST_Toposolid": 14
+                })
+                BuiltInParameterGroup = type("BIPG", (), {"PG_GEOMETRY": 1, "PG_DATA": 2})
+
+            cr.DB = MockDB
+            router = cr.ConversionRouter(MockDoc())
+            success = router.ensure_shared_parameters_bound()
+
+            self.assertTrue(success)
+            self.assertEqual(len(inserted_bindings), 3)
+            self.assertEqual(inserted_bindings[0][0], "R2R_Area")
+            self.assertEqual(inserted_bindings[1][0], "R2R_Volume")
+            self.assertEqual(inserted_bindings[2][0], "R2R_Material")
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            if orig_db is not None:
+                cr.DB = orig_db
+
+    def test_create_r2r_takeoff_schedule(self):
+        """Tests automatic ViewSchedule generation with R2R Area, Volume, Material, and Grand Totals."""
+        import conversion_router as cr
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        try:
+            cr.REVIT_AVAILABLE = True
+
+            fields_added = []
+
+            class MockSchedField(object):
+                def __init__(self, name):
+                    self.name = name
+                    self.IsCalculateTotals = False
+
+            class MockSchedDef(object):
+                ShowGrandTotal = False
+                ShowGrandTotalTitle = False
+                ShowGrandTotalCount = False
+                @staticmethod
+                def GetSchedulableFields():
+                    class _SF(object):
+                        def __init__(self, name):
+                            self._name = name
+                            self.ParameterId = -1
+                        def GetName(self, doc):
+                            return self._name
+                    return [_SF("R2R_Area"), _SF("R2R_Volume"), _SF("R2R_Material"), _SF("R2R_Source_Layer")]
+                @staticmethod
+                def AddField(sf):
+                    msf = MockSchedField(sf.GetName(None))
+                    fields_added.append(msf)
+                    return msf
+
+            class MockViewSchedule(object):
+                Name = "R2R Cave & Geometry Takeoff Schedule"
+                Definition = MockSchedDef()
+
+            class MockDB(object):
+                Level = type("Level", (), {})
+                FloorType = type("FloorType", (), {})
+                WallType = type("WallType", (), {})
+                RoofType = type("RoofType", (), {})
+                CeilingType = type("CeilingType", (), {})
+                ElementTypeGroup = type("ETG", (), {"FloorType": 1, "WallType": 2, "RoofType": 3, "CeilingType": 4})
+                BuiltInParameter = type("BIP", (), {"ALL_MODEL_MARK": 1, "ALL_MODEL_INSTANCE_COMMENTS": 2})
+                class ViewSchedule(object):
+                    @staticmethod
+                    def CreateSchedule(doc, cat_id):
+                        return MockViewSchedule()
+                class ElementId(object):
+                    InvalidElementId = -1
+                    def __init__(self, val=-1):
+                        self.val = val
+                    def __eq__(self, other):
+                        return getattr(other, "val", other) == self.val
+                BuiltInCategory = type("BIC", (), {"OST_GenericModel": 1})
+                @staticmethod
+                def FilteredElementCollector(doc):
+                    class _Col(object):
+                        def __init__(self, d): pass
+                        def OfClass(self, cls): return self
+                        def FirstElement(self): return None
+                        def __iter__(self): return iter([])
+                    return _Col(doc)
+
+            cr.DB = MockDB
+            router = cr.ConversionRouter(object())
+            sched = router.create_r2r_takeoff_schedule()
+
+            self.assertIsNotNone(sched)
+            self.assertEqual(sched.Name, "R2R Cave & Geometry Takeoff Schedule")
+            self.assertTrue(sched.Definition.ShowGrandTotal)
+
+            names = [f.name for f in fields_added]
+            self.assertIn("R2R_Area", names)
+            self.assertIn("R2R_Volume", names)
+            self.assertIn("R2R_Material", names)
+
+            # Verify CalculateTotals was turned on for Area and Volume
+            area_field = next(f for f in fields_added if f.name == "R2R_Area")
+            vol_field = next(f for f in fields_added if f.name == "R2R_Volume")
+            self.assertTrue(area_field.IsCalculateTotals)
+            self.assertTrue(vol_field.IsCalculateTotals)
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            if orig_db is not None:
+                cr.DB = orig_db
+
 
 if __name__ == "__main__":
     unittest.main()

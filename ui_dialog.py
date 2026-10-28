@@ -2010,6 +2010,17 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         tg = DB.TransactionGroup(self.revit_doc, "R2R One-Click Transfer")
         tg.Start()
 
+        # Phase 2A: Ensure R2R Shared Parameters are bound for Scheduling
+        try:
+            with DB.Transaction(self.revit_doc, "Bind R2R Shared Parameters") as trans_sp:
+                trans_sp.Start()
+                sp_bound = router.ensure_shared_parameters_bound()
+                trans_sp.Commit()
+                if sp_bound:
+                    self.txt_exec_log.Text += "Phase 2A: R2R Schedulable Shared Parameters successfully bound to model categories.\n"
+        except Exception as ex_sp:
+            self.txt_exec_log.Text += "Phase 2A Notice: Shared Parameter registration notice: {}. Continuing...\n".format(ex_sp)
+
         try:
             for idx, obj in enumerate(approved_objs):
                 guid = obj.rhino_guid
@@ -2120,6 +2131,17 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 # Update progress
                 pct = int(((idx + 1) / float(total)) * 100)
                 self.progress_bar.Value = pct
+
+            # Phase 2B: Generate / Update R2R Cave & Geometry Takeoff Schedule in Revit
+            try:
+                with DB.Transaction(self.revit_doc, "Create R2R Takeoff Schedule") as trans_sc:
+                    trans_sc.Start()
+                    sched_view = router.create_r2r_takeoff_schedule()
+                    trans_sc.Commit()
+                    if sched_view:
+                        self.txt_exec_log.Text += "Phase 2B: Created/Updated Revit Schedule: '{}' in Project Browser.\n".format(getattr(sched_view, "Name", "Takeoff Schedule"))
+            except Exception as ex_sc:
+                self.txt_exec_log.Text += "Phase 2B Notice: Schedule creation notice: {}. Continuing...\n".format(ex_sc)
 
             tg.Assimilate()
             self.lbl_exec_status.Text = "Transfer complete! Created: {}, Updated: {}, Skipped: {}, Errors: {}".format(
