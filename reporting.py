@@ -42,27 +42,98 @@ class TransferQAReport(object):
             "missing_in_rhino": 0
         }
 
-        # BUA / GFA Metrics
+        # BUA / GFA, Volumetric & Material Takeoff Metrics
         self.bua_stats = {
             "rhino_slab_area_sqm": 0.0,
             "revit_floor_area_sqm": 0.0,
             "discrepancy_sqm": 0.0,
-            "discrepancy_pct": 0.0
+            "discrepancy_pct": 0.0,
+            "rhino_slab_volume_cum": 0.0,
+            "revit_floor_volume_cum": 0.0,
+            "floor_volume_discrepancy_pct": 0.0,
+            "rhino_wall_area_sqm": 0.0,
+            "revit_wall_area_sqm": 0.0,
+            "wall_area_discrepancy_pct": 0.0,
+            "rhino_wall_volume_cum": 0.0,
+            "revit_wall_volume_cum": 0.0,
+            "wall_volume_discrepancy_pct": 0.0,
+            "total_material_volume_cum": 0.0,
+            "material_takeoff": {}  # mat_name -> {"total_volume_cum": ..., "total_area_sqm": ..., "element_count": ...}
         }
 
         # Element-level Dual-Status records
         self.element_records = []  # list of dicts
 
     def compute_bua_summary(self):
-        """Calculates area totals and percentage variance between Rhino and Revit."""
-        total_rhino = sum(r.get("rhino_area", 0.0) for r in self.element_records if r.get("category") == "Floors")
-        total_revit = sum(r.get("bua_area", 0.0) for r in self.element_records if r.get("category") == "Floors")
+        """Calculates area totals, solid volumes, and material takeoff variance between Rhino and Revit."""
+        # 1. Floors Quantities
+        total_rhino_floor_area = sum(r.get("rhino_area", 0.0) for r in self.element_records if r.get("category") in ("Floors", "Floor", "Slab"))
+        total_revit_floor_area = sum(r.get("area_sqm", r.get("bua_area", 0.0)) for r in self.element_records if r.get("category") in ("Floors", "Floor", "Slab"))
+        diff_area = abs(total_rhino_floor_area - total_revit_floor_area)
 
-        self.bua_stats["rhino_slab_area_sqm"] = round(total_rhino, 2)
-        self.bua_stats["revit_floor_area_sqm"] = round(total_revit, 2)
-        diff = abs(total_rhino - total_revit)
-        self.bua_stats["discrepancy_sqm"] = round(diff, 2)
-        self.bua_stats["discrepancy_pct"] = round((diff / max(1.0, total_rhino)) * 100.0, 2)
+        total_rhino_floor_vol = sum(r.get("rhino_volume", 0.0) for r in self.element_records if r.get("category") in ("Floors", "Floor", "Slab"))
+        total_revit_floor_vol = sum(r.get("volume_cum", 0.0) for r in self.element_records if r.get("category") in ("Floors", "Floor", "Slab"))
+        diff_floor_vol = abs(total_rhino_floor_vol - total_revit_floor_vol)
+
+        self.bua_stats["rhino_slab_area_sqm"] = round(total_rhino_floor_area, 2)
+        self.bua_stats["revit_floor_area_sqm"] = round(total_revit_floor_area, 2)
+        self.bua_stats["discrepancy_sqm"] = round(diff_area, 2)
+        self.bua_stats["discrepancy_pct"] = round((diff_area / max(1.0, total_rhino_floor_area)) * 100.0, 2)
+
+        self.bua_stats["rhino_slab_volume_cum"] = round(total_rhino_floor_vol, 2)
+        self.bua_stats["revit_floor_volume_cum"] = round(total_revit_floor_vol, 2)
+        self.bua_stats["floor_volume_discrepancy_pct"] = round((diff_floor_vol / max(1.0, total_rhino_floor_vol)) * 100.0, 2)
+
+        # 2. Walls Quantities
+        total_rhino_wall_area = sum(r.get("rhino_area", 0.0) for r in self.element_records if r.get("category") in ("Walls", "Wall"))
+        total_revit_wall_area = sum(r.get("area_sqm", 0.0) for r in self.element_records if r.get("category") in ("Walls", "Wall"))
+        diff_wall_area = abs(total_rhino_wall_area - total_revit_wall_area)
+
+        total_rhino_wall_vol = sum(r.get("rhino_volume", 0.0) for r in self.element_records if r.get("category") in ("Walls", "Wall"))
+        total_revit_wall_vol = sum(r.get("volume_cum", 0.0) for r in self.element_records if r.get("category") in ("Walls", "Wall"))
+        diff_wall_vol = abs(total_rhino_wall_vol - total_revit_wall_vol)
+
+        self.bua_stats["rhino_wall_area_sqm"] = round(total_rhino_wall_area, 2)
+        self.bua_stats["revit_wall_area_sqm"] = round(total_revit_wall_area, 2)
+        self.bua_stats["wall_area_discrepancy_pct"] = round((diff_wall_area / max(1.0, total_rhino_wall_area)) * 100.0, 2)
+
+        self.bua_stats["rhino_wall_volume_cum"] = round(total_rhino_wall_vol, 2)
+        self.bua_stats["revit_wall_volume_cum"] = round(total_revit_wall_vol, 2)
+        self.bua_stats["wall_volume_discrepancy_pct"] = round((diff_wall_vol / max(1.0, total_rhino_wall_vol)) * 100.0, 2)
+
+        # 3. Aggregated Compound Material Takeoff
+        mat_summary = {}
+        total_mat_vol = 0.0
+        for r in self.element_records:
+            elem_mto = r.get("material_takeoff", {})
+            if elem_mto and isinstance(elem_mto, dict):
+                for m_name, vals in elem_mto.items():
+                    if m_name not in mat_summary:
+                        mat_summary[m_name] = {"total_volume_cum": 0.0, "total_area_sqm": 0.0, "element_count": 0}
+                    v = float(vals.get("volume_cum", 0.0) or 0.0)
+                    a = float(vals.get("area_sqm", 0.0) or 0.0)
+                    mat_summary[m_name]["total_volume_cum"] += v
+                    mat_summary[m_name]["total_area_sqm"] += a
+                    mat_summary[m_name]["element_count"] += 1
+                    total_mat_vol += v
+            else:
+                m_name = r.get("material_name") or r.get("primary_material") or "Default"
+                if m_name not in mat_summary:
+                    mat_summary[m_name] = {"total_volume_cum": 0.0, "total_area_sqm": 0.0, "element_count": 0}
+                v = float(r.get("material_volume_cum", r.get("volume_cum", 0.0)) or 0.0)
+                a = float(r.get("area_sqm", r.get("bua_area", 0.0)) or 0.0)
+                mat_summary[m_name]["total_volume_cum"] += v
+                mat_summary[m_name]["total_area_sqm"] += a
+                mat_summary[m_name]["element_count"] += 1
+                total_mat_vol += v
+
+        # Round totals
+        for m_name in mat_summary:
+            mat_summary[m_name]["total_volume_cum"] = round(mat_summary[m_name]["total_volume_cum"], 2)
+            mat_summary[m_name]["total_area_sqm"] = round(mat_summary[m_name]["total_area_sqm"], 2)
+
+        self.bua_stats["material_takeoff"] = mat_summary
+        self.bua_stats["total_material_volume_cum"] = round(total_mat_vol, 2)
 
 
 class ReportExporter(object):
@@ -88,13 +159,14 @@ class ReportExporter(object):
 
     @staticmethod
     def export_csv(report, file_path):
-        """Writes element records and validation status to CSV."""
+        """Writes element records, volumetric quantities, and validation status to CSV."""
         report.compute_bua_summary()
         fieldnames = [
             "rhino_guid", "revit_element_id", "layer_name", "category",
             "strategy", "sync_state", "confidence_pct", "bim_status",
             "graphics_status", "overall_status", "plan_view", "section_view",
-            "elevation_view", "3d_view", "rhino_area_sqm", "revit_bua_sqm", "issues"
+            "elevation_view", "3d_view", "area_sqm", "volume_cum",
+            "primary_material", "material_volume_cum", "rhino_area_sqm", "revit_bua_sqm", "issues"
         ]
 
         with open(file_path, "w", newline="") as f:
@@ -117,6 +189,10 @@ class ReportExporter(object):
                     "section_view": vm.get("Section", "N/A"),
                     "elevation_view": vm.get("Elevation", "N/A"),
                     "3d_view": vm.get("3D", "N/A"),
+                    "area_sqm": r.get("area_sqm", r.get("bua_area", 0.0)),
+                    "volume_cum": r.get("volume_cum", 0.0),
+                    "primary_material": r.get("material_name", r.get("primary_material", "")),
+                    "material_volume_cum": r.get("material_volume_cum", 0.0),
                     "rhino_area_sqm": r.get("rhino_area", 0.0),
                     "revit_bua_sqm": r.get("bua_area", 0.0),
                     "issues": "; ".join(r.get("issues", []))
@@ -125,10 +201,31 @@ class ReportExporter(object):
 
     @staticmethod
     def export_html(report, file_path):
-        """Generates a responsive, publication-quality executive HTML report."""
+        """Generates a responsive, publication-quality executive HTML report with volumetric and material takeoff schedules."""
         report.compute_bua_summary()
 
-        # Build table rows
+        # Build Material Takeoff rows
+        mat_rows_html = []
+        tot_m_vol = max(0.001, report.bua_stats.get("total_material_volume_cum", 0.0))
+        for m_name, m_info in sorted(report.bua_stats.get("material_takeoff", {}).items(), key=lambda x: x[1].get("total_volume_cum", 0.0), reverse=True):
+            m_vol = m_info.get("total_volume_cum", 0.0)
+            m_area = m_info.get("total_area_sqm", 0.0)
+            m_cnt = m_info.get("element_count", 0)
+            pct_share = round((m_vol / tot_m_vol) * 100.0, 1)
+            mat_rows_html.append("""
+            <tr>
+              <td><strong>{name}</strong></td>
+              <td>{cnt}</td>
+              <td>{area:.2f} m²</td>
+              <td><strong style="color: var(--accent);">{vol:.2f} m³</strong></td>
+              <td><span class="category-pill">{pct}%</span></td>
+            </tr>
+            """.format(name=m_name, cnt=m_cnt, area=m_area, vol=m_vol, pct=pct_share))
+
+        if not mat_rows_html:
+            mat_rows_html.append('<tr><td colspan="5" style="text-align:center; color:var(--text-muted);">No compound material data recorded</td></tr>')
+
+        # Build element table rows
         rows_html = []
         for r in report.element_records:
             vm = r.get("view_matrix", {})
@@ -137,6 +234,11 @@ class ReportExporter(object):
 
             plan_badge = "badge-pass" if vm.get("Plan") == "PASS" else ("badge-warn" if vm.get("Plan") == "WARNING" else "badge-fail")
             sec_badge = "badge-pass" if vm.get("Section") == "PASS" else ("badge-warn" if vm.get("Section") == "WARNING" else "badge-fail")
+
+            e_area = float(r.get("area_sqm", r.get("bua_area", 0.0)) or 0.0)
+            e_vol = float(r.get("volume_cum", 0.0) or 0.0)
+            e_mat = r.get("material_name") or r.get("primary_material") or "-"
+            e_mvol = float(r.get("material_volume_cum", 0.0) or 0.0)
 
             row = """
             <tr>
@@ -148,6 +250,10 @@ class ReportExporter(object):
               <td>{sync}</td>
               <td><strong>{conf}%</strong></td>
               <td><span class="{overall_cls}">{overall}</span></td>
+              <td>{area:.2f} m²</td>
+              <td><strong style="color: var(--accent);">{vol:.2f} m³</strong></td>
+              <td>{mat}</td>
+              <td>{mvol:.2f} m³</td>
               <td><span class="{p_cls}">{plan}</span></td>
               <td><span class="{s_cls}">{sec}</span></td>
               <td>{issues}</td>
@@ -162,6 +268,10 @@ class ReportExporter(object):
                 conf=r.get("confidence_pct", 0),
                 overall_cls=badge_class,
                 overall=overall,
+                area=e_area,
+                vol=e_vol,
+                mat=e_mat,
+                mvol=e_mvol,
                 p_cls=plan_badge,
                 plan=vm.get("Plan", "PASS"),
                 s_cls=sec_badge,
@@ -174,7 +284,7 @@ class ReportExporter(object):
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>R2R Transfer QA & Validation Report</title>
+  <title>R2R Transfer QA & Material Takeoff Report</title>
   <style>
     :root {
       --bg: #0f141c;
@@ -206,32 +316,34 @@ class ReportExporter(object):
     .meta { color: var(--text-muted); font-size: 14px; }
     .kpi-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 20px;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 18px;
       margin-bottom: 30px;
     }
     .kpi-card {
       background: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 20px;
+      padding: 18px;
       box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
     }
-    .kpi-title { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 8px; }
-    .kpi-value { font-size: 28px; font-weight: 700; color: #fff; }
+    .kpi-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 8px; }
+    .kpi-value { font-size: 24px; font-weight: 700; color: #fff; }
+    .kpi-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
     .kpi-value.green { color: var(--pass); }
     .kpi-value.amber { color: var(--warn); }
     .kpi-value.blue { color: var(--accent); }
+    .section-title { font-size: 16px; font-weight: 600; color: #fff; margin-top: 30px; margin-bottom: 12px; }
     .table-container {
       background: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 8px;
-      overflow: hidden;
-      margin-top: 25px;
+      overflow-x: auto;
+      margin-bottom: 25px;
     }
     table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
-    th { background: #1e293b; padding: 12px 16px; font-weight: 600; color: #cbd5e1; border-bottom: 1px solid var(--border); }
-    td { padding: 12px 16px; border-bottom: 1px solid #1e293b; }
+    th { background: #1e293b; padding: 12px 14px; font-weight: 600; color: #cbd5e1; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    td { padding: 10px 14px; border-bottom: 1px solid #1e293b; }
     tr:hover { background: #1a2638; }
     .badge-pass { background: rgba(34,197,94,0.15); color: var(--pass); padding: 4px 8px; border-radius: 4px; font-weight: 600; }
     .badge-warn { background: rgba(245,158,11,0.15); color: var(--warn); padding: 4px 8px; border-radius: 4px; font-weight: 600; }
@@ -243,8 +355,8 @@ class ReportExporter(object):
 <body>
   <div class="header">
     <div>
-      <h1>R2R ONE-CLICK TRANSFER - QA & VALIDATION REPORT</h1>
-      <div class="meta">Project: __PROJECT__ | Mode: __MODE__ | Generated: __TIMESTAMP__</div>
+      <h1>R2R ONE-CLICK TRANSFER - QUANTITY TAKEOFF & QA AUDIT</h1>
+      <div class="meta">Project: __PROJECT__ | Mode: __MODE__ | Unit System: __UNIT__ | Generated: __TIMESTAMP__</div>
     </div>
     <div>
       <span class="badge-pass" style="font-size:14px; padding: 6px 12px;">SYSTEM READY</span>
@@ -253,32 +365,51 @@ class ReportExporter(object):
 
   <div class="kpi-grid">
     <div class="kpi-card">
-      <div class="kpi-title">Total Scanned</div>
-      <div class="kpi-value">__TOTAL_SCANNED__</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-title">Created Elements</div>
+      <div class="kpi-title">Total Elements</div>
       <div class="kpi-value green">__CREATED__</div>
+      <div class="kpi-sub">Scanned: __TOTAL_SCANNED__ | Skipped: __SKIPPED__</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-title">Updated / Modified</div>
-      <div class="kpi-value blue">__UPDATED__</div>
+      <div class="kpi-title">Total Material Volume</div>
+      <div class="kpi-value blue">__TOTAL_MAT_VOL__ m³</div>
+      <div class="kpi-sub">Native Revit Solid Volume</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-title">Skipped (Unchanged)</div>
-      <div class="kpi-value">__SKIPPED__</div>
+      <div class="kpi-title">Floor Slab Quantities</div>
+      <div class="kpi-value">__FLOOR_AREA__ m²</div>
+      <div class="kpi-sub">Volume: __FLOOR_VOL__ m³ (Var: __BUA_VAR__%)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-title">Wall Quantities</div>
+      <div class="kpi-value">__WALL_AREA__ m²</div>
+      <div class="kpi-sub">Volume: __WALL_VOL__ m³</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-title">Review / Warnings</div>
       <div class="kpi-value amber">__FAILED__</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-title">BUA Area Variance</div>
-      <div class="kpi-value">__BUA_VAR__%</div>
+      <div class="kpi-sub">Exceptions requiring audit</div>
     </div>
   </div>
 
-  <h3>Dual-Status Verification & View Graphics Audit</h3>
+  <div class="section-title">Compound Material Takeoff Schedule</div>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Material Name</th>
+          <th>Element Count</th>
+          <th>Total Surface Area (m²)</th>
+          <th>Total Material Volume (m³)</th>
+          <th>Share of Total Volume</th>
+        </tr>
+      </thead>
+      <tbody>
+__MAT_ROWS__
+      </tbody>
+    </table>
+  </div>
+
+  <div class="section-title">Element-by-Element Volumetric & Dual-Status Audit</div>
   <div class="table-container">
     <table>
       <thead>
@@ -288,11 +419,15 @@ class ReportExporter(object):
           <th>Layer</th>
           <th>Category</th>
           <th>Strategy</th>
-          <th>Sync State</th>
-          <th>Confidence</th>
-          <th>Overall Status</th>
-          <th>Plan View</th>
-          <th>Section View</th>
+          <th>Sync</th>
+          <th>Conf</th>
+          <th>Overall</th>
+          <th>Area (m²)</th>
+          <th>Volume (m³)</th>
+          <th>Primary Material</th>
+          <th>Material Vol</th>
+          <th>Plan</th>
+          <th>Section</th>
           <th>Issues / Notes</th>
         </tr>
       </thead>
@@ -307,13 +442,20 @@ __ROWS__
         html_content = html_template \
             .replace("__PROJECT__", str(report.project_name)) \
             .replace("__MODE__", str(report.execution_mode)) \
+            .replace("__UNIT__", str(report.unit_system)) \
             .replace("__TIMESTAMP__", str(report.timestamp)) \
             .replace("__TOTAL_SCANNED__", str(report.preflight_data.get("total_scanned", len(report.element_records)))) \
             .replace("__CREATED__", str(report.transfer_stats.get("created", 0))) \
             .replace("__UPDATED__", str(report.transfer_stats.get("updated", 0))) \
             .replace("__SKIPPED__", str(report.transfer_stats.get("skipped", 0))) \
             .replace("__FAILED__", str(report.transfer_stats.get("failed", 0))) \
+            .replace("__TOTAL_MAT_VOL__", str(report.bua_stats.get("total_material_volume_cum", 0.0))) \
+            .replace("__FLOOR_AREA__", str(report.bua_stats.get("revit_floor_area_sqm", 0.0))) \
+            .replace("__FLOOR_VOL__", str(report.bua_stats.get("revit_floor_volume_cum", 0.0))) \
+            .replace("__WALL_AREA__", str(report.bua_stats.get("revit_wall_area_sqm", 0.0))) \
+            .replace("__WALL_VOL__", str(report.bua_stats.get("revit_wall_volume_cum", 0.0))) \
             .replace("__BUA_VAR__", str(report.bua_stats.get("discrepancy_pct", 0.0))) \
+            .replace("__MAT_ROWS__", "\n".join(mat_rows_html)) \
             .replace("__ROWS__", "\n".join(rows_html))
 
         with open(file_path, "w", encoding="utf-8") as f:

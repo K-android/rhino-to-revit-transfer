@@ -263,12 +263,15 @@ class LayerRowItem(object):
 class ValidationRowItem(object):
     """Data item model for the Validate & QA Report GridView."""
 
-    def __init__(self, val_report, layer_name, strategy):
+    def __init__(self, val_report, layer_name, strategy, area_sqm=0.0, volume_cum=0.0, material_name="", material_vol=0.0):
         self.revit_id = str(val_report.revit_element_id)
         self.rhino_guid = val_report.rhino_guid
         self.layer_name = layer_name
         self.category = val_report.category_name
         self.strategy = strategy
+        self.area = "{:.2f}".format(float(area_sqm)) if float(area_sqm or 0.0) > 0 else "-"
+        self.volume = "{:.2f}".format(float(volume_cum)) if float(volume_cum or 0.0) > 0 else "-"
+        self.material = "{}: {:.2f} m³".format(material_name, float(material_vol)) if (material_name and float(material_vol or 0.0) > 0) else (material_name or "-")
         self.bim_status = val_report.bim_status
         self.graphics_status = val_report.graphics_status
         self.overall_status = val_report.overall_status
@@ -1326,16 +1329,19 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         col_defs = [
             ("Revit ID", 75),
-            ("Rhino GUID", 120),
-            ("Layer", 150),
-            ("Category", 120),
-            ("Strategy", 110),
+            ("Rhino GUID", 110),
+            ("Layer", 140),
+            ("Category", 110),
+            ("Strategy", 100),
+            ("Area (m²)", 85),
+            ("Volume (m³)", 90),
+            ("Material Takeoff", 150),
             ("BIM Status", 85),
             ("Graphics Status", 105),
-            ("Overall Status", 120),
-            ("Plan", 70),
-            ("Section", 70),
-            ("Issues / Recommendations", 220)
+            ("Overall Status", 110),
+            ("Plan", 65),
+            ("Section", 65),
+            ("Issues / Recommendations", 200)
         ]
 
         for idx, (header, width) in enumerate(col_defs):
@@ -2051,16 +2057,25 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                         else:
                             created_cnt += 1
 
-                        self.txt_exec_log.Text += "[SUCCESS] {} -> Revit ID {} ({})\n".format(
+                        log_msg = "[SUCCESS] {} -> Revit ID {} ({})".format(
                             obj.layer_name, conv_res.revit_element_id, conv_res.strategy_used
                         )
+                        if conv_res.area_sqm > 0 or conv_res.volume_cum > 0 or conv_res.material_volume_cum > 0:
+                            log_msg += " | Area: {:.2f} m², Vol: {:.2f} m³, Mat: {} ({:.2f} m³)".format(
+                                conv_res.area_sqm, conv_res.volume_cum, conv_res.primary_material, conv_res.material_volume_cum
+                            )
+                        self.txt_exec_log.Text += log_msg + "\n"
                         if conv_res.warnings:
                             for w in conv_res.warnings:
                                 self.txt_exec_log.Text += "  [NOTICE] {}\n".format(w)
 
                         # Dual-Status Validation
                         val_rep = self.validator.validate_element(conv_res.revit_element_id, guid)
-                        val_row = ValidationRowItem(val_rep, obj.layer_name, conv_res.strategy_used)
+                        val_row = ValidationRowItem(val_rep, obj.layer_name, conv_res.strategy_used,
+                                                    area_sqm=conv_res.area_sqm,
+                                                    volume_cum=conv_res.volume_cum,
+                                                    material_name=conv_res.primary_material,
+                                                    material_vol=conv_res.material_volume_cum)
                         self.validation_rows.append(val_row)
 
                         # Log to QA report
@@ -2076,7 +2091,13 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                             "graphics_status": val_rep.graphics_status,
                             "overall_status": val_rep.overall_status,
                             "view_matrix": val_rep.view_matrix,
-                            "rhino_area": obj.area,
+                            "rhino_area": conv_res.rhino_area_sqm or obj.area,
+                            "rhino_volume": conv_res.rhino_volume_cum or getattr(obj, "volume", 0.0),
+                            "area_sqm": conv_res.area_sqm,
+                            "volume_cum": conv_res.volume_cum,
+                            "material_name": conv_res.primary_material,
+                            "material_volume_cum": conv_res.material_volume_cum,
+                            "material_takeoff": conv_res.material_takeoff,
                             "bua_area": conv_res.bua_area,
                             "issues": val_rep.issues
                         })
@@ -2125,6 +2146,9 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 r.layer_name,
                 r.category,
                 r.strategy,
+                r.area,
+                r.volume,
+                r.material,
                 r.bim_status,
                 r.graphics_status,
                 r.overall_status,

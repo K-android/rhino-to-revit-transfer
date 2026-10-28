@@ -57,6 +57,8 @@ class ScannedObject(object):
         self.dz = 0.0
         self.area = 0.0
         self.volume = 0.0
+        self.area_sqm = 0.0
+        self.volume_cum = 0.0
 
         # Topological flags
         self.is_closed = False
@@ -118,6 +120,8 @@ class ScannedObject(object):
             "parametric_dims": dict(self.parametric_dims),
             "area": self.area,
             "volume": self.volume,
+            "area_sqm": self.area_sqm,
+            "volume_cum": self.volume_cum,
             "is_closed": self.is_closed,
             "is_planar": self.is_planar,
             "is_horizontal": self.is_horizontal,
@@ -352,7 +356,13 @@ class RhinoScanner(object):
         if mat_idx >= 0 and mat_idx < self.doc.Materials.Count:
             scanned.material_name = self.doc.Materials[mat_idx].Name
         else:
-            scanned.material_name = "ByLayer"
+            layer_mat_idx = getattr(layer, "RenderMaterialIndex", -1)
+            if layer_mat_idx >= 0 and layer_mat_idx < self.doc.Materials.Count:
+                scanned.material_name = self.doc.Materials[layer_mat_idx].Name
+            elif hasattr(layer, "RenderMaterial") and layer.RenderMaterial:
+                scanned.material_name = layer.RenderMaterial.Name
+            else:
+                scanned.material_name = layer.Name
 
         color = obj.Attributes.ObjectColor
         scanned.object_color = (color.R, color.G, color.B, color.A)
@@ -565,6 +575,10 @@ class RhinoScanner(object):
             scanned.repetition_signature = "{:.2f}x{:.2f}x{:.2f}_V{:.2f}_A{:.2f}".format(
                 plan_dims[0], plan_dims[1], round(scanned.dz, 2), round(scanned.volume, 2), round(scanned.area, 2)
             )
+
+        # Normalized metric quantities in m² and m³
+        scanned.area_sqm = round(scanned.area * (scale_to_m ** 2), 3)
+        scanned.volume_cum = round(scanned.volume * (scale_to_m ** 3), 3)
 
     @staticmethod
     def order_adaptive_points_ccw(points):

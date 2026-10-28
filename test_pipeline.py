@@ -918,6 +918,399 @@ class TestR2RPipeline(unittest.TestCase):
             if orig_db is not None:
                 conversion_router.DB = orig_db
 
+    def test_floor_and_wall_thickness_matching_and_type_creation(self):
+        """Tests that matching FloorType and WallType are dynamically created with precise thickness and material."""
+        import conversion_router
+
+        class MockElementId(object):
+            InvalidElementId = -1
+            def __init__(self, val=-1):
+                self.val = val
+            def __eq__(self, other):
+                if hasattr(other, "val"):
+                    return self.val == other.val
+                return self.val == other
+
+        class MockLayer(object):
+            def __init__(self, width=0.5, mat_id=10):
+                self.Width = width
+                self.MaterialId = mat_id
+                self.Function = 1  # Structure
+
+        class MockCompoundStructure(object):
+            def __init__(self, thickness=0.5):
+                self.thickness = thickness
+                self.layers = [MockLayer(thickness)]
+            def GetTotalThickness(self):
+                return self.thickness
+            def GetLayers(self):
+                return self.layers
+            def SetLayerWidth(self, idx, w):
+                self.thickness = w
+                self.layers[idx].Width = w
+            def SetMaterialId(self, idx, mid):
+                self.layers[idx].MaterialId = mid
+
+        class MockType(object):
+            def __init__(self, name="Generic", cs=None, eid=301):
+                self.name = name
+                self.cs = cs or MockCompoundStructure(0.5)
+                self.Id = eid
+                self.Kind = 0  # Basic wall
+            def GetCompoundStructure(self):
+                return self.cs
+            def SetCompoundStructure(self, cs):
+                self.cs = cs
+            def Duplicate(self, new_name):
+                new_cs = MockCompoundStructure(self.cs.thickness)
+                return MockType(new_name, new_cs, eid=self.Id + 10)
+            def get_Parameter(self, bip):
+                class _P:
+                    def AsString(s): return self.name
+                return _P()
+
+        class MockMat(object):
+            def __init__(self, name="Concrete", mid=55):
+                self.Name = name
+                self.Id = mid
+
+        class MockCollectorTypes(object):
+            def __init__(self, doc, items):
+                self.items = items
+            def OfClass(self, cls):
+                return self
+            def FirstElement(self):
+                return self.items[0] if self.items else None
+            def __iter__(self):
+                return iter(self.items)
+
+        base_floor = MockType("Floor_Base", MockCompoundStructure(0.5), 301)
+        base_wall = MockType("Wall_Base", MockCompoundStructure(0.656), 401)
+        mat_concrete = MockMat("Concrete", 55)
+
+        class MockDocTypes(object):
+            def __init__(self):
+                self.floors = [base_floor]
+                self.walls = [base_wall]
+                self.materials = [mat_concrete]
+            def GetElement(self, eid):
+                if eid == 55: return mat_concrete
+                return None
+            def GetDefaultElementTypeId(self, group):
+                return 301
+
+        class MockDBTypes(object):
+            Level = type("Level", (), {})
+            FloorType = type("FloorType", (), {})
+            WallType = type("WallType", (), {})
+            RoofType = type("RoofType", (), {})
+            CeilingType = type("CeilingType", (), {})
+            ElementTypeGroup = type("ETG", (), {"FloorType": 1, "WallType": 2, "RoofType": 3, "CeilingType": 4})
+            Material = type("MatCls", (), {"Create": lambda doc, name: 77})
+            ElementId = MockElementId
+            BuiltInParameter = type("BIP", (), {"SYMBOL_NAME_PARAM": 99})
+            WallKind = type("WK", (), {"Basic": 0})
+            MaterialFunctionAssignment = type("MFA", (), {"Structure": 1})
+            @staticmethod
+            def FilteredElementCollector(doc):
+                class _Col(object):
+                    def __init__(self, d): self.d = d
+                    def OfClass(self, cls):
+                        if cls == MockDBTypes.FloorType:
+                            return MockCollectorTypes(self.d, self.d.floors)
+                        elif cls == MockDBTypes.WallType:
+                            return MockCollectorTypes(self.d, self.d.walls)
+                        elif cls == MockDBTypes.Material:
+                            return MockCollectorTypes(self.d, self.d.materials)
+                        return MockCollectorTypes(self.d, [])
+                return _Col(doc)
+
+        orig_revit = conversion_router.REVIT_AVAILABLE
+        orig_db = getattr(conversion_router, "DB", None)
+        try:
+            conversion_router.REVIT_AVAILABLE = True
+            conversion_router.DB = MockDBTypes
+
+            doc = MockDocTypes()
+            router = conversion_router.ConversionRouter(doc)
+            router.default_floor_type = base_floor.Id
+            router.default_wall_type = base_wall.Id
+
+            # 1. Floor Type matching/creation: 300mm slab (0.98425 ft) with Concrete
+            f_id = router._get_or_create_matching_floor_type(0.98425, "Concrete")
+            self.assertIsNotNone(f_id)
+            self.assertNotEqual(f_id, base_floor.Id)
+
+            # 2. Wall Type matching/creation: 200mm wall (0.656 ft) with Concrete
+            w_id = router._get_or_create_matching_wall_type(0.656, "Concrete")
+            self.assertIsNotNone(w_id)
+        finally:
+            conversion_router.REVIT_AVAILABLE = orig_revit
+            if orig_db is not None:
+                conversion_router.DB = orig_db
+
+    def test_element_quantities_and_material_takeoff_extraction(self):
+        """Tests that Revit native Area, Volume, and Material Takeoff are extracted with 100% precision."""
+        import conversion_router
+        from scanner import ScannedObject
+
+        class MockParamVal(object):
+            def __init__(self, d_val=0.0):
+                self.d_val = d_val
+                self.HasValue = True
+                self.IsReadOnly = False
+                self.str_val = ""
+            def AsDouble(self):
+                return self.d_val
+            def Set(self, v):
+                self.str_val = str(v)
+
+        class MockElemWithQuantities(object):
+            def __init__(self):
+                # 100 sq ft area, 50 cu ft volume
+                self.params = {
+                    1: MockParamVal(100.0),   # HOST_AREA_COMPUTED
+                    2: MockParamVal(50.0),    # HOST_VOLUME_COMPUTED
+                    3: MockParamVal()         # ALL_MODEL_INSTANCE_COMMENTS
+                }
+                self.mat_ids = [501, 502]
+            def get_Parameter(self, bip):
+                return self.params.get(bip)
+            def LookupParameter(self, name):
+                return None
+            def GetMaterialIds(self, paint):
+                class _MatList(list):
+                    Count = 2
+                return _MatList(self.mat_ids)
+            def GetMaterialVolume(self, mid):
+                return 35.0 if mid == 501 else 15.0
+            def GetMaterialArea(self, mid, paint):
+                return 70.0 if mid == 501 else 30.0
+
+        class MockDocQ(object):
+            def GetElement(self, mid):
+                class _Mat:
+                    Name = "Concrete Structure" if mid == 501 else "Mortar Finish"
+                return _Mat()
+
+        class MockElementIdQ(object):
+            InvalidElementId = -1
+            def __init__(self, val=-1):
+                self.val = val
+            def __eq__(self, other):
+                if hasattr(other, "val"):
+                    return self.val == other.val
+                return self.val == other
+
+        class MockDBQ(object):
+            Level = type("Level", (), {})
+            FloorType = type("FloorType", (), {})
+            WallType = type("WallType", (), {})
+            RoofType = type("RoofType", (), {})
+            CeilingType = type("CeilingType", (), {})
+            ElementTypeGroup = type("ETG", (), {"FloorType": 1, "WallType": 2, "RoofType": 3, "CeilingType": 4})
+            BuiltInParameter = type("BIP", (), {
+                "HOST_AREA_COMPUTED": 1,
+                "HOST_VOLUME_COMPUTED": 2,
+                "ALL_MODEL_INSTANCE_COMMENTS": 3
+            })
+            ElementId = MockElementIdQ
+            @staticmethod
+            def FilteredElementCollector(doc):
+                class _Col(object):
+                    def __init__(self, d): pass
+                    def OfClass(self, cls): return self
+                    def FirstElement(self): return None
+                    def __iter__(self): return iter([])
+                return _Col(doc)
+
+        orig_revit = conversion_router.REVIT_AVAILABLE
+        orig_db = getattr(conversion_router, "DB", None)
+        try:
+            conversion_router.REVIT_AVAILABLE = True
+            conversion_router.DB = MockDBQ
+
+            doc = MockDocQ()
+            router = conversion_router.ConversionRouter(doc)
+
+            elem = MockElemWithQuantities()
+            scanned = ScannedObject("elem-guid-123")
+            scanned.area = 10.0
+            scanned.volume = 1.5
+
+            res = conversion_router.ConversionResult("elem-guid-123")
+            router._extract_element_quantities(elem, scanned, res)
+
+            # 100 sq ft * 0.09290304 = 9.29 sqm
+            self.assertAlmostEqual(res.area_sqm, 9.29, places=2)
+            # 50 cu ft * 0.0283168 = 1.42 cum
+            self.assertAlmostEqual(res.volume_cum, 1.42, places=2)
+            # Material takeoff should have 2 materials
+            self.assertIn("Concrete Structure", res.material_takeoff)
+            self.assertIn("Mortar Finish", res.material_takeoff)
+            # Primary material should be Concrete Structure (35 cuft > 15 cuft)
+            self.assertEqual(res.primary_material, "Concrete Structure")
+            # 35 cu ft * 0.0283168 = 0.99 cum
+            self.assertAlmostEqual(res.material_volume_cum, 0.99, places=2)
+            # Comments parameter written
+            self.assertIn("R2R | Area: 9.29 m² | Vol: 1.42 m³", elem.params[3].str_val)
+        finally:
+            conversion_router.REVIT_AVAILABLE = orig_revit
+            if orig_db is not None:
+                conversion_router.DB = orig_db
+
+    def test_reporting_volumetric_and_material_takeoff(self):
+        """Tests that QualityAuditReport aggregates floor, wall, and material takeoff schedules."""
+        from reporting import TransferQAReport, ReportExporter
+
+        report = TransferQAReport()
+        # Floor record
+        report.element_records.append({
+            "rhino_guid": "floor-1",
+            "revit_element_id": 1001,
+            "layer_name": "A-FLOR",
+            "category": "Floors",
+            "strategy": "FloorNative",
+            "sync_state": "CREATE",
+            "confidence_pct": 100.0,
+            "bim_status": "PASS",
+            "graphics_status": "PASS",
+            "overall_status": "COMPLETE",
+            "view_matrix": {"Plan": "PASS", "Section": "PASS"},
+            "rhino_area": 120.0,
+            "rhino_volume": 36.0,
+            "area_sqm": 120.0,
+            "volume_cum": 36.0,
+            "material_name": "Reinforced Concrete",
+            "material_volume_cum": 36.0,
+            "material_takeoff": {
+                "Reinforced Concrete": {"volume_cum": 36.0, "area_sqm": 120.0}
+            },
+            "bua_area": 120.0,
+            "issues": []
+        })
+        # Wall record
+        report.element_records.append({
+            "rhino_guid": "wall-1",
+            "revit_element_id": 1002,
+            "layer_name": "A-WALL",
+            "category": "Walls",
+            "strategy": "WallByCurve",
+            "sync_state": "CREATE",
+            "confidence_pct": 100.0,
+            "bim_status": "PASS",
+            "graphics_status": "PASS",
+            "overall_status": "COMPLETE",
+            "view_matrix": {"Plan": "PASS", "Section": "PASS"},
+            "rhino_area": 50.0,
+            "rhino_volume": 10.0,
+            "area_sqm": 50.0,
+            "volume_cum": 10.0,
+            "material_name": "Brick Masonry",
+            "material_volume_cum": 10.0,
+            "material_takeoff": {
+                "Brick Masonry": {"volume_cum": 10.0, "area_sqm": 50.0}
+            },
+            "bua_area": 0.0,
+            "issues": []
+        })
+
+        report.compute_bua_summary()
+        self.assertEqual(report.bua_stats["revit_floor_area_sqm"], 120.0)
+        self.assertEqual(report.bua_stats["revit_floor_volume_cum"], 36.0)
+        self.assertEqual(report.bua_stats["revit_wall_area_sqm"], 50.0)
+        self.assertEqual(report.bua_stats["revit_wall_volume_cum"], 10.0)
+        self.assertEqual(report.bua_stats["total_material_volume_cum"], 46.0)
+        self.assertIn("Reinforced Concrete", report.bua_stats["material_takeoff"])
+        self.assertIn("Brick Masonry", report.bua_stats["material_takeoff"])
+
+        test_dir = os.path.join(pkg_dir, "test_output")
+        os.makedirs(test_dir, exist_ok=True)
+        html_p = os.path.join(test_dir, "test_takeoff.html")
+        csv_p = os.path.join(test_dir, "test_takeoff.csv")
+
+        ReportExporter.export_html(report, html_p)
+        ReportExporter.export_csv(report, csv_p)
+
+        with open(html_p, "r", encoding="utf-8") as f:
+            html_text = f.read()
+        self.assertIn("Compound Material Takeoff Schedule", html_text)
+        self.assertIn("Reinforced Concrete", html_text)
+        self.assertIn("Brick Masonry", html_text)
+        self.assertIn("46.0 m³", html_text)
+
+        with open(csv_p, "r", encoding="utf-8") as f:
+            csv_text = f.read()
+        self.assertIn("volume_cum", csv_text)
+        self.assertIn("Reinforced Concrete", csv_text)
+
+    def test_direct_shape_quantities_and_geometry_solid_volume(self):
+        """Tests that DirectShape elements without HOST_VOLUME_COMPUTED compute volume from solid geometry."""
+        import conversion_router
+        from scanner import ScannedObject
+
+        class MockSolid(object):
+            def __init__(self, vol=70.6293):  # 70.6293 cu ft = 2.0 m³
+                self.Volume = vol
+                self.SurfaceArea = 107.639    # 107.639 sq ft = 10.0 m²
+
+        class MockDSElement(object):
+            def __init__(self):
+                self.solids = [MockSolid(70.6293)]
+            def get_Parameter(self, bip):
+                return None
+            def get_Geometry(self, opt):
+                return self.solids
+            def LookupParameter(self, name):
+                return None
+
+        class MockDocDS(object):
+            pass
+
+        class MockDBDS(object):
+            Options = type("Options", (), {})
+            Level = type("Level", (), {})
+            FloorType = type("FloorType", (), {})
+            WallType = type("WallType", (), {})
+            RoofType = type("RoofType", (), {})
+            CeilingType = type("CeilingType", (), {})
+            ElementTypeGroup = type("ETG", (), {"FloorType": 1, "WallType": 2, "RoofType": 3, "CeilingType": 4})
+            ElementId = type("EID", (), {"InvalidElementId": -1})
+            @staticmethod
+            def FilteredElementCollector(doc):
+                class _Col(object):
+                    def __init__(self, d): pass
+                    def OfClass(self, cls): return self
+                    def FirstElement(self): return None
+                    def __iter__(self): return iter([])
+                return _Col(doc)
+
+        orig_revit = conversion_router.REVIT_AVAILABLE
+        orig_db = getattr(conversion_router, "DB", None)
+        try:
+            conversion_router.REVIT_AVAILABLE = True
+            conversion_router.DB = MockDBDS
+
+            doc = MockDocDS()
+            router = conversion_router.ConversionRouter(doc)
+
+            ds_elem = MockDSElement()
+            scanned = ScannedObject("ds-guid-999")
+            scanned.material_name = "Concrete Precast"
+
+            res = conversion_router.ConversionResult("ds-guid-999")
+            router._extract_element_quantities(ds_elem, scanned, res)
+
+            # 70.6293 cu ft * 0.028316846 = 2.00 cum
+            self.assertAlmostEqual(res.volume_cum, 2.0, places=2)
+            self.assertEqual(res.primary_material, "Concrete Precast")
+            self.assertAlmostEqual(res.material_volume_cum, 2.0, places=2)
+            self.assertIn("Concrete Precast", res.material_takeoff)
+        finally:
+            conversion_router.REVIT_AVAILABLE = orig_revit
+            if orig_db is not None:
+                conversion_router.DB = orig_db
+
 
 if __name__ == "__main__":
     unittest.main()

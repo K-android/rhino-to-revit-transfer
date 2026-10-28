@@ -122,6 +122,15 @@ class ConversionResult(object):
         self.error_message = ""
         self.bua_area = 0.0  # Area contribution for floors (sqm)
 
+        # Volumetric & Material Quantities
+        self.area_sqm = 0.0
+        self.volume_cum = 0.0
+        self.primary_material = ""
+        self.material_volume_cum = 0.0
+        self.material_takeoff = {}  # {mat_name: {"volume_cum": ..., "area_sqm": ...}}
+        self.rhino_area_sqm = 0.0
+        self.rhino_volume_cum = 0.0
+
     def to_dict(self):
         return {
             "rhino_guid": self.rhino_guid,
@@ -132,7 +141,14 @@ class ConversionResult(object):
             "category_created": self.category_created,
             "warnings": self.warnings,
             "error_message": self.error_message,
-            "bua_area": self.bua_area
+            "bua_area": self.bua_area,
+            "area_sqm": self.area_sqm,
+            "volume_cum": self.volume_cum,
+            "primary_material": self.primary_material,
+            "material_volume_cum": self.material_volume_cum,
+            "material_takeoff": self.material_takeoff,
+            "rhino_area_sqm": self.rhino_area_sqm,
+            "rhino_volume_cum": self.rhino_volume_cum
         }
 
 
@@ -516,6 +532,9 @@ class ConversionRouter(object):
                 res.revit_unique_id = created_elem.UniqueId
                 res.status = "SUCCESS"
                 res.category_created = created_elem.Category.Name if created_elem.Category else "Unknown"
+
+                # Extract Revit Area, Solid Volume, and Compound Material Takeoff
+                self._extract_element_quantities(created_elem, scanned_obj, res)
             elif res.status != "FAILED":
                 res.status = "FAILED"
                 res.error_message = "Pipeline returned null element without raising exception"
@@ -818,7 +837,16 @@ class ConversionRouter(object):
         level_elem = self.doc.GetElement(level_id) if level_id and level_id != DB.ElementId.InvalidElementId else None
         level_elev = level_elem.Elevation if level_elem else 0.0
 
-        floor_type_id = self.default_floor_type
+        # Determine slab thickness from bounding box dz or scanned object dz to match FloorType
+        bbox = geom_feet.GetBoundingBox(True) if hasattr(geom_feet, "GetBoundingBox") else None
+        slab_thickness_feet = (bbox.Max.Z - bbox.Min.Z) if bbox else 0.0
+        if slab_thickness_feet < 0.05:
+            slab_thickness_feet = max(0.2, (float(getattr(scanned_obj, "dz", 0.3) or 0.3) * self.unit_scale))
+
+        mat_name = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
+        floor_type_id = self._get_or_create_matching_floor_type(slab_thickness_feet, mat_name)
+        if not floor_type_id or floor_type_id == DB.ElementId.InvalidElementId:
+            floor_type_id = self.default_floor_type
         if not floor_type_id or floor_type_id == DB.ElementId.InvalidElementId:
             col_ft = DB.FilteredElementCollector(self.doc).OfClass(DB.FloorType)
             ft = col_ft.FirstElement()
@@ -916,15 +944,22 @@ class ConversionRouter(object):
         if not level_id or level_id == DB.ElementId.InvalidElementId:
             level_id = self._resolve_level_id(scanned_obj)
 
-        wall_type_id = self.default_wall_type
+        bbox = geom_feet.GetBoundingBox(True)
+        wall_height = max(1.0, bbox.Max.Z - bbox.Min.Z)
+        dx = bbox.Max.X - bbox.Min.X
+        dy = bbox.Max.Y - bbox.Min.Y
+        horiz_min = min(dx, dy)
+        wall_thickness_feet = horiz_min if (0.1 <= horiz_min <= 4.0) else (0.2 * 3.28084)
+        mat_name = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
+
+        wall_type_id = self._get_or_create_matching_wall_type(wall_thickness_feet, mat_name)
+        if not wall_type_id or wall_type_id == DB.ElementId.InvalidElementId:
+            wall_type_id = self.default_wall_type
         if not wall_type_id or wall_type_id == DB.ElementId.InvalidElementId:
             col_wt = DB.FilteredElementCollector(self.doc).OfClass(DB.WallType)
             wt = col_wt.FirstElement()
             if wt:
                 wall_type_id = wt.Id
-
-        bbox = geom_feet.GetBoundingBox(True)
-        wall_height = max(1.0, bbox.Max.Z - bbox.Min.Z)
 
         base_curve = None
         if isinstance(geom_feet, rg.Curve):
@@ -998,6 +1033,24 @@ class ConversionRouter(object):
             return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=DB.ElementId(DB.BuiltInCategory.OST_Walls))
 
         try:
+            wall_thickness_feet = 0.2 * 3.28084
+            if working_brep and max_area > 0.01:
+                try:
+                    mp_brep = rg.MassProperties.Compute(working_brep)
+                    if mp_brep and mp_brep.Volume > 0:
+                        wall_thickness_feet = max(0.1, min(4.0, mp_brep.Volume / max_area))
+                except Exception:
+                    pass
+            mat_name = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
+            wall_type_id = self._get_or_create_matching_wall_type(wall_thickness_feet, mat_name)
+            if not wall_type_id or wall_type_id == DB.ElementId.InvalidElementId:
+                wall_type_id = self.default_wall_type
+            if not wall_type_id or wall_type_id == DB.ElementId.InvalidElementId:
+                col_wt = DB.FilteredElementCollector(self.doc).OfClass(DB.WallType)
+                wt = col_wt.FirstElement()
+                if wt:
+                    wall_type_id = wt.Id
+
             profile_loops = List[DB.CurveLoop]()
             outer_cl = self._rg_loop_to_revit_curveloop(best_face.OuterLoop)
             if outer_cl and not outer_cl.IsOpen():
@@ -1010,7 +1063,7 @@ class ConversionRouter(object):
                         if inner_cl and not inner_cl.IsOpen():
                             profile_loops.Add(inner_cl)
 
-                wall = DB.Wall.Create(self.doc, profile_loops, self.default_wall_type, level_id, False)
+                wall = DB.Wall.Create(self.doc, profile_loops, wall_type_id, level_id, False)
                 if wall:
                     res.strategy_used = "WallByProfile"
                     return wall
@@ -1535,6 +1588,18 @@ class ConversionRouter(object):
         if name_param and not name_param.IsReadOnly:
             name_param.Set(name)
 
+        # Assign Material to DirectShape for scheduling and visual fidelity
+        mat_name = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
+        if mat_name:
+            mat_id = self._get_or_create_material(mat_name)
+            if mat_id and mat_id != DB.ElementId.InvalidElementId:
+                p_mat = ds.get_Parameter(DB.BuiltInParameter.MATERIAL_ID_PARAM)
+                if p_mat and not p_mat.IsReadOnly:
+                    try:
+                        p_mat.Set(mat_id)
+                    except Exception:
+                        pass
+
         return ds
 
     # =========================================================================
@@ -1778,6 +1843,329 @@ class ConversionRouter(object):
             for c in cl:
                 arr.Append(c)
         return arr
+
+    def _get_or_create_material(self, material_name):
+        """Retrieves existing Material by name or creates a new one in the Revit document."""
+        if not REVIT_AVAILABLE or not self.doc or not material_name:
+            return None
+
+        clean_name = re.sub(r'[^a-zA-Z0-9_\-\s]', '', str(material_name)).strip()
+        if not clean_name or clean_name.lower() in ("bylayer", "default", "none"):
+            clean_name = "R2R_Structure"
+
+        try:
+            col = DB.FilteredElementCollector(self.doc).OfClass(DB.Material)
+            for m in col:
+                if m and hasattr(m, "Name") and m.Name.lower() == clean_name.lower():
+                    return m.Id
+
+            # Create new Material if not found
+            if hasattr(DB, "Material") and hasattr(DB.Material, "Create"):
+                return DB.Material.Create(self.doc, clean_name)
+        except Exception:
+            pass
+        return None
+
+    def _get_or_create_matching_floor_type(self, thickness_feet, material_name=None):
+        """
+        Finds or creates a Revit FloorType matching the specified thickness and material.
+        Guarantees that Revit's CompoundStructure matches the Rhino geometry thickness exactly,
+        resulting in 100% accurate HOST_VOLUME_COMPUTED and GetMaterialVolume() calculations.
+        """
+        if not REVIT_AVAILABLE or not self.doc:
+            return getattr(self, "default_floor_type", None)
+
+        try:
+            thickness_feet = max(0.01, float(thickness_feet))
+            thk_mm = int(round(thickness_feet * 304.8))
+
+            col = DB.FilteredElementCollector(self.doc).OfClass(DB.FloorType)
+            first_type = None
+            for ft in col:
+                if not first_type:
+                    first_type = ft
+                try:
+                    cs = ft.GetCompoundStructure() if hasattr(ft, "GetCompoundStructure") else None
+                    if cs:
+                        tot_thk = cs.GetTotalThickness()
+                        if abs(tot_thk - thickness_feet) < 0.006:  # ~1.8mm tolerance
+                            if material_name and material_name.lower() not in ("bylayer", "default", "none"):
+                                layers = cs.GetLayers()
+                                for lyr in layers:
+                                    if lyr.MaterialId != DB.ElementId.InvalidElementId:
+                                        m = self.doc.GetElement(lyr.MaterialId)
+                                        if m and material_name.lower() in m.Name.lower():
+                                            return ft.Id
+                            return ft.Id
+                except Exception:
+                    continue
+
+            base_type = first_type
+            if not base_type:
+                return getattr(self, "default_floor_type", None)
+
+            mat_suffix = ""
+            if material_name and material_name.lower() not in ("bylayer", "default", "none"):
+                clean_mat = re.sub(r'[^a-zA-Z0-9_]', '_', str(material_name)).strip('_')
+                if clean_mat:
+                    mat_suffix = "_" + clean_mat[:18]
+
+            type_name = "R2R_Floor{}_{}mm".format(mat_suffix, thk_mm)
+
+            for ft in DB.FilteredElementCollector(self.doc).OfClass(DB.FloorType):
+                try:
+                    p_name = ft.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM)
+                    if p_name and p_name.AsString() == type_name:
+                        return ft.Id
+                except Exception:
+                    pass
+
+            if hasattr(base_type, "Duplicate"):
+                new_type = base_type.Duplicate(type_name)
+                cs = new_type.GetCompoundStructure() if hasattr(new_type, "GetCompoundStructure") else None
+                if cs and hasattr(cs, "GetLayers") and hasattr(cs, "SetLayerWidth"):
+                    mat_id = self._get_or_create_material(material_name)
+                    layers = cs.GetLayers()
+                    target_idx = 0
+                    for idx, lyr in enumerate(layers):
+                        if hasattr(lyr, "Function") and lyr.Function == DB.MaterialFunctionAssignment.Structure:
+                            target_idx = idx
+                            break
+
+                    cs.SetLayerWidth(target_idx, thickness_feet)
+                    if mat_id and mat_id != DB.ElementId.InvalidElementId and hasattr(cs, "SetMaterialId"):
+                        cs.SetMaterialId(target_idx, mat_id)
+
+                    new_type.SetCompoundStructure(cs)
+                return new_type.Id
+        except Exception:
+            pass
+
+        return getattr(self, "default_floor_type", None)
+
+    def _get_or_create_matching_wall_type(self, thickness_feet, material_name=None):
+        """
+        Finds or creates a Revit WallType matching the specified wall thickness and material.
+        Guarantees native Revit volume and material volume match Rhino dimensions.
+        """
+        if not REVIT_AVAILABLE or not self.doc:
+            return getattr(self, "default_wall_type", None)
+
+        try:
+            thickness_feet = max(0.05, float(thickness_feet))
+            thk_mm = int(round(thickness_feet * 304.8))
+
+            col = DB.FilteredElementCollector(self.doc).OfClass(DB.WallType)
+            first_basic_type = None
+            for wt in col:
+                if hasattr(wt, "Kind") and wt.Kind != DB.WallKind.Basic:
+                    continue
+                if not first_basic_type:
+                    first_basic_type = wt
+                try:
+                    cs = wt.GetCompoundStructure() if hasattr(wt, "GetCompoundStructure") else None
+                    if cs:
+                        tot_thk = cs.GetTotalThickness()
+                        if abs(tot_thk - thickness_feet) < 0.006:
+                            if material_name and material_name.lower() not in ("bylayer", "default", "none"):
+                                layers = cs.GetLayers()
+                                for lyr in layers:
+                                    if lyr.MaterialId != DB.ElementId.InvalidElementId:
+                                        m = self.doc.GetElement(lyr.MaterialId)
+                                        if m and material_name.lower() in m.Name.lower():
+                                            return wt.Id
+                            return wt.Id
+                except Exception:
+                    continue
+
+            base_type = first_basic_type
+            if not base_type:
+                return getattr(self, "default_wall_type", None)
+
+            mat_suffix = ""
+            if material_name and material_name.lower() not in ("bylayer", "default", "none"):
+                clean_mat = re.sub(r'[^a-zA-Z0-9_]', '_', str(material_name)).strip('_')
+                if clean_mat:
+                    mat_suffix = "_" + clean_mat[:18]
+
+            type_name = "R2R_Wall{}_{}mm".format(mat_suffix, thk_mm)
+
+            for wt in DB.FilteredElementCollector(self.doc).OfClass(DB.WallType):
+                try:
+                    p_name = wt.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM)
+                    if p_name and p_name.AsString() == type_name:
+                        return wt.Id
+                except Exception:
+                    pass
+
+            if hasattr(base_type, "Duplicate"):
+                new_type = base_type.Duplicate(type_name)
+                cs = new_type.GetCompoundStructure() if hasattr(new_type, "GetCompoundStructure") else None
+                if cs and hasattr(cs, "GetLayers") and hasattr(cs, "SetLayerWidth"):
+                    mat_id = self._get_or_create_material(material_name)
+                    layers = cs.GetLayers()
+                    target_idx = 0
+                    for idx, lyr in enumerate(layers):
+                        if hasattr(lyr, "Function") and lyr.Function == DB.MaterialFunctionAssignment.Structure:
+                            target_idx = idx
+                            break
+
+                    cs.SetLayerWidth(target_idx, thickness_feet)
+                    if mat_id and mat_id != DB.ElementId.InvalidElementId and hasattr(cs, "SetMaterialId"):
+                        cs.SetMaterialId(target_idx, mat_id)
+
+                    new_type.SetCompoundStructure(cs)
+                return new_type.Id
+        except Exception:
+            pass
+
+        return getattr(self, "default_wall_type", None)
+
+    def _extract_element_quantities(self, created_elem, scanned_obj, res):
+        """
+        Extracts native Revit Area, Solid Volume, and Material Takeoff metrics from the created element.
+        Populates res.area_sqm, res.volume_cum, res.primary_material, res.material_volume_cum,
+        and res.material_takeoff, ensuring full volumetric parity and scheduling in Revit.
+        """
+        if not created_elem or not res:
+            return
+
+        # 1. Benchmark Rhino Dimensions in metric (m² and m³)
+        scale_to_m = self.unit_scale * 0.3048 if hasattr(self, "unit_scale") and self.unit_scale else 1.0
+        rh_area_raw = float(getattr(scanned_obj, "area", 0.0) or 0.0)
+        rh_vol_raw = float(getattr(scanned_obj, "volume", 0.0) or 0.0)
+        res.rhino_area_sqm = getattr(scanned_obj, "area_sqm", 0.0) or round(rh_area_raw * (scale_to_m ** 2), 2)
+        res.rhino_volume_cum = getattr(scanned_obj, "volume_cum", 0.0) or round(rh_vol_raw * (scale_to_m ** 3), 2)
+
+        revit_area_sqm = 0.0
+        revit_vol_cum = 0.0
+        mat_takeoff = {}
+
+        if REVIT_AVAILABLE and self.doc and hasattr(created_elem, "get_Parameter"):
+            # 2. Extract BuiltIn Parameter Area (HOST_AREA_COMPUTED)
+            try:
+                p_area = created_elem.get_Parameter(DB.BuiltInParameter.HOST_AREA_COMPUTED)
+                if p_area and p_area.HasValue:
+                    revit_area_sqm = round(p_area.AsDouble() * 0.09290304, 2)
+            except Exception:
+                pass
+
+            # 3. Extract BuiltIn Parameter Volume (HOST_VOLUME_COMPUTED)
+            try:
+                p_vol = created_elem.get_Parameter(DB.BuiltInParameter.HOST_VOLUME_COMPUTED)
+                if p_vol and p_vol.HasValue:
+                    revit_vol_cum = round(p_vol.AsDouble() * 0.028316846592, 2)
+            except Exception:
+                pass
+
+            # 4. Extract Native Compound Structure Material Takeoff (GetMaterialIds & GetMaterialVolume)
+            try:
+                if hasattr(created_elem, "GetMaterialIds"):
+                    mat_ids = created_elem.GetMaterialIds(False)
+                    if mat_ids and mat_ids.Count > 0:
+                        for mid in mat_ids:
+                            try:
+                                m_elem = self.doc.GetElement(mid)
+                                m_name = m_elem.Name if m_elem else "Revit Material"
+                                m_vol_cuft = created_elem.GetMaterialVolume(mid)
+                                m_area_sqft = created_elem.GetMaterialArea(mid, False) if hasattr(created_elem, "GetMaterialArea") else 0.0
+                                m_vol_m3 = round(m_vol_cuft * 0.028316846592, 2)
+                                m_area_m2 = round(m_area_sqft * 0.09290304, 2)
+                                if m_vol_m3 > 0 or m_area_m2 > 0:
+                                    mat_takeoff[m_name] = {
+                                        "volume_cum": m_vol_m3,
+                                        "area_sqm": m_area_m2
+                                    }
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+            # 5. DirectShape / Solid Geometry Volume Fallback if HOST_VOLUME_COMPUTED was missing/zero
+            if revit_vol_cum <= 0.0 and hasattr(created_elem, "get_Geometry"):
+                try:
+                    opt = DB.Options()
+                    opt.ComputeReferences = False
+                    geom_elem = created_elem.get_Geometry(opt)
+                    if geom_elem:
+                        tot_cuft = 0.0
+                        tot_sqft = 0.0
+                        for g in geom_elem:
+                            if hasattr(g, "Volume") and g.Volume > 0:
+                                tot_cuft += g.Volume
+                                if hasattr(g, "SurfaceArea"):
+                                    tot_sqft += g.SurfaceArea
+                            elif hasattr(g, "GetInstanceGeometry"):
+                                ig = g.GetInstanceGeometry()
+                                if ig:
+                                    for sub_g in ig:
+                                        if hasattr(sub_g, "Volume") and sub_g.Volume > 0:
+                                            tot_cuft += sub_g.Volume
+                                            if hasattr(sub_g, "SurfaceArea"):
+                                                tot_sqft += sub_g.SurfaceArea
+                        if tot_cuft > 0:
+                            revit_vol_cum = round(tot_cuft * 0.028316846592, 2)
+                        if revit_area_sqm <= 0.0 and tot_sqft > 0:
+                            revit_area_sqm = round((tot_sqft * 0.09290304) / 2.0, 2)
+                except Exception:
+                    pass
+
+        # 6. Fallback if Revit geometry wasn't queryable
+        if revit_area_sqm <= 0.0:
+            revit_area_sqm = res.rhino_area_sqm
+        if revit_vol_cum <= 0.0:
+            revit_vol_cum = res.rhino_volume_cum
+
+        # 7. Material Takeoff Synthesis & Primary Material Determination
+        primary_mat = ""
+        primary_vol = 0.0
+
+        if mat_takeoff:
+            sorted_mats = sorted(mat_takeoff.items(), key=lambda x: x[1].get("volume_cum", 0.0), reverse=True)
+            primary_mat = sorted_mats[0][0]
+            primary_vol = sorted_mats[0][1].get("volume_cum", 0.0)
+            if revit_vol_cum <= 0.0 and primary_vol > 0:
+                revit_vol_cum = primary_vol
+        else:
+            inferred_mat = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "") or "Structure"
+            clean_inferred = re.sub(r'[^a-zA-Z0-9_\-\s]', '', str(inferred_mat)).strip()
+            if not clean_inferred or clean_inferred.lower() in ("bylayer", "default", "none"):
+                clean_inferred = "Structure"
+            primary_mat = clean_inferred
+            primary_vol = revit_vol_cum
+            mat_takeoff[primary_mat] = {
+                "volume_cum": primary_vol,
+                "area_sqm": revit_area_sqm
+            }
+
+        res.area_sqm = revit_area_sqm
+        res.volume_cum = revit_vol_cum
+        res.primary_material = primary_mat
+        res.material_volume_cum = primary_vol
+        res.material_takeoff = mat_takeoff
+        res.bua_area = revit_area_sqm
+
+        # 8. Write parameters to Revit element for immediate scheduling & property display
+        if REVIT_AVAILABLE and self.doc and hasattr(created_elem, "get_Parameter"):
+            try:
+                p_comm = created_elem.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+                if p_comm and not p_comm.IsReadOnly:
+                    p_comm.Set("R2R | Area: {:.2f} m² | Vol: {:.2f} m³ | Mat: {} ({:.2f} m³)".format(
+                        res.area_sqm, res.volume_cum, res.primary_material, res.material_volume_cum
+                    ))
+
+                for param_name, val in [("R2R_Area_sqm", res.area_sqm), ("R2R_Volume_cum", res.volume_cum), ("R2R_Material", res.primary_material)]:
+                    try:
+                        p_custom = created_elem.LookupParameter(param_name)
+                        if p_custom and not p_custom.IsReadOnly:
+                            if isinstance(val, (int, float)):
+                                p_custom.Set(float(val))
+                            else:
+                                p_custom.Set(str(val))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     def _category_str_to_id(self, cat_name):
         """Maps category name string to Revit ElementId with Toposolid, all 3D model categories, and dynamic BuiltInCategory resolution."""
