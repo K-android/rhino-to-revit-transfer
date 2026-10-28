@@ -507,6 +507,29 @@ class RhinoScanner(object):
                 scanned.is_horizontal = (horiz_face_count / float(face_count)) > 0.3 or (scanned.dz < min(scanned.dx, scanned.dy) * 0.4 and horiz_face_count >= 1)
                 scanned.is_vertical = (vert_face_count / float(face_count)) > 0.3 or (scanned.dz >= 1.5 and vert_face_count >= 1)
 
+            # For solid 3D Breps (irregular/planar slabs and walls), extract architectural surface area
+            if working_brep.IsSolid and face_count > 1:
+                try:
+                    top_area = 0.0
+                    vert_area = 0.0
+                    for face in working_brep.Faces:
+                        u_mid = 0.5 * (face.Domain(0).Min + face.Domain(0).Max)
+                        v_mid = 0.5 * (face.Domain(1).Min + face.Domain(1).Max)
+                        norm = face.NormalAt(u_mid, v_mid)
+                        norm.Unitize()
+                        f_mp = rg.MassProperties.Compute(face)
+                        f_area = f_mp.Area if f_mp else 0.0
+                        if norm.Z > 0.5:
+                            top_area += f_area
+                        elif abs(norm.Z) < 0.3:
+                            vert_area += f_area
+                    if scanned.is_horizontal and top_area > 0:
+                        scanned.area = round(top_area, 3)
+                    elif scanned.is_vertical and vert_area > 0:
+                        scanned.area = round(vert_area / 2.0, 3)
+                except Exception:
+                    pass
+
             # Planarity check
             try:
                 scanned.is_planar = working_brep.Faces.Count == 1 and working_brep.Faces[0].IsPlanar(0.01)

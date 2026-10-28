@@ -2090,10 +2090,26 @@ class ConversionRouter(object):
                     if geom_elem:
                         tot_cuft = 0.0
                         tot_sqft = 0.0
+                        top_face_sqft = 0.0
+                        vert_face_sqft = 0.0
                         for g in geom_elem:
                             if hasattr(g, "Volume") and g.Volume > 0:
                                 tot_cuft += g.Volume
-                                if hasattr(g, "SurfaceArea"):
+                                if hasattr(g, "Faces"):
+                                    for f in g.Faces:
+                                        f_area = f.Area if hasattr(f, "Area") else 0.0
+                                        tot_sqft += f_area
+                                        try:
+                                            bb = f.GetBoundingBox()
+                                            uv_mid = DB.UV(0.5 * (bb.Min.U + bb.Max.U), 0.5 * (bb.Min.V + bb.Max.V))
+                                            n = f.ComputeNormal(uv_mid)
+                                            if n.Z > 0.5:
+                                                top_face_sqft += f_area
+                                            elif abs(n.Z) < 0.3:
+                                                vert_face_sqft += f_area
+                                        except Exception:
+                                            pass
+                                elif hasattr(g, "SurfaceArea"):
                                     tot_sqft += g.SurfaceArea
                             elif hasattr(g, "GetInstanceGeometry"):
                                 ig = g.GetInstanceGeometry()
@@ -2103,10 +2119,18 @@ class ConversionRouter(object):
                                             tot_cuft += sub_g.Volume
                                             if hasattr(sub_g, "SurfaceArea"):
                                                 tot_sqft += sub_g.SurfaceArea
+
                         if tot_cuft > 0:
                             revit_vol_cum = round(tot_cuft * 0.028316846592, 2)
-                        if revit_area_sqm <= 0.0 and tot_sqft > 0:
-                            revit_area_sqm = round((tot_sqft * 0.09290304) / 2.0, 2)
+                        if revit_area_sqm <= 0.0:
+                            is_horiz = getattr(scanned_obj, "is_horizontal", False)
+                            is_vert = getattr(scanned_obj, "is_vertical", False)
+                            if is_horiz and top_face_sqft > 0:
+                                revit_area_sqm = round(top_face_sqft * 0.09290304, 2)
+                            elif is_vert and vert_face_sqft > 0:
+                                revit_area_sqm = round((vert_face_sqft * 0.09290304) / 2.0, 2)
+                            elif tot_sqft > 0:
+                                revit_area_sqm = round((tot_sqft * 0.09290304) / 2.0, 2)
                 except Exception:
                     pass
 

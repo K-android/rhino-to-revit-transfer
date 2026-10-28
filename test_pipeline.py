@@ -1311,6 +1311,98 @@ class TestR2RPipeline(unittest.TestCase):
             if orig_db is not None:
                 conversion_router.DB = orig_db
 
+    def test_irregular_non_planar_geometry_quantities(self):
+        """Tests that irregular/warped/double-curved solid geometry calculates true top surface area and solid volume."""
+        import conversion_router
+        from scanner import ScannedObject
+
+        class MockFace(object):
+            def __init__(self, area, normal_z):
+                self.Area = area
+                self.normal_z = normal_z
+            def GetBoundingBox(self):
+                class _BB:
+                    Min = type("P", (), {"U": 0, "V": 0})()
+                    Max = type("P", (), {"U": 1, "V": 1})()
+                return _BB()
+            def ComputeNormal(self, uv):
+                class _N:
+                    Z = self.normal_z
+                return _N()
+
+        class MockIrregularSolid(object):
+            def __init__(self):
+                # Sloped/warped slab with 100 sq ft top face (nz=0.9), 100 sq ft bottom face (nz=-0.9), 20 sq ft sides (nz=0)
+                # Total volume = 60 cu ft (~1.70 cum)
+                self.Volume = 60.0
+                self.Faces = [
+                    MockFace(100.0, 0.9),   # Top walkable/sloped surface
+                    MockFace(100.0, -0.9),  # Soffit
+                    MockFace(10.0, 0.0),    # Side 1
+                    MockFace(10.0, 0.0),    # Side 2
+                ]
+
+        class MockIrregularElement(object):
+            def __init__(self):
+                self.solids = [MockIrregularSolid()]
+            def get_Parameter(self, bip):
+                return None
+            def get_Geometry(self, opt):
+                return self.solids
+            def LookupParameter(self, name):
+                return None
+
+        class MockDocIrr(object):
+            pass
+
+        class MockDBIrr(object):
+            Options = type("Options", (), {})
+            UV = lambda u, v: None
+            Level = type("Level", (), {})
+            FloorType = type("FloorType", (), {})
+            WallType = type("WallType", (), {})
+            RoofType = type("RoofType", (), {})
+            CeilingType = type("CeilingType", (), {})
+            ElementTypeGroup = type("ETG", (), {"FloorType": 1, "WallType": 2, "RoofType": 3, "CeilingType": 4})
+            ElementId = type("EID", (), {"InvalidElementId": -1})
+            @staticmethod
+            def FilteredElementCollector(doc):
+                class _Col(object):
+                    def __init__(self, d): pass
+                    def OfClass(self, cls): return self
+                    def FirstElement(self): return None
+                    def __iter__(self): return iter([])
+                return _Col(doc)
+
+        orig_revit = conversion_router.REVIT_AVAILABLE
+        orig_db = getattr(conversion_router, "DB", None)
+        try:
+            conversion_router.REVIT_AVAILABLE = True
+            conversion_router.DB = MockDBIrr
+
+            doc = MockDocIrr()
+            router = conversion_router.ConversionRouter(doc)
+
+            elem = MockIrregularElement()
+            scanned = ScannedObject("irr-guid-1")
+            scanned.is_horizontal = True  # Irregular floor slab
+            scanned.material_name = "Reinforced Cast-in-Place"
+
+            res = conversion_router.ConversionResult("irr-guid-1")
+            router._extract_element_quantities(elem, scanned, res)
+
+            # Volume: 60 cu ft * 0.028316846 = 1.70 cum
+            self.assertAlmostEqual(res.volume_cum, 1.70, places=2)
+            # Area: 100 sq ft top face * 0.09290304 = 9.29 sqm (architectural top surface, not total 220 envelope)
+            self.assertAlmostEqual(res.area_sqm, 9.29, places=2)
+            # Material volume: 1.70 cum
+            self.assertAlmostEqual(res.material_volume_cum, 1.70, places=2)
+            self.assertEqual(res.primary_material, "Reinforced Cast-in-Place")
+        finally:
+            conversion_router.REVIT_AVAILABLE = orig_revit
+            if orig_db is not None:
+                conversion_router.DB = orig_db
+
 
 if __name__ == "__main__":
     unittest.main()
