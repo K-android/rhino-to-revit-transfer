@@ -793,6 +793,131 @@ class TestR2RPipeline(unittest.TestCase):
             cat = clf._refine_family_category(obj)
             self.assertEqual(cat, expected_cat, "Failed refining '{}' / '{}'".format(layer, name))
 
+    def test_native_floor_pipeline_execution(self):
+        """Tests that _pipeline_1_native_floor creates native Floor, applies offset, and sets room bounding."""
+        import conversion_router
+        from scanner import ScannedObject
+
+        class MockParam(object):
+            def __init__(self):
+                self.val = None
+                self.IsReadOnly = False
+            def Set(self, v):
+                self.val = v
+
+        class MockFloor(object):
+            def __init__(self, eid=9999):
+                self.Id = eid
+                self.UniqueId = "mock-floor-uuid-1234"
+                self.Category = type("Cat", (), {"Name": "Floors"})()
+                self.params = {
+                    1: MockParam(),  # FLOOR_HEIGHTABOVELEVEL_PARAM
+                    2: MockParam(),  # WALL_ATTR_ROOM_BOUNDING
+                }
+            def get_Parameter(self, bip):
+                return self.params.get(bip)
+
+        class MockLevel(object):
+            def __init__(self, name, elev, lid):
+                self.Name = name
+                self.Elevation = elev
+                self.Id = lid
+
+        class MockBuiltInParam(object):
+            FLOOR_HEIGHTABOVELEVEL_PARAM = 1
+            WALL_ATTR_ROOM_BOUNDING = 2
+
+        class MockFloorAPI(object):
+            created_instances = []
+            @classmethod
+            def Create(cls, doc, loops, floor_type_id, level_id):
+                inst = MockFloor()
+                cls.created_instances.append((loops, floor_type_id, level_id))
+                return inst
+
+        class MockElementTypeGroup(object):
+            FloorType = 1
+            WallType = 2
+            RoofType = 3
+            CeilingType = 4
+
+        class MockCollector(object):
+            def __init__(self, doc, items=None):
+                self.items = items if items is not None else []
+            def OfClass(self, cls):
+                return self
+            def FirstElement(self):
+                return self.items[0] if self.items else None
+            def __iter__(self):
+                return iter(self.items)
+
+        class MockDoc(object):
+            def __init__(self):
+                self.levels = [MockLevel("Level 1", 0.0, 101), MockLevel("Level 2", 12.0, 102)]
+            def GetDefaultElementTypeId(self, group):
+                return 201
+            def GetElement(self, eid):
+                for lvl in self.levels:
+                    if lvl.Id == eid:
+                        return lvl
+                return None
+
+        class MockDBFull(object):
+            Floor = MockFloorAPI
+            BuiltInParameter = MockBuiltInParam
+            ElementTypeGroup = MockElementTypeGroup
+            CurveLoop = object
+            Level = object
+            FloorType = object
+            WallType = object
+            RoofType = object
+            CeilingType = object
+            @staticmethod
+            def FilteredElementCollector(doc):
+                return MockCollector(doc, doc.levels if hasattr(doc, "levels") else [])
+            @staticmethod
+            def ElementId(v):
+                return v
+
+        MockDBFull.ElementId.InvalidElementId = -1
+
+        orig_revit = conversion_router.REVIT_AVAILABLE
+        orig_db = getattr(conversion_router, "DB", None)
+        try:
+            conversion_router.REVIT_AVAILABLE = True
+            conversion_router.DB = MockDBFull
+
+            doc = MockDoc()
+            router = conversion_router.ConversionRouter(doc)
+            router.default_floor_type = 201
+            router.level_cache["Level 1"] = 101
+            router.level_cache["Level 2"] = 102
+
+            # Mock boundary loop extraction to return a synthetic outer curve
+            router._extract_floor_boundary_loops = lambda geom, obj: ("outer_curve", [], 12.5)
+            router._build_curveloop_from_rhino_curve = lambda crv, target_z=None, is_outer=True: "mock_curveloop"
+
+            scanned = ScannedObject("floor-guid-001")
+            scanned.layer_name = "A-FLOR"
+            scanned.nearest_level_name = "Level 2"
+            scanned.area = 250.0
+
+            res = conversion_router.ConversionResult("floor-guid-001")
+            floor_elem = router._pipeline_1_native_floor(scanned, "mock_geom", 102, None, res)
+
+            self.assertIsNotNone(floor_elem)
+            self.assertEqual(res.strategy_used, "FloorNative")
+            self.assertEqual(res.bua_area, 250.0)
+            # Offset should be slab_z (12.5) - level_elev (12.0) = 0.5
+            self.assertAlmostEqual(floor_elem.params[1].val, 0.5, places=2)
+            # Room bounding should be 1
+            self.assertEqual(floor_elem.params[2].val, 1)
+
+        finally:
+            conversion_router.REVIT_AVAILABLE = orig_revit
+            if orig_db is not None:
+                conversion_router.DB = orig_db
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2054,6 +2054,9 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                         self.txt_exec_log.Text += "[SUCCESS] {} -> Revit ID {} ({})\n".format(
                             obj.layer_name, conv_res.revit_element_id, conv_res.strategy_used
                         )
+                        if conv_res.warnings:
+                            for w in conv_res.warnings:
+                                self.txt_exec_log.Text += "  [NOTICE] {}\n".format(w)
 
                         # Dual-Status Validation
                         val_rep = self.validator.validate_element(conv_res.revit_element_id, guid)
