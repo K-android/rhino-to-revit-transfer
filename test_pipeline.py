@@ -2075,6 +2075,205 @@ class TestR2RPipeline(unittest.TestCase):
             cr.REVIT_AVAILABLE = orig_revit
             cr.DB = orig_db
 
+    def test_revit_material_selector_and_overrides(self):
+        """Tests that LayerRowItem and LayerConfigDialog manage Revit material selections cleanly."""
+        from ui_dialog import LayerRowItem, LayerConfigDialog
+        from profile_manager import MappingRule
+
+        class MockObj(object):
+            def __init__(self):
+                self.classification = None
+
+        row = LayerRowItem("CAVE_WALLS", [MockObj()], None, None)
+        self.assertEqual(row.selected_material, "<Auto from Rhino>")
+
+        # Update material
+        row.update_material("Concrete, Cast-in-Place")
+        self.assertEqual(row.selected_material, "Concrete, Cast-in-Place")
+
+        # Fallback to auto when empty
+        row.update_material("")
+        self.assertEqual(row.selected_material, "<Auto from Rhino>")
+
+        # MappingRule with material
+        rule = MappingRule("CAVE_WALLS", material="Sandstone")
+        self.assertEqual(rule.material, "Sandstone")
+
+        # LayerConfigDialog material dropdown verification
+        project_mats = ["<Auto from Rhino>", "Concrete, Cast-in-Place", "Sandstone", "Granite"]
+        dlg = LayerConfigDialog(row, revit_materials=project_mats)
+        if hasattr(dlg, "dd_material"):
+            self.assertEqual(len(dlg.dd_material.Items), 4)
+            dlg.dd_material.SelectedIndex = 2  # Sandstone
+            dlg._on_apply(None, None)
+            self.assertEqual(row.selected_material, "Sandstone")
+
+    def test_direct_shape_and_family_material_pipeline_enforcement(self):
+        """Tests that user-selected Revit material is applied to DirectShape and FamilyInstance pipelines."""
+        import conversion_router as cr
+        from scanner import ScannedObject
+        from profile_manager import MappingRule
+        from conversion_router import ConversionResult
+
+        class MockParam(object):
+            def __init__(self):
+                self.val = None
+                self.HasValue = False
+                self.IsReadOnly = False
+            def Set(self, v):
+                self.val = v
+                self.HasValue = True
+            def AsElementId(self):
+                return self.val
+
+        class MockMaterialElem(object):
+            def __init__(self, mid, name):
+                self.Id = mid
+                self.Name = name
+
+        class MockDirectShape(object):
+            def __init__(self):
+                self.Id = 1001
+                self.UniqueId = "ds-unique-1001"
+                self.Category = type("Cat", (), {"Name": "Generic Models"})
+                self.params = {1: MockParam(), 2: MockParam()} # 1: MARK, 2: MATERIAL_ID_PARAM
+            def SetShape(self, geoms):
+                pass
+            def get_Parameter(self, bip):
+                return self.params.get(bip)
+            def LookupParameter(self, name):
+                return None
+
+        class MockFamilyInst(object):
+            def __init__(self):
+                self.Id = 2001
+                self.UniqueId = "fam-unique-2001"
+                self.Category = type("Cat", (), {"Name": "Generic Models"})
+                self.params = {"Element_Material": MockParam()}
+            def get_Parameter(self, bip):
+                return None
+            def LookupParameter(self, name):
+                return self.params.get(name)
+
+        class MockCollector(object):
+            def __init__(self, mats):
+                self.mats = mats
+                self.cls = None
+            def OfClass(self, cls):
+                self.cls = cls
+                return self
+            def FirstElement(self):
+                return None
+            def __iter__(self):
+                if self.cls == MockDB.Material:
+                    return iter(self.mats)
+                return iter([])
+
+        sandstone_mat = MockMaterialElem(301, "Sandstone")
+        concrete_mat = MockMaterialElem(302, "Concrete, Cast-in-Place")
+        all_mats = [sandstone_mat, concrete_mat]
+
+        class MockDoc(object):
+            def GetElement(self, mid):
+                for m in all_mats:
+                    if m.Id == mid:
+                        return m
+                return None
+
+        class MockBICMeta(type):
+            def __getattr__(cls, name):
+                return -2000150
+
+        class MockBIC(object, metaclass=MockBICMeta):
+            OST_GenericModel = -2000150
+
+        class MockElementId(object):
+            InvalidElementId = -1
+            def __init__(self, val=-1):
+                self.val = val
+            def __eq__(self, other):
+                if hasattr(other, "val"):
+                    return self.val == other.val
+                return self.val == other
+
+        class MockDB(object):
+            XYZ = staticmethod(lambda x, y, z: type("XYZ", (), {"X": x, "Y": y, "Z": z})())
+            Level = type("Level", (), {})
+            FloorType = type("FloorType", (), {})
+            WallType = type("WallType", (), {})
+            RoofType = type("RoofType", (), {})
+            CeilingType = type("CeilingType", (), {})
+            FamilySymbol = type("FamilySymbol", (), {})
+            Material = type("Material", (), {})
+            ElementTypeGroup = type("ETG", (), {"FloorType": 1, "WallType": 2, "RoofType": 3, "CeilingType": 4})
+            DirectShape = type("DirectShape", (), {
+                "CreateElement": staticmethod(lambda d, c: MockDirectShape()),
+                "IsValidCategoryId": staticmethod(lambda c, d: True)
+            })
+            BuiltInParameter = type("BIP", (), {
+                "ALL_MODEL_MARK": 1,
+                "MATERIAL_ID_PARAM": 2,
+                "HOST_AREA_COMPUTED": 3,
+                "HOST_VOLUME_COMPUTED": 4,
+                "ALL_MODEL_INSTANCE_COMMENTS": 5
+            })
+            BuiltInCategory = MockBIC
+            ElementId = MockElementId
+            FilteredElementCollector = staticmethod(lambda d: MockCollector(all_mats))
+
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_db = cr.DB
+        try:
+            cr.REVIT_AVAILABLE = True
+            cr.DB = MockDB
+            doc = MockDoc()
+            router = cr.ConversionRouter(doc)
+
+            # 1. Test DirectShape with material override "Sandstone"
+            obj = ScannedObject("test-ds-guid")
+            obj.layer_name = "Subterranean_Mesh"
+            obj.raw_geometry = type("Mesh", (), {})()
+            rule_ds = MappingRule("Subterranean_Mesh", material="Sandstone")
+            res_ds = ConversionResult("test-ds-guid")
+
+            # Mock _convert_rhino_to_revit_geometry to return dummy geometry
+            router._convert_rhino_to_revit_geometry = lambda g, geom_feet=None, material_id=None: ["dummy_geom"]
+
+            ds_elem = router._pipeline_9_direct_shape(obj, None, None, profile_rule=rule_ds, res=res_ds)
+            self.assertIsNotNone(ds_elem)
+            # Verify MATERIAL_ID_PARAM was set to Sandstone's Id (301)
+            p_mat = ds_elem.get_Parameter(2)
+            self.assertEqual(p_mat.val, 301)
+
+            # Verify _extract_element_quantities resolves primary_material as "Sandstone"
+            router._extract_element_quantities(ds_elem, obj, res_ds, profile_rule=rule_ds)
+            self.assertEqual(res_ds.primary_material, "Sandstone")
+
+            # 2. Test FamilyInstance material parameter assignment
+            inst_obj = MockFamilyInst()
+            rule_fam = MappingRule("Cave_Vault", material="Concrete, Cast-in-Place")
+            obj_fam = ScannedObject("test-fam-guid")
+            obj_fam.layer_name = "Cave_Vault"
+            obj_fam.centroid = (0.0, 0.0, 0.0)
+            res_fam = ConversionResult("test-fam-guid")
+
+            # Mock symbol and NewFamilyInstance
+            mock_sym = type("Sym", (), {"IsActive": True, "LookupParameter": lambda s, n: None})()
+            router.family_symbol_cache["test-fam-guid"] = mock_sym
+            doc.Create = type("Create", (), {
+                "NewFamilyInstance": lambda *a, **k: inst_obj
+            })()
+            cr.DB.Structure = type("Struct", (), {"StructuralType": type("ST", (), {"NonStructural": 0})})()
+
+            placed = router._pipeline_8c_parametric_family(obj_fam, None, None, profile_rule=rule_fam, res=res_fam)
+            self.assertIsNotNone(placed)
+            # Verify Element_Material on instance was set to Concrete's Id (302)
+            p_fam_mat = placed.LookupParameter("Element_Material")
+            self.assertEqual(p_fam_mat.val, 302)
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            cr.DB = orig_db
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -591,7 +591,7 @@ class ConversionRouter(object):
                 res.category_created = created_elem.Category.Name if created_elem.Category else "Unknown"
 
                 # Extract Revit Area, Solid Volume, and Compound Material Takeoff
-                self._extract_element_quantities(created_elem, scanned_obj, res)
+                self._extract_element_quantities(created_elem, scanned_obj, res, profile_rule=profile_rule)
             elif res.status != "FAILED":
                 res.status = "FAILED"
                 res.error_message = "Pipeline returned null element without raising exception"
@@ -1417,6 +1417,28 @@ class ConversionRouter(object):
                     axis = DB.Line.CreateBound(pt, DB.XYZ(pt.X, pt.Y, pt.Z + 1.0))
                     DB.ElementTransformUtils.RotateElement(self.doc, inst.Id, axis, scanned_obj.rotation_angle)
                 if inst:
+                    # Set material on FamilyInstance if applicable
+                    mat_to_set = None
+                    override_mat = getattr(profile_rule, "material", None)
+                    if override_mat and override_mat not in ("<Auto from Rhino>", "ByLayer", "Default", ""):
+                        mat_to_set = override_mat
+                    else:
+                        mat_to_set = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
+
+                    if mat_to_set:
+                        mat_id = self._get_or_create_material(mat_to_set)
+                        if mat_id and mat_id != DB.ElementId.InvalidElementId:
+                            for p_mat_name in ("Element_Material", "Material", "Material_Override", "Finish"):
+                                p_m = inst.LookupParameter(p_mat_name)
+                                if not p_m and hasattr(sym, "LookupParameter"):
+                                    p_m = sym.LookupParameter(p_mat_name)
+                                if p_m and not p_m.IsReadOnly:
+                                    try:
+                                        p_m.Set(mat_id)
+                                        break
+                                    except Exception:
+                                        pass
+
                     res.strategy_used = "RepetitiveFamily"
                     return inst
             except Exception as ex:
@@ -1611,6 +1633,28 @@ class ConversionRouter(object):
                                     break
                                 except Exception:
                                     pass
+                    # Set material parameter on FamilyInstance if applicable
+                    mat_to_set = None
+                    override_mat = getattr(profile_rule, "material", None)
+                    if override_mat and override_mat not in ("<Auto from Rhino>", "ByLayer", "Default", ""):
+                        mat_to_set = override_mat
+                    else:
+                        mat_to_set = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
+
+                    if mat_to_set:
+                        mat_id = self._get_or_create_material(mat_to_set)
+                        if mat_id and mat_id != DB.ElementId.InvalidElementId:
+                            for p_mat_name in ("Element_Material", "Material", "Material_Override", "Finish"):
+                                p_m = inst.LookupParameter(p_mat_name)
+                                if not p_m and hasattr(target_sym, "LookupParameter"):
+                                    p_m = target_sym.LookupParameter(p_mat_name)
+                                if p_m and not p_m.IsReadOnly:
+                                    try:
+                                        p_m.Set(mat_id)
+                                        break
+                                    except Exception:
+                                        pass
+
                     res.strategy_used = "FamilyInstance"
                     return inst
             except Exception as ex:
@@ -1655,9 +1699,15 @@ class ConversionRouter(object):
 
         # Resolve material before converting geometry so tessellated faces receive the material ID
         mat_id = None
-        mat_name = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
-        obj_color = getattr(scanned_obj, "object_color", None)
-        color_rgb = (int(obj_color[0]), int(obj_color[1]), int(obj_color[2])) if (obj_color and len(obj_color) >= 3) else None
+        override_mat = getattr(profile_rule, "material", None)
+        if override_mat and override_mat not in ("<Auto from Rhino>", "ByLayer", "Default", ""):
+            mat_name = override_mat
+            color_rgb = None
+        else:
+            mat_name = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
+            obj_color = getattr(scanned_obj, "object_color", None)
+            color_rgb = (int(obj_color[0]), int(obj_color[1]), int(obj_color[2])) if (obj_color and len(obj_color) >= 3) else None
+
         if mat_name:
             mat_id = self._get_or_create_material(mat_name, color_rgb=color_rgb)
 
@@ -1972,15 +2022,18 @@ class ConversionRouter(object):
         if not REVIT_AVAILABLE or not self.doc or not material_name:
             return None
 
-        clean_name = re.sub(r'[^a-zA-Z0-9_\-\s]', '', str(material_name)).strip()
+        raw_name = str(material_name).strip()
+        clean_name = re.sub(r'[^a-zA-Z0-9_\-\s,()\.#\+]', '', raw_name).strip()
         if not clean_name or clean_name.lower() in ("bylayer", "default", "none"):
             clean_name = "R2R_Structure"
 
         try:
             col = DB.FilteredElementCollector(self.doc).OfClass(DB.Material)
             for m in col:
-                if m and hasattr(m, "Name") and m.Name.lower() == clean_name.lower():
-                    return m.Id
+                if m and hasattr(m, "Name"):
+                    m_name = m.Name.strip().lower()
+                    if m_name == raw_name.lower() or m_name == clean_name.lower():
+                        return m.Id
 
             # Create new Material if not found
             if hasattr(DB, "Material") and hasattr(DB.Material, "Create"):
@@ -2152,7 +2205,7 @@ class ConversionRouter(object):
 
         return getattr(self, "default_wall_type", None)
 
-    def _extract_element_quantities(self, created_elem, scanned_obj, res):
+    def _extract_element_quantities(self, created_elem, scanned_obj, res, profile_rule=None):
         """
         Extracts native Revit Area, Solid Volume, and Material Takeoff metrics from the created element.
         Populates res.area_sqm, res.volume_cum, res.primary_material, res.material_volume_cum,
@@ -2211,6 +2264,22 @@ class ConversionRouter(object):
                                 pass
             except Exception:
                 pass
+
+            # DirectShape / FamilyInstance Material parameter check if GetMaterialIds returned nothing
+            if not mat_takeoff and hasattr(created_elem, "get_Parameter"):
+                try:
+                    bip_mat = getattr(getattr(DB, "BuiltInParameter", None), "MATERIAL_ID_PARAM", None)
+                    if bip_mat:
+                        p_mat = created_elem.get_Parameter(bip_mat)
+                        if p_mat and p_mat.HasValue:
+                            m_elem = self.doc.GetElement(p_mat.AsElementId())
+                            if m_elem and hasattr(m_elem, "Name"):
+                                mat_takeoff[m_elem.Name] = {
+                                    "volume_cum": revit_vol_cum,
+                                    "area_sqm": revit_area_sqm
+                                }
+                except Exception:
+                    pass
 
             # 5. DirectShape / Solid Geometry Volume Fallback if HOST_VOLUME_COMPUTED was missing/zero
             if revit_vol_cum <= 0.0 and hasattr(created_elem, "get_Geometry"):
@@ -2282,7 +2351,11 @@ class ConversionRouter(object):
             if revit_vol_cum <= 0.0 and primary_vol > 0:
                 revit_vol_cum = primary_vol
         else:
-            inferred_mat = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "") or "Structure"
+            override_mat = getattr(profile_rule, "material", None) if profile_rule else None
+            if override_mat and override_mat not in ("<Auto from Rhino>", "ByLayer", "Default", ""):
+                inferred_mat = override_mat
+            else:
+                inferred_mat = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "") or "Structure"
             clean_inferred = re.sub(r'[^a-zA-Z0-9_\-\s]', '', str(inferred_mat)).strip()
             if not clean_inferred or clean_inferred.lower() in ("bylayer", "default", "none"):
                 clean_inferred = "Structure"

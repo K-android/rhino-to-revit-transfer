@@ -60,7 +60,7 @@ except (ImportError, ValueError):
 class LayerRowItem(object):
     """Data item model for the Review & Configure GridView."""
 
-    def __init__(self, layer_name, objects, classification, sync_eval, checked=True):
+    def __init__(self, layer_name, objects, classification, sync_eval, checked=True, selected_material="<Auto from Rhino>"):
         self.checked = checked
         self.layer_name = layer_name
         self.objects = objects  # list of ScannedObject
@@ -73,6 +73,7 @@ class LayerRowItem(object):
         self.confidence_tier = classification.confidence_tier if classification else "MANUAL_OR_EXCLUDED"
         self.sync_state = sync_eval.sync_state if sync_eval else "CREATE"
         self.sync_eval = sync_eval
+        self.selected_material = selected_material or "<Auto from Rhino>"
 
         # Geometric pattern & adaptive summary tag
         adaptive_cnt = sum(1 for o in objects if getattr(o, "adaptive_point_count", 0) in (2, 3, 4))
@@ -88,6 +89,10 @@ class LayerRowItem(object):
             self.pattern_tag = "Repetitive ({}x)".format(rep_cnt)
         else:
             self.pattern_tag = "Unique Mesh/Brep"
+
+    def update_material(self, new_material):
+        """Updates selected Revit material for the layer."""
+        self.selected_material = str(new_material).strip() if new_material else "<Auto from Rhino>"
 
     def update_strategy(self, new_strategy):
         """Updates proposed strategy and recalculates confidence score based on geometric compatibility."""
@@ -300,16 +305,16 @@ STANDARD_REVIT_CATEGORIES = [
 
 
 class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
-    """Direct modal dialog to inspect and edit category, strategy, and transfer inclusion for a layer."""
+    """Direct modal dialog to inspect and edit category, strategy, material, and transfer inclusion for a layer."""
 
-    def __init__(self, layer_row, parent=None):
+    def __init__(self, layer_row, parent=None, revit_materials=None):
         if not ETO_AVAILABLE:
             return
 
         super(LayerConfigDialog, self).__init__()
         self.layer_row = layer_row
         self.Title = "Edit Layer Mapping: {}".format(layer_row.layer_name)
-        self.ClientSize = ed.Size(480, 320)
+        self.ClientSize = ed.Size(500, 370)
         self.Resizable = False
         self.Padding = ed.Padding(16)
 
@@ -374,6 +379,30 @@ class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         row_strat.EndHorizontal()
         layout.Add(row_strat)
 
+        # Material Dropdown
+        lbl_mat = ef.Label()
+        lbl_mat.Text = "Revit Material:"
+        self.dd_material = ef.DropDown()
+        mats_list = list(revit_materials) if revit_materials else (
+            list(parent.revit_materials) if parent and hasattr(parent, "revit_materials") and parent.revit_materials else ["<Auto from Rhino>"]
+        )
+        if "<Auto from Rhino>" not in mats_list:
+            mats_list.insert(0, "<Auto from Rhino>")
+        for m in mats_list:
+            self.dd_material.Items.Add(m)
+
+        curr_mat = getattr(layer_row, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>"
+        match_mat_idx = next((i for i, m in enumerate(mats_list) if m.lower() == curr_mat.lower()), 0)
+        self.dd_material.SelectedIndex = match_mat_idx
+
+        row_mat = ef.DynamicLayout()
+        row_mat.Spacing = ed.Size(8, 5)
+        row_mat.BeginHorizontal()
+        row_mat.Add(lbl_mat)
+        row_mat.Add(self.dd_material, True)
+        row_mat.EndHorizontal()
+        layout.Add(row_mat)
+
         # Checkbox
         self.chk_include = ef.CheckBox()
         self.chk_include.Text = "Include this layer in Revit transfer"
@@ -405,10 +434,12 @@ class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
     def _on_apply(self, sender, e):
         sel_cat = str(self.dd_cat.SelectedValue or "Generic Models")
         sel_strat = str(self.dd_strat.SelectedValue or "DirectShape")
+        sel_mat = str(self.dd_material.SelectedValue or "<Auto from Rhino>")
 
         self.layer_row.checked = bool(self.chk_include.Checked)
         self.layer_row.update_category(sel_cat)
         self.layer_row.update_strategy(sel_strat)
+        self.layer_row.update_material(sel_mat)
 
         for obj in self.layer_row.objects:
             c = getattr(obj, "classification", None)
@@ -672,8 +703,26 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.validation_rows = []  # list of ValidationRowItem
         self.qa_report = TransferQAReport()
 
+        # Query Revit Materials
+        self.revit_materials = self._get_project_materials()
+
         # Build UI Structure
         self._init_ui()
+
+    def _get_project_materials(self):
+        """Queries the active Revit document for all available project materials."""
+        mats = ["<Auto from Rhino>"]
+        if REVIT_AVAILABLE and self.revit_doc:
+            try:
+                col = DB.FilteredElementCollector(self.revit_doc).OfClass(DB.Material)
+                names = []
+                for m in col:
+                    if hasattr(m, "Name") and m.Name:
+                        names.append(m.Name)
+                mats.extend(sorted(names, key=lambda s: s.lower()))
+            except Exception:
+                pass
+        return mats
 
     def _create_separator(self):
         """Creates a 1px horizontal divider panel compatible with all Eto.Forms versions."""
@@ -1045,6 +1094,20 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         btn_apply_cat.ToolTip = "Override the Revit category for all currently checked layers"
         btn_apply_cat.Click += self._on_apply_category_override
 
+        lbl_mat_override = ef.Label()
+        lbl_mat_override.Text = "Override Material:"
+        lbl_mat_override.VerticalAlignment = ef.VerticalAlignment.Center
+
+        self.dd_mat_override = ef.DropDown()
+        for mat_opt in (self.revit_materials or ["<Auto from Rhino>"]):
+            self.dd_mat_override.Items.Add(mat_opt)
+        self.dd_mat_override.SelectedIndex = 0
+
+        btn_apply_mat = ef.Button()
+        btn_apply_mat.Text = "Apply Material"
+        btn_apply_mat.ToolTip = "Override the Revit material for all currently checked or selected layers"
+        btn_apply_mat.Click += self._on_apply_material_override
+
         lbl_rep_thresh = ef.Label()
         lbl_rep_thresh.Text = "Repetition Grouping:"
         lbl_rep_thresh.VerticalAlignment = ef.VerticalAlignment.Center
@@ -1064,6 +1127,9 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         strat_layout.Add(lbl_cat_override)
         strat_layout.Add(self.dd_cat_override)
         strat_layout.Add(btn_apply_cat)
+        strat_layout.Add(lbl_mat_override)
+        strat_layout.Add(self.dd_mat_override)
+        strat_layout.Add(btn_apply_mat)
         strat_layout.Add(lbl_rep_thresh)
         strat_layout.Add(self.dd_rep_threshold)
         strat_layout.EndHorizontal()
@@ -1120,27 +1186,35 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         col_type = ef.GridColumn()
         col_type.HeaderText = "Target Revit Type"
         col_type.DataCell = ef.TextBoxCell(5)
-        col_type.Width = 150
+        col_type.Width = 140
         self.grid_review.Columns.Add(col_type)
+
+        # Revit Material
+        col_mat = ef.GridColumn()
+        col_mat.HeaderText = "Revit Material"
+        col_mat.DataCell = ef.TextBoxCell(6)
+        col_mat.Width = 140
+        col_mat.Editable = True
+        self.grid_review.Columns.Add(col_mat)
 
         # Confidence
         col_conf = ef.GridColumn()
         col_conf.HeaderText = "Confidence"
-        col_conf.DataCell = ef.TextBoxCell(6)
+        col_conf.DataCell = ef.TextBoxCell(7)
         col_conf.Width = 90
         self.grid_review.Columns.Add(col_conf)
 
         # Sync State
         col_sync = ef.GridColumn()
         col_sync.HeaderText = "Sync State"
-        col_sync.DataCell = ef.TextBoxCell(7)
+        col_sync.DataCell = ef.TextBoxCell(8)
         col_sync.Width = 110
         self.grid_review.Columns.Add(col_sync)
 
         # Pattern / Signature
         col_pattern = ef.GridColumn()
         col_pattern.HeaderText = "Pattern / Points"
-        col_pattern.DataCell = ef.TextBoxCell(8)
+        col_pattern.DataCell = ef.TextBoxCell(9)
         col_pattern.Width = 140
         self.grid_review.Columns.Add(col_pattern)
 
@@ -1155,7 +1229,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             ctx_menu = ef.ContextMenu()
 
             item_edit = ef.ButtonMenuItem()
-            item_edit.Text = "Edit Layer Category & Strategy (Double-Click)..."
+            item_edit.Text = "Edit Layer Category, Strategy & Material (Double-Click)..."
             item_edit.Click += self._on_ctx_edit_layer
             ctx_menu.Items.Add(item_edit)
 
@@ -1182,6 +1256,18 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 q_item.Click += _make_strat_cb(q_strat)
                 strat_menu.Items.Add(q_item)
             ctx_menu.Items.Add(strat_menu)
+
+            mat_menu = ef.ButtonMenuItem()
+            mat_menu.Text = "Quick Set Material"
+            avail_mats = self.revit_materials if self.revit_materials else ["<Auto from Rhino>"]
+            for q_mat in avail_mats[:40]:
+                q_item = ef.ButtonMenuItem()
+                q_item.Text = q_mat
+                def _make_mat_cb(m_name):
+                    return lambda s, e: self._quick_set_material(m_name)
+                q_item.Click += _make_mat_cb(q_mat)
+                mat_menu.Items.Add(q_item)
+            ctx_menu.Items.Add(mat_menu)
 
             self.grid_review.ContextMenu = ctx_menu
         except Exception:
@@ -1383,6 +1469,20 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 except Exception as ex_lvl:
                     print("[R2R Scan] Level query notice: {}".format(ex_lvl))
 
+                self.revit_materials = self._get_project_materials()
+                if hasattr(self, "dd_mat_override") and self.dd_mat_override:
+                    try:
+                        curr_sel = self.dd_mat_override.SelectedValue
+                        self.dd_mat_override.Items.Clear()
+                        for m in self.revit_materials:
+                            self.dd_mat_override.Items.Add(m)
+                        if curr_sel and curr_sel in self.revit_materials:
+                            self.dd_mat_override.SelectedValue = curr_sel
+                        else:
+                            self.dd_mat_override.SelectedIndex = 0
+                    except Exception:
+                        pass
+
             include_hidden = self.chk_include_hidden.Checked or False
             include_locked = self.chk_include_locked.Checked or False
 
@@ -1458,7 +1558,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.sync_evaluations, self.missing_in_rhino = self.sync_engine.evaluate_sync_states(self.scanned_objects)
 
     def _sync_grid_check_states(self):
-        """Syncs checkbox state and category/strategy changes made in Eto GridView back to LayerRowItem objects."""
+        """Syncs checkbox state, category, strategy, and material changes made in Eto GridView back to LayerRowItem objects."""
         try:
             ds = self.grid_review.DataStore
             if ds is not None and self.filtered_layer_rows:
@@ -1485,8 +1585,8 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                                     row_data[4] = row.proposed_strategy
                                 if len(row_data) > 5:
                                     row_data[5] = row.revit_type
-                                if len(row_data) > 6:
-                                    row_data[6] = "{:.0f}%".format(row.confidence_score)
+                                if len(row_data) > 7:
+                                    row_data[7] = "{:.0f}%".format(row.confidence_score)
                                 changed = True
 
                         # If strategy was modified in-place (column 4)
@@ -1500,8 +1600,15 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                                         c.proposed_strategy = row.proposed_strategy
                                         c.confidence_score = row.confidence_score
                                         c.confidence_tier = row.confidence_tier
-                                if len(row_data) > 6:
-                                    row_data[6] = "{:.0f}%".format(row.confidence_score)
+                                if len(row_data) > 7:
+                                    row_data[7] = "{:.0f}%".format(row.confidence_score)
+                                changed = True
+
+                        # If material was modified in-place (column 6)
+                        if len(row_data) > 6:
+                            new_mat = str(row_data[6] or "").strip()
+                            if new_mat and new_mat != getattr(row, "selected_material", "<Auto from Rhino>"):
+                                row.update_material(new_mat)
                                 changed = True
                 if changed:
                     self._update_preview_kpis()
@@ -1572,6 +1679,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 r.inferred_category,
                 r.proposed_strategy,
                 r.revit_type,
+                getattr(r, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>",
                 "{:.0f}%".format(r.confidence_score),
                 r.sync_state,
                 getattr(r, "pattern_tag", "-")
@@ -1721,6 +1829,26 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             selected_cat, len(targets), target_desc, targets[0].revit_type if targets else ""
         )
 
+    def _on_apply_material_override(self, sender, e):
+        """Overrides Revit material for highlighted row(s) or all checked layers."""
+        selected_mat = str(self.dd_mat_override.SelectedValue or "<Auto from Rhino>").strip()
+        if not selected_mat:
+            selected_mat = "<Auto from Rhino>"
+
+        targets, is_highlighted = self._get_target_review_rows()
+        if not targets:
+            self.lbl_global_status.Text = "Please select or check at least one layer to apply material override."
+            return
+
+        for r in targets:
+            r.update_material(selected_mat)
+
+        self._refresh_review_grid_datastore()
+        target_desc = "highlighted layer(s)" if is_highlighted else "checked layer(s)"
+        self.lbl_global_status.Text = "Applied material override '{}' to {} {}.".format(
+            selected_mat, len(targets), target_desc
+        )
+
     def _on_grid_cell_double_click(self, sender, e):
         """Opens LayerConfigDialog modal when user double-clicks any row in the review grid."""
         try:
@@ -1732,12 +1860,12 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
             if 0 <= sel_idx < len(self.filtered_layer_rows):
                 row = self.filtered_layer_rows[sel_idx]
-                dlg = LayerConfigDialog(row, parent=self)
+                dlg = LayerConfigDialog(row, parent=self, revit_materials=self.revit_materials)
                 if dlg.ShowModal(self):
                     self._refresh_review_grid_datastore()
                     self._update_preview_kpis()
-                    self.lbl_global_status.Text = "Updated layer '{}' -> Category: {}, Strategy: {} (Confidence: {:.0f}%).".format(
-                        row.layer_name, row.inferred_category, row.proposed_strategy, row.confidence_score
+                    self.lbl_global_status.Text = "Updated layer '{}' -> Category: {}, Strategy: {}, Material: {} (Confidence: {:.0f}%).".format(
+                        row.layer_name, row.inferred_category, row.proposed_strategy, getattr(row, "selected_material", "<Auto from Rhino>"), row.confidence_score
                     )
         except Exception as ex:
             self.lbl_global_status.Text = "Layer config dialog notice: {}".format(ex)
@@ -1745,6 +1873,20 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
     def _on_ctx_edit_layer(self, sender, e):
         """Context menu handler to edit selected layer."""
         self._on_grid_cell_double_click(sender, e)
+
+    def _quick_set_material(self, mat_name):
+        """Quick sets Revit material for selected or checked rows via context menu."""
+        targets, is_highlighted = self._get_target_review_rows()
+        if not targets:
+            self.lbl_global_status.Text = "No layers selected to set material."
+            return
+
+        for r in targets:
+            r.update_material(mat_name)
+
+        self._refresh_review_grid_datastore()
+        desc = "highlighted" if is_highlighted else "checked"
+        self.lbl_global_status.Text = "Set material '{}' on {} {} layer(s).".format(mat_name, len(targets), desc)
 
     def _quick_set_category(self, cat_name):
         """Quick sets category for selected or checked rows via context menu."""
@@ -1884,6 +2026,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                         revit_category=r.revit_type if (r.revit_type and r.revit_type.startswith("OST_")) else (r.classification.revit_category_name if r.classification else "OST_GenericModel"),
                         revit_type=r.revit_type,
                         strategy=r.proposed_strategy,
+                        material=getattr(r, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>",
                         room_bounding=True
                     )
                     self.profile_mgr.add_rule(rule)
@@ -1991,6 +2134,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                         revit_category=cat_name,
                         revit_type=r.revit_type,
                         strategy=r.proposed_strategy,
+                        material=getattr(r, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>",
                         room_bounding=True
                     )
                     profile_rules_map[r.layer_name] = rule_item
@@ -2075,6 +2219,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                             revit_category=cat_name,
                             revit_type=row.revit_type,
                             strategy=row.proposed_strategy,
+                            material=getattr(row, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>",
                             room_bounding=True
                         )
 
