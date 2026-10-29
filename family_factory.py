@@ -418,7 +418,9 @@ class FamilyFactory(object):
         rh_brep_or_solid,
         subcategory_name="R2R_Component",
         category_hint="Generic Model",
-        target_bic=None
+        target_bic=None,
+        geom_feet=None,
+        unit_scale=1.0
     ):
         """Mode B: Creates a bespoke 3D solid native .rfa family using DB.FreeFormElement.Create.
 
@@ -429,6 +431,8 @@ class FamilyFactory(object):
         :param subcategory_name: Subcategory name to assign within family
         :param category_hint: Category hint for template selection
         :param target_bic: Optional DB.BuiltInCategory override
+        :param geom_feet: Optional geometry pre-scaled to Revit internal feet for TSB
+        :param unit_scale: Scale factor from Rhino document units to Revit internal feet
         :return: Loaded DB.FamilySymbol, or None on failure
         """
         if not REVIT_AVAILABLE or not app or not project_doc or not rh_brep_or_solid:
@@ -451,7 +455,22 @@ class FamilyFactory(object):
                     b = working.ToBrep()
                     if b:
                         working = b
-                if hasattr(GeometryEncoder, "ToSolid") and isinstance(working, rg.Brep):
+
+                # Priority 1: If Mesh, attempt smooth SubD -> Brep conversion for continuous NURBS solid (NO wire lines)
+                if isinstance(working, rg.Mesh) and hasattr(rg, "SubD") and hasattr(rg.SubD, "CreateFromMesh"):
+                    try:
+                        subd = rg.SubD.CreateFromMesh(working)
+                        if subd and getattr(subd, "IsValid", False):
+                            b_subd = subd.ToBrep()
+                            if b_subd and getattr(b_subd, "IsValid", False) and hasattr(GeometryEncoder, "ToSolid"):
+                                s_subd = GeometryEncoder.ToSolid(b_subd)
+                                if s_subd and getattr(s_subd, "Volume", 0.0) > 0.00001:
+                                    revit_solid = s_subd
+                    except Exception:
+                        pass
+
+                # Priority 2: Brep ToSolid conversion
+                if not revit_solid and hasattr(GeometryEncoder, "ToSolid") and isinstance(working, rg.Brep):
                     try:
                         revit_solid = GeometryEncoder.ToSolid(working)
                     except Exception:
@@ -462,12 +481,19 @@ class FamilyFactory(object):
             # Fallback to TessellatedShapeBuilder Solid construction (handles Meshes & complex Breps)
             if (not revit_solid or getattr(revit_solid, "Volume", 0.0) <= 0.00001) and hasattr(DB, "TessellatedShapeBuilder"):
                 try:
+                    # TessellatedShapeBuilder requires coordinates in Revit internal feet
+                    working_tsb = geom_feet
+                    if not working_tsb:
+                        working_tsb = working.Duplicate() if hasattr(working, "Duplicate") else working
+                        if hasattr(working_tsb, "Scale") and abs(float(unit_scale or 1.0) - 1.0) > 0.00001:
+                            working_tsb.Scale(float(unit_scale))
+
                     meshes = []
-                    if isinstance(working, rg.Mesh):
-                        meshes = [working]
-                    elif isinstance(working, rg.Brep):
+                    if isinstance(working_tsb, rg.Mesh):
+                        meshes = [working_tsb]
+                    elif isinstance(working_tsb, rg.Brep):
                         mp = rg.MeshingParameters.Default
-                        b_meshes = rg.Mesh.CreateFromBrep(working, mp)
+                        b_meshes = rg.Mesh.CreateFromBrep(working_tsb, mp)
                         if b_meshes:
                             meshes = list(b_meshes)
 
@@ -495,6 +521,16 @@ class FamilyFactory(object):
                                     loop_pts.Add(v2)
                                     tsb.AddFace(DB.TessellatedFace(loop_pts, DB.ElementId.InvalidElementId))
                                     face_added = True
+                                if hasattr(f, "IsQuad") and f.IsQuad:
+                                    p3 = verts[f.D]
+                                    v3 = DB.XYZ(float(p3.X), float(p3.Y), float(p3.Z))
+                                    if v0.DistanceTo(v2) > 0.0001 and v2.DistanceTo(v3) > 0.0001 and v3.DistanceTo(v0) > 0.0001:
+                                        loop_pts2 = List[DB.XYZ]()
+                                        loop_pts2.Add(v0)
+                                        loop_pts2.Add(v2)
+                                        loop_pts2.Add(v3)
+                                        tsb.AddFace(DB.TessellatedFace(loop_pts2, DB.ElementId.InvalidElementId))
+                                        face_added = True
                         tsb.CloseConnectedFaceSet()
                         if face_added:
                             tsb.Target = DB.TessellatedShapeBuilderTarget.Solid

@@ -419,20 +419,24 @@ class ConversionRouter(object):
                         cx_raw = obj.centroid[0]
                         cy_raw = obj.centroid[1]
                         cz_raw = obj.centroid[2]
-                        canonical_raw = obj.raw_geometry.Duplicate() if hasattr(obj.raw_geometry, "Duplicate") else obj.raw_geometry if hasattr(obj.raw_geometry, "Duplicate") else obj.raw_geometry
-                        if hasattr(canonical_raw, "Translate"):
-                            canonical_raw.Translate(-cx_raw, -cy_raw, -cz_raw)
-                        if hasattr(canonical_raw, "Scale"):
-                            canonical_raw.Scale(self.unit_scale)
+                        canonical_rhino = obj.raw_geometry.Duplicate() if hasattr(obj.raw_geometry, "Duplicate") else obj.raw_geometry
+                        if hasattr(canonical_rhino, "Translate"):
+                            canonical_rhino.Translate(-cx_raw, -cy_raw, -cz_raw)
+
+                        canonical_feet = canonical_rhino.Duplicate() if hasattr(canonical_rhino, "Duplicate") else canonical_rhino
+                        if hasattr(canonical_feet, "Scale"):
+                            canonical_feet.Scale(self.unit_scale)
 
                         sym = FamilyFactory.create_native_freeform_family(
                             self.app,
                             self.doc,
                             family_name=fam_name,
-                            rh_brep_or_solid=canonical_raw,
+                            rh_brep_or_solid=canonical_rhino,
                             subcategory_name=obj.layer_name,
                             category_hint=inferred_cat,
-                            target_bic=target_bic
+                            target_bic=target_bic,
+                            geom_feet=canonical_feet,
+                            unit_scale=self.unit_scale
                         )
                     except Exception as ex_ff:
                         _log("  [Pre-generate FreeForm Family Exception]: {}".format(ex_ff))
@@ -483,11 +487,13 @@ class ConversionRouter(object):
                     cx_raw = obj.centroid[0]
                     cy_raw = obj.centroid[1]
                     cz_raw = obj.centroid[2]
-                    canonical_raw = obj.raw_geometry.Duplicate() if hasattr(obj.raw_geometry, "Duplicate") else obj.raw_geometry
-                    if hasattr(canonical_raw, "Translate"):
-                        canonical_raw.Translate(-cx_raw, -cy_raw, -cz_raw)
-                    if hasattr(canonical_raw, "Scale"):
-                        canonical_raw.Scale(self.unit_scale)
+                    canonical_rhino = obj.raw_geometry.Duplicate() if hasattr(obj.raw_geometry, "Duplicate") else obj.raw_geometry
+                    if hasattr(canonical_rhino, "Translate"):
+                        canonical_rhino.Translate(-cx_raw, -cy_raw, -cz_raw)
+
+                    canonical_feet = canonical_rhino.Duplicate() if hasattr(canonical_rhino, "Duplicate") else canonical_rhino
+                    if hasattr(canonical_feet, "Scale"):
+                        canonical_feet.Scale(self.unit_scale)
 
                     target_bic = self._category_str_to_bic(inferred_cat)
 
@@ -495,10 +501,12 @@ class ConversionRouter(object):
                         self.app,
                         self.doc,
                         family_name=fam_key,
-                        rh_brep_or_solid=canonical_raw,
+                        rh_brep_or_solid=canonical_rhino,
                         subcategory_name=obj.layer_name,
                         category_hint=inferred_cat,
-                        target_bic=target_bic
+                        target_bic=target_bic,
+                        geom_feet=canonical_feet,
+                        unit_scale=self.unit_scale
                     )
                     if sym:
                         self.family_symbol_cache[fam_key] = sym
@@ -506,8 +514,6 @@ class ConversionRouter(object):
                         _log("  [Phase 1] Loaded repetitive .rfa Family: '{}' ({})".format(fam_key, inferred_cat))
                     else:
                         _log("  [Phase 1 Notice] Repetitive family '{}' could not form a closed solid; DirectShape fallback will be used in Phase 2.".format(fam_key))
-
-        return self.family_symbol_cache
 
         return self.family_symbol_cache
 
@@ -1827,17 +1833,7 @@ class ConversionRouter(object):
             except Exception:
                 pass
 
-        # 1. Try RIR GeometryEncoder using native Rhino geometry (GeometryEncoder automatically scales to feet)
-        try:
-            if hasattr(GeometryEncoder, "ToGeometryObject"):
-                rvt_obj = GeometryEncoder.ToGeometryObject(working_geom)
-                if rvt_obj:
-                    geom_list.Add(rvt_obj)
-                    return geom_list
-        except Exception:
-            pass
-
-        # 2. Try specific ToSolid / ToMesh encoders
+        # 1. Try Brep ToSolid or SubD-to-Solid first (produces clean DB.Solid with NO wire lines)
         try:
             if isinstance(working_geom, rg.Brep):
                 if hasattr(GeometryEncoder, "ToSolid"):
@@ -1846,19 +1842,27 @@ class ConversionRouter(object):
                         geom_list.Add(solid)
                         return geom_list
             elif isinstance(working_geom, rg.Mesh):
-                if hasattr(GeometryEncoder, "ToMesh"):
-                    rvt_mesh = GeometryEncoder.ToMesh(working_geom)
-                    if rvt_mesh:
-                        geom_list.Add(rvt_mesh)
-                        return geom_list
+                # Attempt smooth SubD -> Brep -> Solid conversion (100% clean NURBS, zero wire lines)
+                if hasattr(rg, "SubD") and hasattr(rg.SubD, "CreateFromMesh"):
+                    try:
+                        subd = rg.SubD.CreateFromMesh(working_geom)
+                        if subd and getattr(subd, "IsValid", False):
+                            b_subd = subd.ToBrep()
+                            if b_subd and getattr(b_subd, "IsValid", False) and hasattr(GeometryEncoder, "ToSolid"):
+                                s = GeometryEncoder.ToSolid(b_subd)
+                                if s and getattr(s, "Volume", 0.0) > 0.00001:
+                                    geom_list.Add(s)
+                                    return geom_list
+                    except Exception:
+                        pass
         except Exception:
             pass
 
-        # 3. Native Revit TessellatedShapeBuilder fallback (uses geom_feet with explicit feet coordinates)
+        # 2. Native Revit TessellatedShapeBuilder (Target = Solid for clean solid body with NO wire lines, real Volume & Area)
         try:
             working_feet = geom_feet
             if not working_feet:
-                working_feet = working_geom.Duplicate()
+                working_feet = working_geom.Duplicate() if hasattr(working_geom, "Duplicate") else working_geom
                 if hasattr(working_feet, "Scale"):
                     working_feet.Scale(self.unit_scale)
 
@@ -1873,20 +1877,22 @@ class ConversionRouter(object):
 
             if meshes:
                 tsb = DB.TessellatedShapeBuilder()
-                tsb.OpenConnectedFaceSet(False)
+                tsb.OpenConnectedFaceSet(True)
                 face_added = False
                 for m in meshes:
-                    m.Faces.ConvertQuadsToTriangles()
-                    verts = m.Vertices
-                    for i in range(m.Faces.Count):
-                        f = m.Faces[i]
+                    m_copy = m.Duplicate() if hasattr(m, "Duplicate") else m
+                    if hasattr(m_copy.Faces, "ConvertQuadsToTriangles"):
+                        m_copy.Faces.ConvertQuadsToTriangles()
+                    verts = m_copy.Vertices
+                    for i in range(m_copy.Faces.Count):
+                        f = m_copy.Faces[i]
                         p0 = verts[f.A]
                         p1 = verts[f.B]
                         p2 = verts[f.C]
                         v0 = DB.XYZ(float(p0.X), float(p0.Y), float(p0.Z))
                         v1 = DB.XYZ(float(p1.X), float(p1.Y), float(p1.Z))
                         v2 = DB.XYZ(float(p2.X), float(p2.Y), float(p2.Z))
-                        if v0.DistanceTo(v1) > 0.001 and v1.DistanceTo(v2) > 0.001 and v2.DistanceTo(v0) > 0.001:
+                        if v0.DistanceTo(v1) > 0.0001 and v1.DistanceTo(v2) > 0.0001 and v2.DistanceTo(v0) > 0.0001:
                             loop_pts = List[DB.XYZ]()
                             loop_pts.Add(v0)
                             loop_pts.Add(v1)
@@ -1894,15 +1900,49 @@ class ConversionRouter(object):
                             face_mat_id = material_id if (material_id and material_id != DB.ElementId.InvalidElementId) else DB.ElementId.InvalidElementId
                             tsb.AddFace(DB.TessellatedFace(loop_pts, face_mat_id))
                             face_added = True
+                        if hasattr(f, "IsQuad") and f.IsQuad:
+                            p3 = verts[f.D]
+                            v3 = DB.XYZ(float(p3.X), float(p3.Y), float(p3.Z))
+                            if v0.DistanceTo(v2) > 0.0001 and v2.DistanceTo(v3) > 0.0001 and v3.DistanceTo(v0) > 0.0001:
+                                loop_pts2 = List[DB.XYZ]()
+                                loop_pts2.Add(v0)
+                                loop_pts2.Add(v2)
+                                loop_pts2.Add(v3)
+                                tsb.AddFace(DB.TessellatedFace(loop_pts2, face_mat_id))
+                                face_added = True
                 tsb.CloseConnectedFaceSet()
                 if face_added:
-                    tsb.Target = DB.TessellatedShapeBuilderTarget.AnyGeometry
-                    tsb.Fallback = DB.TessellatedShapeBuilderFallback.Mesh
-                    tsb.Build()
-                    res_objs = tsb.GetBuildResult().GetGeometricalObjects()
-                    if res_objs:
-                        for go in res_objs:
-                            geom_list.Add(go)
+                    # Primary attempt: Target = Solid (Clean, NO WIRE LINES, ASM Solid with Volume)
+                    tsb.Target = DB.TessellatedShapeBuilderTarget.Solid
+                    tsb.Fallback = DB.TessellatedShapeBuilderFallback.Salvage
+                    try:
+                        tsb.Build()
+                        b_res = tsb.GetBuildResult()
+                        if b_res:
+                            res_objs = b_res.GetGeometricalObjects()
+                            if res_objs:
+                                for go in res_objs:
+                                    if isinstance(go, DB.Solid) and getattr(go, "Volume", 0.0) > 0.00001:
+                                        geom_list.Add(go)
+                                if len(geom_list) > 0:
+                                    return geom_list
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # 3. Fallback for open / non-manifold meshes: Target = Mesh
+        try:
+            if hasattr(GeometryEncoder, "ToMesh") and isinstance(working_geom, rg.Mesh):
+                rvt_mesh = GeometryEncoder.ToMesh(working_geom)
+                if rvt_mesh:
+                    geom_list.Add(rvt_mesh)
+                    return geom_list
+            elif hasattr(GeometryEncoder, "ToGeometryObject"):
+                rvt_obj = GeometryEncoder.ToGeometryObject(working_geom)
+                if rvt_obj:
+                    geom_list.Add(rvt_obj)
+                    return geom_list
         except Exception:
             pass
 

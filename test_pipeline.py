@@ -1913,11 +1913,11 @@ class TestR2RPipeline(unittest.TestCase):
 
             class MockFF(object):
                 @classmethod
-                def create_native_freeform_family(cls, app, project_doc, family_name, rh_brep_or_solid, subcategory_name=None, category_hint="Generic Model", target_bic=None):
+                def create_native_freeform_family(cls, app, project_doc, family_name, rh_brep_or_solid, *args, **kwargs):
                     return MockSym(family_name)
 
                 @classmethod
-                def create_parametric_box_or_profile_family(cls, app, project_doc, family_name, width=1.0, depth=1.0, height=1.0, category_hint="Generic Model", target_bic=None):
+                def create_parametric_box_or_profile_family(cls, app, project_doc, family_name, *args, **kwargs):
                     return MockSym(family_name)
 
             cr.FamilyFactory = MockFF
