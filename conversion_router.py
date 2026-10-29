@@ -2308,6 +2308,14 @@ class ConversionRouter(object):
         if not REVIT_AVAILABLE or not self.doc or not created_elem:
             return
 
+        # Crucial Revit API requirement: Force document regeneration so newly created elements
+        # (DirectShapes and FamilyInstances) have their category-bound project parameters instantiated!
+        if hasattr(self.doc, "Regenerate"):
+            try:
+                self.doc.Regenerate()
+            except Exception:
+                pass
+
         # 1. Built-in Comments Summary (visible in any schedule querying Comments)
         try:
             p_comm = created_elem.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
@@ -2486,16 +2494,20 @@ class ConversionRouter(object):
             )
 
         try:
-            # Write shared parameter file with strict UTF-16 LE encoding with BOM
-            if sys.version_info[0] >= 3:
-                with open(sp_temp_path, "w", encoding="utf-16") as f:
-                    f.write(sp_content)
-            else:
-                import codecs
-                with codecs.open(sp_temp_path, "w", encoding="utf-16") as f:
-                    f.write(unicode(sp_content))
+            # 0. Check bundled static template first
+            bundled_sp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "R2R_SharedParameters.txt")
+            if not os.path.exists(bundled_sp):
+                bundled_sp = os.path.join(os.environ.get("APPDATA", ""), r"pyRevit\Extensions\R2R.extension\templates\R2R_SharedParameters.txt")
 
-            app.SharedParametersFilename = os.path.abspath(sp_temp_path)
+            target_sp_file = bundled_sp if os.path.exists(bundled_sp) else sp_temp_path
+            if target_sp_file == sp_temp_path or not os.path.exists(target_sp_file):
+                # Write with explicit UTF-16 LE BOM (0xFF 0xFE) across all Python 2/3 and IronPython runtimes
+                raw_bytes = b'\xff\xfe' + sp_content.encode('utf-16-le')
+                with open(sp_temp_path, "wb") as f:
+                    f.write(raw_bytes)
+                target_sp_file = sp_temp_path
+
+            app.SharedParametersFilename = os.path.abspath(target_sp_file)
             sp_file = app.OpenSharedParameterFile()
             if not sp_file:
                 if log_fn:
