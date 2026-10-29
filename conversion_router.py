@@ -358,7 +358,7 @@ class ConversionRouter(object):
         self.canonical_repetition_cache = {}
         self.adaptive_family_cache = {}
 
-    def pre_generate_families(self, approved_objects, classifications, profile_rules=None):
+    def pre_generate_families(self, approved_objects, classifications, profile_rules=None, log_fn=None):
         """Phase 1: Pre-Transaction Native .rfa Family Generator.
 
         Generates and loads real Revit .rfa families in memory BEFORE opening the project
@@ -367,8 +367,16 @@ class ConversionRouter(object):
         :param approved_objects: list of ScannedObject approved for transfer
         :param classifications: dict {rhino_guid: ClassificationResult}
         :param profile_rules: optional dict {layer_name: MappingRule}
+        :param log_fn: optional logging callback (msg -> None)
         :return: dict {family_key: DB.FamilySymbol}
         """
+        def _log(msg):
+            if log_fn and callable(log_fn):
+                try:
+                    log_fn(msg)
+                except Exception:
+                    pass
+
         if not REVIT_AVAILABLE or not self.doc or not self.app or not FamilyFactory:
             return self.family_symbol_cache
 
@@ -381,65 +389,83 @@ class ConversionRouter(object):
             inferred_cat = rule.revit_category if rule else (c_res.inferred_category if c_res else "GenericModel")
 
             if strat in ("ParametricFamily", "FamilyInstance"):
-                clean_layer = re.sub(r'[^a-zA-Z0-9_]', '_', obj.layer_name)
+                clean_layer = re.sub(r'[^a-zA-Z0-9_]', '_', obj.layer_name or "Default")
+                obj_name = getattr(obj, "object_name", "") or getattr(obj, "name", "") or ""
+                clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', obj_name.strip()) if obj_name else ""
+                clean_guid = re.sub(r'[^a-zA-Z0-9_]', '', str(obj.rhino_guid or "").replace('-', '_'))
+                short_guid = clean_guid[-8:] if len(clean_guid) >= 8 else clean_guid
+
+                if clean_name:
+                    fam_name = "R2R_Fam_{}_{}".format(clean_layer[:20], clean_name[:20])
+                else:
+                    fam_name = "R2R_Fam_{}_{}".format(clean_layer[:20], short_guid)
+
+                fam_key_layer = "R2R_Family_{}".format(clean_layer)
                 fam_key_param = "R2R_Parametric_{}".format(clean_layer)
-                fam_key_gen = "R2R_Family_{}".format(clean_layer)
 
-                if fam_key_param not in self.family_symbol_cache and fam_key_gen not in self.family_symbol_cache:
-                    target_bic_id = self._category_str_to_id(inferred_cat)
-                    target_bic = None
+                # Skip if already pre-generated for this specific object
+                if obj.rhino_guid in self.family_symbol_cache:
+                    continue
+                if fam_name in self.family_symbol_cache:
+                    self.family_symbol_cache[obj.rhino_guid] = self.family_symbol_cache[fam_name]
+                    continue
+
+                target_bic = self._category_str_to_bic(inferred_cat)
+                sym = None
+
+                # Try native FreeFormElement family first if real Brep/Mesh exists
+                if obj.raw_geometry and hasattr(FamilyFactory, "create_native_freeform_family"):
                     try:
-                        target_bic = System.Enum.ToObject(DB.BuiltInCategory, self._get_elem_id_val(target_bic_id))
-                    except Exception:
-                        pass
+                        cx_raw = obj.centroid[0]
+                        cy_raw = obj.centroid[1]
+                        cz_raw = obj.centroid[2]
+                        canonical_raw = obj.raw_geometry.Duplicate() if hasattr(obj.raw_geometry, "Duplicate") else obj.raw_geometry if hasattr(obj.raw_geometry, "Duplicate") else obj.raw_geometry
+                        if hasattr(canonical_raw, "Translate"):
+                            canonical_raw.Translate(-cx_raw, -cy_raw, -cz_raw)
+                        if hasattr(canonical_raw, "Scale"):
+                            canonical_raw.Scale(self.unit_scale)
 
-                    sym = None
-                    # Try native FreeFormElement family first if real Brep/Mesh exists
-                    if obj.raw_geometry and hasattr(FamilyFactory, "create_native_freeform_family"):
-                        try:
-                            cx_raw = obj.centroid[0]
-                            cy_raw = obj.centroid[1]
-                            cz_raw = obj.centroid[2]
-                            canonical_raw = obj.raw_geometry.Duplicate()
-                            if hasattr(canonical_raw, "Translate"):
-                                canonical_raw.Translate(-cx_raw, -cy_raw, -cz_raw)
-                            if hasattr(canonical_raw, "Scale"):
-                                canonical_raw.Scale(self.unit_scale)
+                        sym = FamilyFactory.create_native_freeform_family(
+                            self.app,
+                            self.doc,
+                            family_name=fam_name,
+                            rh_brep_or_solid=canonical_raw,
+                            subcategory_name=obj.layer_name,
+                            category_hint=inferred_cat,
+                            target_bic=target_bic
+                        )
+                    except Exception as ex_ff:
+                        _log("  [Pre-generate FreeForm Family Exception]: {}".format(ex_ff))
 
-                            sym = FamilyFactory.create_native_freeform_family(
-                                self.app,
-                                self.doc,
-                                family_name=fam_key_gen,
-                                rh_brep_or_solid=canonical_raw,
-                                subcategory_name=obj.layer_name,
-                                category_hint=inferred_cat,
-                                target_bic=target_bic
-                            )
-                        except Exception as ex_ff:
-                            pass
+                # Fallback to dimension-driven parametric box if freeform was not created (only if ParametricFamily strategy)
+                if not sym and strat == "ParametricFamily" and hasattr(FamilyFactory, "create_parametric_box_or_profile_family"):
+                    try:
+                        w = max(0.2, (obj.dx or 1.0) * self.unit_scale)
+                        d = max(0.2, (obj.dy or 1.0) * self.unit_scale)
+                        h = max(0.2, (obj.dz or 1.0) * self.unit_scale)
+                        sym = FamilyFactory.create_parametric_box_or_profile_family(
+                            self.app,
+                            self.doc,
+                            family_name=fam_name,
+                            width=w,
+                            depth=d,
+                            height=h,
+                            category_hint=inferred_cat,
+                            target_bic=target_bic
+                        )
+                    except Exception as ex_param:
+                        _log("  [Pre-generate Parametric Box Exception]: {}".format(ex_param))
 
-                    # Fallback to dimension-driven parametric family if freeform was not created
-                    if not sym and hasattr(FamilyFactory, "create_parametric_box_or_profile_family"):
-                        try:
-                            w = max(0.2, (obj.dx or 1.0) * self.unit_scale)
-                            d = max(0.2, (obj.dy or 1.0) * self.unit_scale)
-                            h = max(0.2, (obj.dz or 1.0) * self.unit_scale)
-                            sym = FamilyFactory.create_parametric_box_or_profile_family(
-                                self.app,
-                                self.doc,
-                                family_name=fam_key_param,
-                                width=w,
-                                depth=d,
-                                height=h,
-                                category_hint=inferred_cat,
-                                target_bic=target_bic
-                            )
-                        except Exception:
-                            pass
-
-                    if sym:
+                if sym:
+                    self.family_symbol_cache[obj.rhino_guid] = sym
+                    self.family_symbol_cache[fam_name] = sym
+                    if fam_key_layer not in self.family_symbol_cache:
+                        self.family_symbol_cache[fam_key_layer] = sym
+                    if fam_key_param not in self.family_symbol_cache:
                         self.family_symbol_cache[fam_key_param] = sym
-                        self.family_symbol_cache[fam_key_gen] = sym
+                    _log("  [Phase 1] Loaded native .rfa Family: '{}' ({})".format(fam_name, inferred_cat))
+                else:
+                    _log("  [Phase 1 Notice] Object '{}' ({}) could not form a closed solid in .rfa; DirectShape fallback will be used in Phase 2.".format(obj_name or short_guid, obj.layer_name))
 
             elif strat == "RepetitiveFamily":
                 is_block = (obj.object_type == "InstanceReference")
@@ -447,22 +473,23 @@ class ConversionRouter(object):
                 sig = getattr(obj, "repetition_signature", "") or "default_sig"
                 fam_key = "R2R_Block_{}".format(re.sub(r'[^a-zA-Z0-9_]', '_', blk_name)) if (is_block and blk_name) else "R2R_Repetitive_{}".format(sig)
 
-                if fam_key not in self.family_symbol_cache and obj.raw_geometry:
+                if obj.rhino_guid in self.family_symbol_cache:
+                    continue
+                if fam_key in self.family_symbol_cache:
+                    self.family_symbol_cache[obj.rhino_guid] = self.family_symbol_cache[fam_key]
+                    continue
+
+                if obj.raw_geometry and hasattr(FamilyFactory, "create_native_freeform_family"):
                     cx_raw = obj.centroid[0]
                     cy_raw = obj.centroid[1]
                     cz_raw = obj.centroid[2]
-                    canonical_raw = obj.raw_geometry.Duplicate()
+                    canonical_raw = obj.raw_geometry.Duplicate() if hasattr(obj.raw_geometry, "Duplicate") else obj.raw_geometry
                     if hasattr(canonical_raw, "Translate"):
                         canonical_raw.Translate(-cx_raw, -cy_raw, -cz_raw)
                     if hasattr(canonical_raw, "Scale"):
                         canonical_raw.Scale(self.unit_scale)
 
-                    target_bic_id = self._category_str_to_id(inferred_cat)
-                    target_bic = None
-                    try:
-                        target_bic = System.Enum.ToObject(DB.BuiltInCategory, self._get_elem_id_val(target_bic_id))
-                    except Exception:
-                        pass
+                    target_bic = self._category_str_to_bic(inferred_cat)
 
                     sym = FamilyFactory.create_native_freeform_family(
                         self.app,
@@ -475,6 +502,12 @@ class ConversionRouter(object):
                     )
                     if sym:
                         self.family_symbol_cache[fam_key] = sym
+                        self.family_symbol_cache[obj.rhino_guid] = sym
+                        _log("  [Phase 1] Loaded repetitive .rfa Family: '{}' ({})".format(fam_key, inferred_cat))
+                    else:
+                        _log("  [Phase 1 Notice] Repetitive family '{}' could not form a closed solid; DirectShape fallback will be used in Phase 2.".format(fam_key))
+
+        return self.family_symbol_cache
 
         return self.family_symbol_cache
 
@@ -1347,10 +1380,15 @@ class ConversionRouter(object):
         fam_key = "R2R_Block_{}".format(re.sub(r'[^a-zA-Z0-9_]', '_', blk_name)) if (is_block and blk_name) else "R2R_Repetitive_{}".format(sig)
 
         # 1. Native Loadable .rfa Family Placement (from Phase 1 Pre-Generation)
-        if fam_key in self.family_symbol_cache:
+        sym = None
+        if scanned_obj.rhino_guid and scanned_obj.rhino_guid in self.family_symbol_cache:
+            sym = self.family_symbol_cache[scanned_obj.rhino_guid]
+        elif fam_key in self.family_symbol_cache:
             sym = self.family_symbol_cache[fam_key]
+
+        if sym:
             try:
-                if not sym.IsActive:
+                if hasattr(sym, "IsActive") and not sym.IsActive:
                     sym.Activate()
                 cx = (scanned_obj.centroid[0] + self.origin_shift_rhino[0]) * self.unit_scale
                 cy = (scanned_obj.centroid[1] + self.origin_shift_rhino[1]) * self.unit_scale
@@ -1372,7 +1410,9 @@ class ConversionRouter(object):
                 if scanned_obj.rotation_angle and inst:
                     axis = DB.Line.CreateBound(pt, DB.XYZ(pt.X, pt.Y, pt.Z + 1.0))
                     DB.ElementTransformUtils.RotateElement(self.doc, inst.Id, axis, scanned_obj.rotation_angle)
-                return inst
+                if inst:
+                    res.strategy_used = "RepetitiveFamily"
+                    return inst
             except Exception as ex:
                 res.warnings.append("Native .rfa repetitive family placement notice: {}. Falling back to DirectShapeType.".format(ex))
 
@@ -1469,14 +1509,29 @@ class ConversionRouter(object):
         target_sym = None
 
         # 1. Check Phase 1 Pre-Generated Native .rfa FamilySymbol cache
-        clean_layer = re.sub(r'[^a-zA-Z0-9_]', '_', scanned_obj.layer_name)
+        clean_layer = re.sub(r'[^a-zA-Z0-9_]', '_', scanned_obj.layer_name or "Default")
+        obj_name = getattr(scanned_obj, "object_name", "") or getattr(scanned_obj, "name", "") or ""
+        clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', obj_name.strip()) if obj_name else ""
+        clean_guid = re.sub(r'[^a-zA-Z0-9_]', '', str(scanned_obj.rhino_guid or "").replace('-', '_'))
+        short_guid = clean_guid[-8:] if len(clean_guid) >= 8 else clean_guid
+        fam_name = "R2R_Fam_{}_{}".format(clean_layer[:20], clean_name[:20]) if clean_name else "R2R_Fam_{}_{}".format(clean_layer[:20], short_guid)
         fam_key_param = "R2R_Parametric_{}".format(clean_layer)
         fam_key_gen = "R2R_Family_{}".format(clean_layer)
 
-        if fam_key_gen in self.family_symbol_cache:
-            target_sym = self.family_symbol_cache[fam_key_gen]
-        elif fam_key_param in self.family_symbol_cache:
-            target_sym = self.family_symbol_cache[fam_key_param]
+        # Priority A: Exact object GUID match
+        if scanned_obj.rhino_guid and scanned_obj.rhino_guid in self.family_symbol_cache:
+            target_sym = self.family_symbol_cache[scanned_obj.rhino_guid]
+
+        # Priority B: Specific object family name match
+        if not target_sym and fam_name in self.family_symbol_cache:
+            target_sym = self.family_symbol_cache[fam_name]
+
+        # Priority C: Layer-level fallback keys
+        if not target_sym:
+            if fam_key_gen in self.family_symbol_cache:
+                target_sym = self.family_symbol_cache[fam_key_gen]
+            elif fam_key_param in self.family_symbol_cache:
+                target_sym = self.family_symbol_cache[fam_key_param]
 
         # 2. Check project symbols if not found in pre-generated cache
         if not target_sym:
@@ -1494,7 +1549,7 @@ class ConversionRouter(object):
 
         if target_sym:
             try:
-                if not target_sym.IsActive:
+                if hasattr(target_sym, "IsActive") and not target_sym.IsActive:
                     target_sym.Activate()
                 cx = (scanned_obj.centroid[0] + self.origin_shift_rhino[0]) * self.unit_scale
                 cy = (scanned_obj.centroid[1] + self.origin_shift_rhino[1]) * self.unit_scale
@@ -1522,38 +1577,42 @@ class ConversionRouter(object):
                 if scanned_obj.rotation_angle and inst:
                     axis = DB.Line.CreateBound(pt, DB.XYZ(pt.X, pt.Y, pt.Z + 1.0))
                     DB.ElementTransformUtils.RotateElement(self.doc, inst.Id, axis, scanned_obj.rotation_angle)
-                    DB.ElementTransformUtils.RotateElement(self.doc, inst.Id, axis, scanned_obj.rotation_angle)
 
                 # Drive instance/type dimensional parameters with multilingual aliases
-                dims = dict(getattr(scanned_obj, "parametric_dims", {}) or {})
-                if "Width" not in dims and scanned_obj.dx: dims["Width"] = scanned_obj.dx
-                if "Depth" not in dims and scanned_obj.dy: dims["Depth"] = scanned_obj.dy
-                if "Height" not in dims and scanned_obj.dz: dims["Height"] = scanned_obj.dz
-                param_aliases = {
-                    "Width": ["Width", "b", "w", "Ancho", "Anchura", "Amplada"],
-                    "Depth": ["Depth", "d", "Largo", "Profundidad", "Profunditat", "Length"],
-                    "Height": ["Height", "h", "H", "Altura", "Alto", "Alçada"],
-                    "Length": ["Length", "Longitud", "L"],
-                    "Thickness": ["Thickness", "Espesor", "Grosor", "Gruix", "t"]
-                }
-                for dim_key, p_val in dims.items():
-                    val_feet = p_val * self.unit_scale
-                    aliases = param_aliases.get(dim_key, [dim_key])
-                    for alias in aliases:
-                        param = inst.LookupParameter(alias)
-                        if not param:
-                            param = target_sym.LookupParameter(alias)
-                        if param and not param.IsReadOnly and param.StorageType == DB.StorageType.Double:
-                            try:
-                                param.Set(val_feet)
-                                break
-                            except Exception:
-                                pass
-                return inst
+                if inst:
+                    dims = dict(getattr(scanned_obj, "parametric_dims", {}) or {})
+                    if "Width" not in dims and scanned_obj.dx: dims["Width"] = scanned_obj.dx
+                    if "Depth" not in dims and scanned_obj.dy: dims["Depth"] = scanned_obj.dy
+                    if "Height" not in dims and scanned_obj.dz: dims["Height"] = scanned_obj.dz
+                    param_aliases = {
+                        "Width": ["Width", "b", "w", "Ancho", "Anchura", "Amplada"],
+                        "Depth": ["Depth", "d", "Largo", "Profundidad", "Profunditat", "Length"],
+                        "Height": ["Height", "h", "H", "Altura", "Alto", "Alçada"],
+                        "Length": ["Length", "Longitud", "L"],
+                        "Thickness": ["Thickness", "Espesor", "Grosor", "Gruix", "t"]
+                    }
+                    for dim_key, p_val in dims.items():
+                        val_feet = p_val * self.unit_scale
+                        aliases = param_aliases.get(dim_key, [dim_key])
+                        for alias in aliases:
+                            param = inst.LookupParameter(alias)
+                            if not param:
+                                param = target_sym.LookupParameter(alias)
+                            st_double = getattr(getattr(DB, "StorageType", None), "Double", None)
+                            if param and not param.IsReadOnly and (st_double is None or getattr(param, "StorageType", None) == st_double):
+                                try:
+                                    param.Set(val_feet)
+                                    break
+                                except Exception:
+                                    pass
+                    res.strategy_used = "FamilyInstance"
+                    return inst
             except Exception as ex:
                 res.warnings.append("ParametricFamily placement notice: {}. Falling back to DirectShape.".format(ex))
 
         # Fallback to direct shape if no suitable family is loaded
+        res.strategy_used = "DirectShape (Family Fallback)"
+        res.warnings.append("FamilyInstance/ParametricFamily: Geometry could not be placed as a native FamilyInstance (requires closed solid). Transferred as DirectShape with full volume and schedule parameters.")
         return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=target_cat_id)
 
     # =========================================================================
@@ -2721,8 +2780,8 @@ class ConversionRouter(object):
             return None
 
         # Resolve version-dependent BuiltInCategory safely
-        toposolid_bic = getattr(DB.BuiltInCategory, "OST_Toposolid", DB.BuiltInCategory.OST_Topography)
-        hardscape_bic = getattr(DB.BuiltInCategory, "OST_Hardscape", DB.BuiltInCategory.OST_Site)
+        toposolid_bic = getattr(DB.BuiltInCategory, "OST_Toposolid", getattr(DB.BuiltInCategory, "OST_Topography", getattr(DB.BuiltInCategory, "OST_GenericModel", None)))
+        hardscape_bic = getattr(DB.BuiltInCategory, "OST_Hardscape", getattr(DB.BuiltInCategory, "OST_Site", getattr(DB.BuiltInCategory, "OST_GenericModel", None)))
 
         # Comprehensive map covering architectural, structural, MEP, and site categories
         cat_map = {
@@ -2895,6 +2954,26 @@ class ConversionRouter(object):
             bic = DB.BuiltInCategory.OST_GenericModel
 
         return DB.ElementId(bic)
+
+    def _category_str_to_bic(self, cat_name):
+        """Resolves category string directly to DB.BuiltInCategory enum value."""
+        if not REVIT_AVAILABLE or not hasattr(DB, "BuiltInCategory"):
+            return None
+        target_id = self._category_str_to_id(cat_name)
+        if target_id and hasattr(System, "Enum") and hasattr(System.Enum, "ToObject"):
+            try:
+                val = self._get_elem_id_val(target_id)
+                return System.Enum.ToObject(DB.BuiltInCategory, val)
+            except Exception:
+                pass
+        clean = str(cat_name or "").strip()
+        stripped = re.sub(r'[^a-zA-Z0-9_]', '', clean)
+        ost_cand = "OST_" + stripped if not stripped.startswith("OST_") else stripped
+        if hasattr(DB.BuiltInCategory, ost_cand):
+            return getattr(DB.BuiltInCategory, ost_cand)
+        if hasattr(DB.BuiltInCategory, stripped):
+            return getattr(DB.BuiltInCategory, stripped)
+        return DB.BuiltInCategory.OST_GenericModel
 
     def _get_or_create_bua_area_scheme(self):
         """Finds or creates the 'BUA / GFA Assessment' Area Scheme in Revit."""

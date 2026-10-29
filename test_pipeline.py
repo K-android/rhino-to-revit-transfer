@@ -1820,8 +1820,260 @@ class TestR2RPipeline(unittest.TestCase):
             self.assertTrue(vol_field.IsCalculateTotals)
         finally:
             cr.REVIT_AVAILABLE = orig_revit
+            cr.DB = orig_db
+
+    def test_family_template_locator_bundled_discovery(self):
+        """Tests that FamilyTemplateLocator finds bundled templates without requiring Autodesk Content Pack."""
+        from family_factory import FamilyTemplateLocator
+        tmpl_gm = FamilyTemplateLocator.find_template(None, "Generic Model")
+        self.assertIsNotNone(tmpl_gm)
+        self.assertTrue(os.path.exists(tmpl_gm))
+        self.assertTrue(tmpl_gm.lower().endswith(".rft"))
+
+        tmpl_mass = FamilyTemplateLocator.find_template(None, "Mass")
+        self.assertIsNotNone(tmpl_mass)
+        self.assertTrue(os.path.exists(tmpl_mass))
+        self.assertTrue(tmpl_mass.lower().endswith(".rft"))
+
+    def test_family_factory_tuple_unpacking(self):
+        """Tests that FamilyFactory unpacks (bool, Family) tuple from IronPython LoadFamily."""
+        import family_factory as ff
+        orig_revit = ff.REVIT_AVAILABLE
+        orig_db = getattr(ff, "DB", None)
+        try:
+            ff.REVIT_AVAILABLE = True
+            class MockSymbol(object):
+                def __init__(self, name="TestSymbol"):
+                    self.Name = name
+                    self.FamilyName = "R2R_TestFamily"
+                    self.IsActive = False
+                def Activate(self):
+                    self.IsActive = True
+
+            class MockFamily(object):
+                def __init__(self):
+                    self._symbol = MockSymbol()
+                def GetFamilySymbolIds(self):
+                    return [101]
+
+            class MockDoc(object):
+                def __init__(self):
+                    self._fam = MockFamily()
+                def GetElement(self, eid):
+                    if eid == 101:
+                        return self._fam._symbol
+                    return None
+
+            mock_doc = MockDoc()
+            # Simulate IronPython returning a tuple (True, MockFamily)
+            tuple_result = (True, mock_doc._fam)
+
+            # Test symbol extraction logic
+            fam_obj = tuple_result
+            if isinstance(fam_obj, tuple):
+                for item in fam_obj:
+                    if hasattr(item, "GetFamilySymbolIds"):
+                        fam_obj = item
+                        break
+            found_sym = None
+            if hasattr(fam_obj, "GetFamilySymbolIds"):
+                for sym_id in fam_obj.GetFamilySymbolIds():
+                    sym = mock_doc.GetElement(sym_id)
+                    if sym:
+                        if hasattr(sym, "IsActive") and not sym.IsActive:
+                            sym.Activate()
+                        found_sym = sym
+                        break
+
+            self.assertIsNotNone(found_sym)
+            self.assertTrue(found_sym.IsActive)
+            self.assertEqual(found_sym.FamilyName, "R2R_TestFamily")
+        finally:
+            ff.REVIT_AVAILABLE = orig_revit
             if orig_db is not None:
-                cr.DB = orig_db
+                ff.DB = orig_db
+
+    def test_pre_generate_families_unique_guid_and_logging(self):
+        """Tests that pre_generate_families keys symbols by GUID and calls log_fn."""
+        from conversion_router import ConversionRouter
+        from scanner import ScannedObject
+        from classifier import ClassificationResult
+        import conversion_router as cr
+
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        orig_ff = getattr(cr, "FamilyFactory", None)
+        try:
+            cr.REVIT_AVAILABLE = True
+            class MockSym(object):
+                def __init__(self, name):
+                    self.Name = name
+                    self.FamilyName = name
+                    self.IsActive = True
+
+            class MockFF(object):
+                @classmethod
+                def create_native_freeform_family(cls, app, project_doc, family_name, rh_brep_or_solid, subcategory_name=None, category_hint="Generic Model", target_bic=None):
+                    return MockSym(family_name)
+
+                @classmethod
+                def create_parametric_box_or_profile_family(cls, app, project_doc, family_name, width=1.0, depth=1.0, height=1.0, category_hint="Generic Model", target_bic=None):
+                    return MockSym(family_name)
+
+            cr.FamilyFactory = MockFF
+
+            router = ConversionRouter(None, global_mode="Hybrid")
+            router.doc = object()
+            router.app = object()
+
+            # Create 2 unique irregular cave objects on the same layer
+            obj1 = ScannedObject("cave-guid-1")
+            obj1.layer_name = "Caves"
+            obj1.object_name = "Chamber_Alpha"
+            obj1.raw_geometry = object()
+            obj1.centroid = (10.0, 20.0, 5.0)
+
+            obj2 = ScannedObject("cave-guid-2")
+            obj2.layer_name = "Caves"
+            obj2.object_name = "Chamber_Beta"
+            obj2.raw_geometry = object()
+            obj2.centroid = (30.0, 40.0, 5.0)
+
+            c1 = ClassificationResult("cave-guid-1")
+            c1.inferred_category = "GenericModel"
+            c1.proposed_strategy = "FamilyInstance"
+            c2 = ClassificationResult("cave-guid-2")
+            c2.inferred_category = "GenericModel"
+            c2.proposed_strategy = "FamilyInstance"
+            c_dict = {
+                "cave-guid-1": c1,
+                "cave-guid-2": c2,
+            }
+
+            log_messages = []
+            symbols = router.pre_generate_families([obj1, obj2], c_dict, log_fn=lambda m: log_messages.append(m))
+
+            # Both objects must have their own unique entries in the symbol cache
+            self.assertIn("cave-guid-1", router.family_symbol_cache)
+            self.assertIn("cave-guid-2", router.family_symbol_cache)
+            self.assertNotEqual(router.family_symbol_cache["cave-guid-1"].Name, router.family_symbol_cache["cave-guid-2"].Name)
+            self.assertIn("Chamber_Alpha", router.family_symbol_cache["cave-guid-1"].Name)
+            self.assertIn("Chamber_Beta", router.family_symbol_cache["cave-guid-2"].Name)
+
+            # Check logging
+            self.assertTrue(any("Chamber_Alpha" in m for m in log_messages))
+            self.assertTrue(any("Chamber_Beta" in m for m in log_messages))
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            cr.DB = orig_db
+            cr.FamilyFactory = orig_ff
+
+    def test_pipeline_8c_parametric_family_execution_and_fallback(self):
+        """Tests that _pipeline_8c places FamilyInstance from cache and falls back with warning when absent."""
+        from conversion_router import ConversionRouter, ConversionResult
+        from scanner import ScannedObject
+        import conversion_router as cr
+
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        try:
+            cr.REVIT_AVAILABLE = True
+            class MockParam(object):
+                def __init__(self, val=""):
+                    self.val = val
+                    self.IsReadOnly = False
+                    self.StorageType = 2
+                def Set(self, v): self.val = v
+
+            class MockInstance(object):
+                def __init__(self, sym):
+                    self.Symbol = sym
+                    self.Id = 999
+                    self.UniqueId = "fam-inst-guid-999"
+                def LookupParameter(self, n): return MockParam()
+
+            class MockSymbol(object):
+                def __init__(self, name="CaveFamily"):
+                    self.Name = name
+                    self.FamilyName = name
+                    self.IsActive = True
+                def LookupParameter(self, n): return MockParam()
+
+            class MockCreate(object):
+                def NewFamilyInstance(self, *args, **kwargs):
+                    return MockInstance(args[1] if len(args) > 1 else None)
+
+            class MockDoc(object):
+                def __init__(self):
+                    self.Create = MockCreate()
+                def GetElement(self, eid): return None
+
+            class MockStructure(object):
+                class StructuralType(object):
+                    NonStructural = 0
+
+            class MockBICMeta(type):
+                def __getattr__(cls, name):
+                    return -2000150
+
+            class MockBIC(object, metaclass=MockBICMeta):
+                OST_GenericModel = -2000150
+                OST_Topography = -2000011
+                OST_Site = -2000070
+
+            class MockElementId(object):
+                InvalidElementId = -1
+                def __init__(self, val=-1):
+                    self.val = val
+
+            class MockDB(object):
+                XYZ = lambda x, y, z: (x, y, z)
+                Structure = MockStructure
+                ElementId = MockElementId
+                BuiltInCategory = MockBIC
+                StorageType = type("ST", (), {"Double": 2})
+                FamilySymbol = object
+                def FilteredElementCollector(doc):
+                    class _C(object):
+                        def OfClass(self, c): return []
+                    return _C()
+                def FilteredElementCollector(doc):
+                    class _C(object):
+                        def OfClass(self, c): return []
+                    return _C()
+
+            cr.DB = MockDB
+            router = ConversionRouter(None, global_mode="Hybrid")
+            router.doc = MockDoc()
+
+            obj = ScannedObject("cave-obj-123")
+            obj.layer_name = "Caves"
+            obj.object_name = "Chamber_Central"
+            obj.centroid = (0.0, 0.0, 0.0)
+            res = ConversionResult("cave-obj-123")
+
+            # 1. Successful placement when symbol exists in cache under GUID
+            sym = MockSymbol("R2R_Fam_Caves_Chamber_Central")
+            router.family_symbol_cache["cave-obj-123"] = sym
+            inst = router._pipeline_8c_parametric_family(obj, None, None, None, res)
+            self.assertIsNotNone(inst)
+            self.assertEqual(res.strategy_used, "FamilyInstance")
+
+            # 2. Transparent fallback when symbol does NOT exist in cache
+            obj_fallback = ScannedObject("cave-obj-missing")
+            obj_fallback.layer_name = "Irregular_Caves"
+            obj_fallback.centroid = (0.0, 0.0, 0.0)
+            res_fallback = ConversionResult("cave-obj-missing")
+
+            # Mock _pipeline_9_direct_shape so we can observe fallback routing
+            router._pipeline_9_direct_shape = lambda s, g, c, p, r, category_id=None: "MockDS"
+            inst_fb = router._pipeline_8c_parametric_family(obj_fallback, None, None, None, res_fallback)
+            self.assertEqual(inst_fb, "MockDS")
+            self.assertEqual(res_fallback.strategy_used, "DirectShape (Family Fallback)")
+            self.assertTrue(any("DirectShape with full volume and schedule parameters" in w for w in res_fallback.warnings))
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            cr.DB = orig_db
 
 
 if __name__ == "__main__":

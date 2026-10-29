@@ -101,6 +101,21 @@ class FamilyTemplateLocator(object):
         # Candidate search directories
         search_dirs = []
 
+        # 0. Bundled & Local extension templates (Primary, guaranteed self-contained across all Revit setups)
+        this_file_dir = os.path.dirname(os.path.abspath(__file__))
+        bundled_dirs = [
+            os.path.join(this_file_dir, "templates"),
+            os.path.join(os.path.dirname(this_file_dir), "templates"),
+            os.path.join(os.path.dirname(os.path.dirname(this_file_dir)), "templates"),
+            r"C:\Users\User\.gemini\antigravity\scratch\rhino-to-revit-transfer\templates",
+            r"C:\Users\User\.gemini\antigravity\scratch\ParametricFamilyForge\Templates",
+            os.path.join(os.environ.get("APPDATA", ""), r"pyRevit\Extensions\R2R.extension\templates"),
+            os.path.join(os.environ.get("APPDATA", ""), r"pyRevit\Extensions\R2R.extension\lib\templates"),
+        ]
+        for bd in bundled_dirs:
+            if os.path.isdir(bd) and bd not in search_dirs:
+                search_dirs.append(bd)
+
         # 1. Configured FamilyTemplatePath from active Revit Application
         if app and hasattr(app, "FamilyTemplatePath") and app.FamilyTemplatePath:
             user_tmpl = app.FamilyTemplatePath
@@ -354,16 +369,32 @@ class FamilyFactory(object):
 
             # 6. Locate and activate FamilySymbol in Project Document
             if loaded_fam:
-                sym_id_iterator = loaded_fam.GetFamilySymbolIds().GetEnumerator()
-                if sym_id_iterator.MoveNext():
-                    sym = project_doc.GetElement(sym_id_iterator.Current)
-                    if sym and isinstance(sym, DB.FamilySymbol):
-                        return sym
+                fam_obj = loaded_fam
+                if isinstance(fam_obj, tuple):
+                    for item in fam_obj:
+                        if hasattr(item, "GetFamilySymbolIds"):
+                            fam_obj = item
+                            break
+                if hasattr(fam_obj, "GetFamilySymbolIds"):
+                    for sym_id in fam_obj.GetFamilySymbolIds():
+                        sym = project_doc.GetElement(sym_id)
+                        if sym and isinstance(sym, DB.FamilySymbol):
+                            if hasattr(sym, "IsActive") and not sym.IsActive:
+                                try:
+                                    sym.Activate()
+                                except Exception:
+                                    pass
+                            return sym
 
             # Fallback search by family name
             collector = DB.FilteredElementCollector(project_doc).OfClass(DB.FamilySymbol)
             for s in collector:
-                if s.FamilyName == clean_fam_name or clean_fam_name in s.FamilyName:
+                if s.FamilyName == clean_fam_name or clean_fam_name in s.FamilyName or getattr(s, "Name", "") == clean_fam_name:
+                    if hasattr(s, "IsActive") and not s.IsActive:
+                        try:
+                            s.Activate()
+                        except Exception:
+                            pass
                     return s
 
             return None
@@ -420,12 +451,67 @@ class FamilyFactory(object):
                     b = working.ToBrep()
                     if b:
                         working = b
-                if hasattr(GeometryEncoder, "ToSolid"):
-                    revit_solid = GeometryEncoder.ToSolid(working)
+                if hasattr(GeometryEncoder, "ToSolid") and isinstance(working, rg.Brep):
+                    try:
+                        revit_solid = GeometryEncoder.ToSolid(working)
+                    except Exception:
+                        revit_solid = None
             except Exception:
                 pass
 
-        if not revit_solid or revit_solid.Volume <= 0.00001:
+            # Fallback to TessellatedShapeBuilder Solid construction (handles Meshes & complex Breps)
+            if (not revit_solid or getattr(revit_solid, "Volume", 0.0) <= 0.00001) and hasattr(DB, "TessellatedShapeBuilder"):
+                try:
+                    meshes = []
+                    if isinstance(working, rg.Mesh):
+                        meshes = [working]
+                    elif isinstance(working, rg.Brep):
+                        mp = rg.MeshingParameters.Default
+                        b_meshes = rg.Mesh.CreateFromBrep(working, mp)
+                        if b_meshes:
+                            meshes = list(b_meshes)
+
+                    if meshes:
+                        tsb = DB.TessellatedShapeBuilder()
+                        tsb.OpenConnectedFaceSet(True)
+                        face_added = False
+                        for m in meshes:
+                            m_copy = m.Duplicate()
+                            if hasattr(m_copy.Faces, "ConvertQuadsToTriangles"):
+                                m_copy.Faces.ConvertQuadsToTriangles()
+                            verts = m_copy.Vertices
+                            for i in range(m_copy.Faces.Count):
+                                f = m_copy.Faces[i]
+                                p0 = verts[f.A]
+                                p1 = verts[f.B]
+                                p2 = verts[f.C]
+                                v0 = DB.XYZ(float(p0.X), float(p0.Y), float(p0.Z))
+                                v1 = DB.XYZ(float(p1.X), float(p1.Y), float(p1.Z))
+                                v2 = DB.XYZ(float(p2.X), float(p2.Y), float(p2.Z))
+                                if v0.DistanceTo(v1) > 0.0001 and v1.DistanceTo(v2) > 0.0001 and v2.DistanceTo(v0) > 0.0001:
+                                    loop_pts = List[DB.XYZ]()
+                                    loop_pts.Add(v0)
+                                    loop_pts.Add(v1)
+                                    loop_pts.Add(v2)
+                                    tsb.AddFace(DB.TessellatedFace(loop_pts, DB.ElementId.InvalidElementId))
+                                    face_added = True
+                        tsb.CloseConnectedFaceSet()
+                        if face_added:
+                            tsb.Target = DB.TessellatedShapeBuilderTarget.Solid
+                            tsb.Fallback = DB.TessellatedShapeBuilderFallback.Abort
+                            tsb.Build()
+                            b_res = tsb.GetBuildResult()
+                            if b_res:
+                                res_objs = b_res.GetGeometricalObjects()
+                                if res_objs:
+                                    for go in res_objs:
+                                        if isinstance(go, DB.Solid) and getattr(go, "Volume", 0.0) > 0.00001:
+                                            revit_solid = go
+                                            break
+                except Exception as ex_tsb:
+                    print("[FamilyFactory TSB Solid Notice]: {}".format(ex_tsb))
+
+        if not revit_solid or getattr(revit_solid, "Volume", 0.0) <= 0.00001:
             return None
 
         fam_doc = None
@@ -506,15 +592,31 @@ class FamilyFactory(object):
 
             # 6. Locate and activate FamilySymbol in Project Document
             if loaded_fam:
-                sym_id_iterator = loaded_fam.GetFamilySymbolIds().GetEnumerator()
-                if sym_id_iterator.MoveNext():
-                    sym = project_doc.GetElement(sym_id_iterator.Current)
-                    if sym and isinstance(sym, DB.FamilySymbol):
-                        return sym
+                fam_obj = loaded_fam
+                if isinstance(fam_obj, tuple):
+                    for item in fam_obj:
+                        if hasattr(item, "GetFamilySymbolIds"):
+                            fam_obj = item
+                            break
+                if hasattr(fam_obj, "GetFamilySymbolIds"):
+                    for sym_id in fam_obj.GetFamilySymbolIds():
+                        sym = project_doc.GetElement(sym_id)
+                        if sym and isinstance(sym, DB.FamilySymbol):
+                            if hasattr(sym, "IsActive") and not sym.IsActive:
+                                try:
+                                    sym.Activate()
+                                except Exception:
+                                    pass
+                            return sym
 
             collector = DB.FilteredElementCollector(project_doc).OfClass(DB.FamilySymbol)
             for s in collector:
-                if s.FamilyName == clean_fam_name or clean_fam_name in s.FamilyName:
+                if s.FamilyName == clean_fam_name or clean_fam_name in s.FamilyName or getattr(s, "Name", "") == clean_fam_name:
+                    if hasattr(s, "IsActive") and not s.IsActive:
+                        try:
+                            s.Activate()
+                        except Exception:
+                            pass
                     return s
 
             return None

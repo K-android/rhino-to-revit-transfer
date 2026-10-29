@@ -1998,10 +1998,22 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                         profile_rules_map[getattr(o, "layer_name", "")] = rule_item
                         profile_rules_map[getattr(o, "layer_full_path", "")] = rule_item
 
-            pregen_symbols = router.pre_generate_families(approved_objs, self.classifications, profile_rules=profile_rules_map)
+            pregen_symbols = router.pre_generate_families(
+                approved_objs,
+                self.classifications,
+                profile_rules=profile_rules_map,
+                log_fn=lambda msg: setattr(self.txt_exec_log, "Text", self.txt_exec_log.Text + msg + "\n")
+            )
             pregen_cnt = len(pregen_symbols) if pregen_symbols else 0
+            fam_req_objs = [
+                o for o in approved_objs
+                if (profile_rules_map.get(o.layer_name) and profile_rules_map.get(o.layer_name).strategy in ("ParametricFamily", "FamilyInstance", "RepetitiveFamily"))
+                or (self.classifications.get(o.rhino_guid) and self.classifications.get(o.rhino_guid).proposed_strategy in ("ParametricFamily", "FamilyInstance", "RepetitiveFamily"))
+            ]
             if pregen_cnt > 0:
                 self.txt_exec_log.Text += "Phase 1 Complete: {} native .rfa family definition(s) loaded into project.\n".format(pregen_cnt)
+            elif len(fam_req_objs) > 0:
+                self.txt_exec_log.Text += "Phase 1 Notice: {} object(s) requested family instances, but could not form closed solids in .rfa templates. DirectShape fallback with volume/area parameters will be used in Phase 2.\n".format(len(fam_req_objs))
             else:
                 self.txt_exec_log.Text += "Phase 1 Complete: No family pre-generation required.\n"
         except Exception as ex:
