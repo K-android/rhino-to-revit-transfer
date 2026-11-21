@@ -11,7 +11,8 @@ try:
     from .scanner import RhinoScanner, ScannedObject, ScannerPreflightReport
     from .classifier import AecClassifier, ClassificationResult
     from .ai_assistant import AISemanticInterpreter, SemanticInterpretation
-    from .profile_manager import ProfileManager, MappingRule
+    from .profile_manager import ProfileManager, MappingRule, CustomParameterSpec
+    from .strategy_rules import StrategyRuleEngine, StrategyEvaluation
     from .conversion_router import ConversionRouter, ConversionResult, TransferFailuresPreprocessor
     from .graphics_validator import GraphicsValidator, ElementValidationReport
     from .sync_engine import SyncEngine, RevitSyncRecord, SyncEvaluation
@@ -21,7 +22,8 @@ except (ImportError, ValueError):
     from scanner import RhinoScanner, ScannedObject, ScannerPreflightReport
     from classifier import AecClassifier, ClassificationResult
     from ai_assistant import AISemanticInterpreter, SemanticInterpretation
-    from profile_manager import ProfileManager, MappingRule
+    from profile_manager import ProfileManager, MappingRule, CustomParameterSpec
+    from strategy_rules import StrategyRuleEngine, StrategyEvaluation
     from conversion_router import ConversionRouter, ConversionResult, TransferFailuresPreprocessor
     from graphics_validator import GraphicsValidator, ElementValidationReport
     from sync_engine import SyncEngine, RevitSyncRecord, SyncEvaluation

@@ -83,6 +83,22 @@ except (ImportError, ValueError):
         FamilyFactory = None
         FamilyLoadOptions = None
 
+try:
+    from strategy_rules import StrategyRuleEngine
+except (ImportError, ValueError):
+    try:
+        from .strategy_rules import StrategyRuleEngine
+    except Exception:
+        StrategyRuleEngine = None
+
+try:
+    from profile_manager import CustomParameterSpec
+except (ImportError, ValueError):
+    try:
+        from .profile_manager import CustomParameterSpec
+    except Exception:
+        CustomParameterSpec = None
+
 R2R_PARAM_GUIDS = {
     "R2R_Area": "e1a2b3c4-1111-2222-3333-444455550001",
     "R2R_Volume": "e1a2b3c4-1111-2222-3333-444455550002",
@@ -173,7 +189,9 @@ class ConversionResult(object):
 class ConversionRouter(object):
     """10-pipeline dispatcher coordinating Rhino.Inside.Revit element generation."""
 
-    def __init__(self, revit_doc, global_mode="Hybrid", generate_bua=True, unit_scale=None, origin_shift=None, move_to_origin=False):
+    def __init__(self, revit_doc, global_mode="Hybrid", generate_bua=True, unit_scale=None,
+                 origin_shift=None, move_to_origin=False, mixed_policy="AutoFallback",
+                 project_custom_parameters=None):
         """
         :param revit_doc: Autodesk.Revit.DB.Document
         :param global_mode: "Native BIM" | "Hybrid" | "Geometry-First"
@@ -181,14 +199,27 @@ class ConversionRouter(object):
         :param unit_scale: Optional float override for Rhino-to-Revit foot scale
         :param origin_shift: Optional tuple (dx, dy, dz) in Rhino units to translate geometry to Revit (0,0,0)
         :param move_to_origin: If True, automatically centers geometry at Revit (0,0,0)
+        :param mixed_policy: "AutoFallback" | "StrictSkip" for mixed/incompatible objects
+        :param project_custom_parameters: Optional list of CustomParameterSpec or dicts
         """
         self.doc = revit_doc
         self.global_mode = global_mode
         self.generate_bua = generate_bua
+        self.mixed_policy = mixed_policy or "AutoFallback"
         self.failures_preprocessor = TransferFailuresPreprocessor() if REVIT_AVAILABLE else None
         self.natural_unit_scale = self._calc_rhino_to_revit_scale()
         self.unit_scale = float(unit_scale) if unit_scale is not None else self.natural_unit_scale
         self.move_to_origin = move_to_origin
+
+        self.project_custom_parameters = []
+        for cp in (project_custom_parameters or []):
+            if CustomParameterSpec:
+                self.project_custom_parameters.append(CustomParameterSpec.from_dict(cp))
+            else:
+                self.project_custom_parameters.append(cp)
+
+        self.shared_param_defs = {}
+        self.custom_param_guids = {}
 
         # Origin shift vector in Rhino coordinates and Revit internal feet
         self.origin_shift_rhino = (0.0, 0.0, 0.0)
@@ -205,6 +236,22 @@ class ConversionRouter(object):
         self.app = revit_doc.Application if revit_doc and hasattr(revit_doc, "Application") else None
         if REVIT_AVAILABLE and self.doc:
             self._cache_revit_data()
+
+    def _merge_custom_parameters(self, profile_rule=None):
+        """Merges project-wide and layer-specific custom parameter specs deterministically."""
+        merged = {}
+        order = []
+        for source in (self.project_custom_parameters, getattr(profile_rule, "custom_parameters", None) or []):
+            for cp in source:
+                cp_obj = CustomParameterSpec.from_dict(cp) if (CustomParameterSpec and isinstance(cp, dict)) else cp
+                cname = getattr(cp_obj, "name", "")
+                if not cname:
+                    continue
+                low = cname.lower()
+                if low not in merged:
+                    order.append(low)
+                merged[low] = cp_obj
+        return [merged[k] for k in order]
 
     def set_origin_shift(self, dx_rhino, dy_rhino, dz_rhino):
         """Sets translation vector (in Rhino units) applied to all transferred geometry to align with Revit (0,0,0)."""
@@ -384,11 +431,16 @@ class ConversionRouter(object):
 
         for obj in approved_objects:
             c_res = classifications.get(obj.rhino_guid)
-            rule = rules_by_layer.get(obj.layer_name) or rules_by_layer.get(getattr(obj, "layer_full_path", None))
+            rule = (
+                rules_by_layer.get(obj.rhino_guid)
+                or rules_by_layer.get(getattr(obj, "layer_full_path", None))
+                or rules_by_layer.get(obj.layer_name)
+            )
             strat = rule.strategy if rule else (c_res.proposed_strategy if c_res else "DirectShape")
             inferred_cat = rule.revit_category if rule else (c_res.inferred_category if c_res else "GenericModel")
+            merged_params = self._merge_custom_parameters(rule)
 
-            if strat in ("ParametricFamily", "FamilyInstance"):
+            if strat in ("ParametricFamily", "FreeFormFamily", "FamilyInstance"):
                 clean_layer = re.sub(r'[^a-zA-Z0-9_]', '_', obj.layer_name or "Default")
                 obj_name = getattr(obj, "object_name", "") or getattr(obj, "name", "") or ""
                 clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', obj_name.strip()) if obj_name else ""
@@ -413,52 +465,89 @@ class ConversionRouter(object):
                 target_bic = self._category_str_to_bic(inferred_cat)
                 sym = None
 
-                # Try native FreeFormElement family first if real Brep/Mesh exists
-                if obj.raw_geometry and hasattr(FamilyFactory, "create_native_freeform_family"):
-                    try:
-                        cx_raw = obj.centroid[0]
-                        cy_raw = obj.centroid[1]
-                        cz_raw = obj.centroid[2]
-                        canonical_rhino = obj.raw_geometry.Duplicate() if hasattr(obj.raw_geometry, "Duplicate") else obj.raw_geometry
-                        if hasattr(canonical_rhino, "Translate"):
-                            canonical_rhino.Translate(-cx_raw, -cy_raw, -cz_raw)
+                def _try_freeform():
+                    if obj.raw_geometry and hasattr(FamilyFactory, "create_native_freeform_family"):
+                        try:
+                            cx_raw = obj.centroid[0]
+                            cy_raw = obj.centroid[1]
+                            cz_raw = obj.centroid[2]
+                            canonical_rhino = obj.raw_geometry.Duplicate() if hasattr(obj.raw_geometry, "Duplicate") else obj.raw_geometry
+                            if hasattr(canonical_rhino, "Translate"):
+                                canonical_rhino.Translate(-cx_raw, -cy_raw, -cz_raw)
 
-                        canonical_feet = canonical_rhino.Duplicate() if hasattr(canonical_rhino, "Duplicate") else canonical_rhino
-                        if hasattr(canonical_feet, "Scale"):
-                            canonical_feet.Scale(self.unit_scale)
+                            canonical_feet = canonical_rhino.Duplicate() if hasattr(canonical_rhino, "Duplicate") else canonical_rhino
+                            if hasattr(canonical_feet, "Scale"):
+                                canonical_feet.Scale(self.unit_scale)
 
-                        sym = FamilyFactory.create_native_freeform_family(
-                            self.app,
-                            self.doc,
-                            family_name=fam_name,
-                            rh_brep_or_solid=canonical_rhino,
-                            subcategory_name=obj.layer_name,
-                            category_hint=inferred_cat,
-                            target_bic=target_bic,
-                            geom_feet=canonical_feet,
-                            unit_scale=self.unit_scale
-                        )
-                    except Exception as ex_ff:
-                        _log("  [Pre-generate FreeForm Family Exception]: {}".format(ex_ff))
+                            return FamilyFactory.create_native_freeform_family(
+                                self.app,
+                                self.doc,
+                                family_name=fam_name,
+                                rh_brep_or_solid=canonical_rhino,
+                                subcategory_name=obj.layer_name,
+                                category_hint=inferred_cat,
+                                target_bic=target_bic,
+                                geom_feet=canonical_feet,
+                                unit_scale=self.unit_scale,
+                                default_material=getattr(rule, "material", None),
+                                custom_parameters=merged_params,
+                                shared_param_defs=self.shared_param_defs
+                            )
+                        except Exception as ex_ff:
+                            _log("  [Pre-generate FreeForm Family Exception]: {}".format(ex_ff))
+                    return None
 
-                # Fallback to dimension-driven parametric box if freeform was not created (only if ParametricFamily strategy)
-                if not sym and strat == "ParametricFamily" and hasattr(FamilyFactory, "create_parametric_box_or_profile_family"):
-                    try:
-                        w = max(0.2, (obj.dx or 1.0) * self.unit_scale)
-                        d = max(0.2, (obj.dy or 1.0) * self.unit_scale)
-                        h = max(0.2, (obj.dz or 1.0) * self.unit_scale)
-                        sym = FamilyFactory.create_parametric_box_or_profile_family(
-                            self.app,
-                            self.doc,
-                            family_name=fam_name,
-                            width=w,
-                            depth=d,
-                            height=h,
-                            category_hint=inferred_cat,
-                            target_bic=target_bic
-                        )
-                    except Exception as ex_param:
-                        _log("  [Pre-generate Parametric Box Exception]: {}".format(ex_param))
+                if strat == "ParametricFamily":
+                    ok_param = True
+                    fails_param = []
+                    fb_param = "DirectShape"
+                    if StrategyRuleEngine:
+                        ok_param, fails_param, _, fb_param = StrategyRuleEngine.evaluate_object(obj, "ParametricFamily")
+
+                    if ok_param and hasattr(FamilyFactory, "create_parametric_box_or_profile_family"):
+                        try:
+                            w = max(0.2, (obj.dx or 1.0) * self.unit_scale)
+                            d = max(0.2, (obj.dy or 1.0) * self.unit_scale)
+                            h = max(0.2, (obj.dz or 1.0) * self.unit_scale)
+                            prim = getattr(obj, "geometry_primitive_type", "Box") or "Box"
+                            if prim not in ("Box", "Cylinder", "ProfileExtrusion"):
+                                prim = "Box"
+                            rad_ft = (float(getattr(obj, "cylinder_radius", 0.0) or 0.0) * self.unit_scale) or None
+                            sym = FamilyFactory.create_parametric_box_or_profile_family(
+                                self.app,
+                                self.doc,
+                                family_name=fam_name,
+                                width=w,
+                                depth=d,
+                                height=h,
+                                category_hint=inferred_cat,
+                                target_bic=target_bic,
+                                primitive_type=prim,
+                                radius=rad_ft,
+                                base_offset=0.0,
+                                custom_parameters=merged_params,
+                                shared_param_defs=self.shared_param_defs
+                            )
+                        except Exception as ex_param:
+                            _log("  [Pre-generate Editable Parametric Family Exception]: {}".format(ex_param))
+                    elif not ok_param:
+                        policy = (getattr(rule, "mixed_policy", None) or self.mixed_policy)
+                        _log("  [Rule Check] Object '{}' cannot build Editable ParametricFamily ({}).".format(
+                            obj_name or short_guid, "; ".join(fails_param)
+                        ))
+                        if policy == "StrictSkip":
+                            continue
+                        if fb_param == "FreeFormFamily":
+                            sym = _try_freeform()
+
+                    # Fallback to FreeForm only under AutoFallback when Mode A could not build
+                    if not sym and ok_param:
+                        policy = (getattr(rule, "mixed_policy", None) or self.mixed_policy)
+                        if policy != "StrictSkip":
+                            sym = _try_freeform()
+                else:
+                    # Non-Editable FreeForm Solid Family (FreeFormFamily / FamilyInstance)
+                    sym = _try_freeform()
 
                 if sym:
                     self.family_symbol_cache[obj.rhino_guid] = sym
@@ -467,7 +556,7 @@ class ConversionRouter(object):
                         self.family_symbol_cache[fam_key_layer] = sym
                     if fam_key_param not in self.family_symbol_cache:
                         self.family_symbol_cache[fam_key_param] = sym
-                    _log("  [Phase 1] Loaded native .rfa Family: '{}' ({})".format(fam_name, inferred_cat))
+                    _log("  [Phase 1] Loaded native .rfa Family: '{}' ({}) [{}]".format(fam_name, inferred_cat, strat))
                 else:
                     _log("  [Phase 1 Notice] Object '{}' ({}) could not form a closed solid in .rfa; DirectShape fallback will be used in Phase 2.".format(obj_name or short_guid, obj.layer_name))
 
@@ -506,7 +595,10 @@ class ConversionRouter(object):
                         category_hint=inferred_cat,
                         target_bic=target_bic,
                         geom_feet=canonical_feet,
-                        unit_scale=self.unit_scale
+                        unit_scale=self.unit_scale,
+                        default_material=getattr(rule, "material", None),
+                        custom_parameters=merged_params,
+                        shared_param_defs=self.shared_param_defs
                     )
                     if sym:
                         self.family_symbol_cache[fam_key] = sym
@@ -518,7 +610,7 @@ class ConversionRouter(object):
         return self.family_symbol_cache
 
     def convert_object(self, scanned_obj, classification_result, profile_rule=None):
-        """Dispatches an object through the appropriate conversion strategy."""
+        """Dispatches an object through the appropriate conversion strategy with deterministic rule guard."""
         res = ConversionResult(scanned_obj.rhino_guid)
         if not REVIT_AVAILABLE or not self.doc:
             res.status = "FAILED"
@@ -526,9 +618,30 @@ class ConversionRouter(object):
             return res
 
         # Strategy resolution: Profile Rule override > Classification result
-        strategy = profile_rule.strategy if profile_rule else classification_result.proposed_strategy
+        strategy = profile_rule.strategy if profile_rule else (
+            classification_result.proposed_strategy if classification_result else "DirectShape"
+        )
         if self.global_mode == "Geometry-First" and strategy not in ("FloorNative", "AdaptiveComponent"):
             strategy = "DirectShape"
+
+        # Deterministic Per-Object Strategy Rule Guard
+        if StrategyRuleEngine:
+            ok_rule, failures_rule, _, fallback_rule = StrategyRuleEngine.evaluate_object(scanned_obj, strategy)
+            if not ok_rule:
+                policy = (getattr(profile_rule, "mixed_policy", None) or self.mixed_policy)
+                reason_str = "; ".join(failures_rule)
+                if policy == "StrictSkip" or fallback_rule == "Exclude":
+                    res.status = "SKIPPED"
+                    res.strategy_used = strategy
+                    res.error_message = reason_str
+                    res.warnings.extend(failures_rule)
+                    return res
+                res.warnings.append(
+                    "Rule guard: object failed '{}' ({}). Auto-routed to '{}'.".format(
+                        strategy, reason_str, fallback_rule
+                    )
+                )
+                strategy = fallback_rule
 
         res.strategy_used = strategy
 
@@ -573,7 +686,7 @@ class ConversionRouter(object):
                 created_elem = self._pipeline_6_roof_native(scanned_obj, geom_feet, level_id, profile_rule, res)
             elif strategy == "RoofByHost":
                 created_elem = self._pipeline_7_roof_by_host(scanned_obj, geom_feet, level_id, profile_rule, res)
-            elif strategy == "FamilyInstance":
+            elif strategy in ("FamilyInstance", "FreeFormFamily"):
                 created_elem = self._pipeline_8_family_placement(scanned_obj, geom_feet, level_id, profile_rule, res)
             elif strategy == "DirectShape":
                 created_elem = self._pipeline_9_direct_shape(scanned_obj, geom_feet, classification_result, profile_rule, res)
@@ -581,7 +694,7 @@ class ConversionRouter(object):
                 created_elem = self._pipeline_9_direct_shape(scanned_obj, geom_feet, classification_result, profile_rule, res)
 
             # Optional Auto-BUA generator trigger
-            if self.generate_bua and classification_result.inferred_category == "Floors" and created_elem:
+            if self.generate_bua and classification_result and classification_result.inferred_category == "Floors" and created_elem:
                 self._pipeline_10_auto_bua(scanned_obj, geom_feet, level_id, res)
 
             if created_elem:
@@ -1612,10 +1725,13 @@ class ConversionRouter(object):
                     if "Width" not in dims and scanned_obj.dx: dims["Width"] = scanned_obj.dx
                     if "Depth" not in dims and scanned_obj.dy: dims["Depth"] = scanned_obj.dy
                     if "Height" not in dims and scanned_obj.dz: dims["Height"] = scanned_obj.dz
+                    if getattr(scanned_obj, "cylinder_radius", 0.0) and "Radius" not in dims:
+                        dims["Radius"] = scanned_obj.cylinder_radius
                     param_aliases = {
                         "Width": ["Width", "b", "w", "Ancho", "Anchura", "Amplada"],
                         "Depth": ["Depth", "d", "Largo", "Profundidad", "Profunditat", "Length"],
                         "Height": ["Height", "h", "H", "Altura", "Alto", "Alçada"],
+                        "Radius": ["Radius", "r", "R", "Radio", "Radi"],
                         "Length": ["Length", "Longitud", "L"],
                         "Thickness": ["Thickness", "Espesor", "Grosor", "Gruix", "t"]
                     }
@@ -1655,7 +1771,8 @@ class ConversionRouter(object):
                                     except Exception:
                                         pass
 
-                    res.strategy_used = "FamilyInstance"
+                    rule_strat = getattr(profile_rule, "strategy", "") if profile_rule else ""
+                    res.strategy_used = rule_strat if rule_strat in ("ParametricFamily", "FreeFormFamily") else "FamilyInstance"
                     return inst
             except Exception as ex:
                 res.warnings.append("ParametricFamily placement notice: {}. Falling back to DirectShape.".format(ex))
@@ -2374,10 +2491,77 @@ class ConversionRouter(object):
         res.bua_area = revit_area_sqm
 
         # 8. Write parameters to Revit element for immediate scheduling & property display
-        self._write_parameters_to_element(created_elem, scanned_obj, res)
+        self._write_parameters_to_element(created_elem, scanned_obj, res, profile_rule=profile_rule)
 
-    def _write_parameters_to_element(self, created_elem, scanned_obj, res):
-        """Writes unit-aware shared parameters and built-in summary comments into created Revit element."""
+    @staticmethod
+    def _lookup_param_on_target(target_elem, p_name, p_guid=None):
+        """Resolves a DB.Parameter on an element or FamilySymbol by GUID, display name, or scan."""
+        if not target_elem:
+            return None
+        p_obj = None
+        sys_obj = globals().get("System")
+        if p_guid and sys_obj and hasattr(sys_obj, "Guid"):
+            try:
+                p_obj = target_elem.get_Parameter(sys_obj.Guid(p_guid))
+            except Exception:
+                p_obj = None
+        if not p_obj and hasattr(target_elem, "LookupParameter"):
+            try:
+                p_obj = target_elem.LookupParameter(p_name)
+            except Exception:
+                p_obj = None
+        if not p_obj and hasattr(target_elem, "Parameters"):
+            try:
+                for p in target_elem.Parameters:
+                    p_def = getattr(p, "Definition", None)
+                    cand_name = getattr(p_def, "Name", "") if p_def else getattr(p, "name", "")
+                    if cand_name == p_name:
+                        p_obj = p
+                        break
+            except Exception:
+                pass
+        return p_obj
+
+    def _set_param_value(self, p_obj, p_val, st_str, st_dbl, st_int, data_type_hint=""):
+        """Sets a Revit Parameter safely according to its StorageType."""
+        if not p_obj or getattr(p_obj, "IsReadOnly", True):
+            return False
+
+        st = getattr(p_obj, "StorageType", None)
+        dt_low = str(data_type_hint or "").lower()
+
+        if dt_low == "material":
+            mat_id = p_val
+            if isinstance(p_val, str) and p_val.strip():
+                mat_id = self._get_or_create_material(p_val)
+            if mat_id is not None:
+                try:
+                    p_obj.Set(mat_id)
+                    return True
+                except Exception:
+                    return False
+
+        if (st is not None and st == st_str) or (isinstance(p_val, str) and dt_low in ("", "text")):
+            p_obj.Set(str(p_val))
+            return True
+        if (st is not None and st == st_int) or dt_low in ("integer", "yesno"):
+            p_obj.Set(int(p_val))
+            return True
+        if (st is not None and st == st_dbl) or isinstance(p_val, (int, float)):
+            p_obj.Set(float(p_val))
+            return True
+        try:
+            p_obj.Set(float(p_val))
+            return True
+        except Exception:
+            try:
+                p_obj.Set(str(p_val))
+                return True
+            except Exception:
+                return False
+
+    def _write_parameters_to_element(self, created_elem, scanned_obj, res, profile_rule=None):
+        """Writes unit-aware built-in R2R parameters, summary comments, and user-defined custom parameters."""
         if not REVIT_AVAILABLE or not self.doc or not created_elem:
             return
 
@@ -2443,63 +2627,176 @@ class ConversionRouter(object):
         params_set_count = 0
         for p_name, p_val in param_assignments:
             try:
-                p_obj = None
-                p_guid = R2R_PARAM_GUIDS.get(p_name)
-                # Tier 1: Look up by GUID (Language-agnostic and most reliable for DirectShapes)
-                sys_obj = globals().get("System")
-                if p_guid and sys_obj and hasattr(sys_obj, "Guid"):
-                    try:
-                        p_obj = created_elem.get_Parameter(sys_obj.Guid(p_guid))
-                    except Exception:
-                        p_obj = None
+                p_obj = self._lookup_param_on_target(created_elem, p_name, R2R_PARAM_GUIDS.get(p_name))
+                if self._set_param_value(p_obj, p_val, st_str, st_dbl, st_int):
+                    params_set_count += 1
+            except Exception:
+                pass
 
-                # Tier 2: LookupParameter by display name
-                if not p_obj and hasattr(created_elem, "LookupParameter"):
-                    try:
-                        p_obj = created_elem.LookupParameter(p_name)
-                    except Exception:
-                        p_obj = None
+        # 4. User-Defined Deterministic Custom Parameters (Data + Non-Formula Constraints)
+        custom_specs = self._merge_custom_parameters(profile_rule)
+        for spec in custom_specs:
+            try:
+                # Formula-driven family parameters are computed by Revit and read-only on instances
+                if getattr(spec, "formula", ""):
+                    continue
+                p_name = getattr(spec, "name", "")
+                if not p_name:
+                    continue
+                resolved_val = spec.resolve_value(scanned_obj, res) if hasattr(spec, "resolve_value") else getattr(spec, "value_expr", "")
+                p_guid = getattr(spec, "guid", "") or self.custom_param_guids.get(p_name, "")
 
-                # Tier 3: Search all parameters on element if still unresolved
-                if not p_obj and hasattr(created_elem, "Parameters"):
-                    try:
-                        for p in created_elem.Parameters:
-                            p_def = getattr(p, "Definition", None)
-                            cand_name = getattr(p_def, "Name", "") if p_def else getattr(p, "name", "")
-                            if cand_name == p_name:
-                                p_obj = p
-                                break
-                    except Exception:
-                        pass
+                # Type parameters belong on FamilySymbol when placed as a FamilyInstance
+                is_inst = getattr(spec, "is_instance", True)
+                sym_target = getattr(created_elem, "Symbol", None) if not is_inst else None
+                target = sym_target if sym_target is not None else created_elem
 
-                if p_obj and not p_obj.IsReadOnly:
-                    st = getattr(p_obj, "StorageType", None)
-                    if (st is not None and st == st_str) or isinstance(p_val, str):
-                        p_obj.Set(str(p_val))
-                        params_set_count += 1
-                    elif (st is not None and st == st_dbl) or isinstance(p_val, (int, float)):
-                        p_obj.Set(float(p_val))
-                        params_set_count += 1
-                    elif st is not None and st == st_int:
-                        p_obj.Set(int(p_val))
-                        params_set_count += 1
-                    else:
-                        try:
-                            p_obj.Set(float(p_val))
-                            params_set_count += 1
-                        except Exception:
-                            try:
-                                p_obj.Set(str(p_val))
-                                params_set_count += 1
-                            except Exception:
-                                pass
+                p_obj = self._lookup_param_on_target(target, p_name, p_guid)
+                if not p_obj and target is not created_elem:
+                    p_obj = self._lookup_param_on_target(created_elem, p_name, p_guid)
+
+                if self._set_param_value(
+                    p_obj, resolved_val, st_str, st_dbl, st_int,
+                    data_type_hint=getattr(spec, "data_type", "Text")
+                ):
+                    params_set_count += 1
             except Exception:
                 pass
 
         res.parameters_written_count = params_set_count
 
-    def ensure_shared_parameters_bound(self, log_fn=None):
-        """Binds R2R Shared Parameters to target categories in active Revit document for scheduling.
+    def _build_shared_parameter_content(self, custom_parameters=None, use_10_cols=True):
+        """Constructs R2R_SharedParameters.txt content combining built-in and deterministic custom parameters."""
+        if use_10_cols:
+            lines = [
+                "# This is a Revit shared parameter file.",
+                "# Do not edit manually.",
+                "*META\tVERSION\tMINVERS",
+                "META\t2\t1",
+                "*GROUP\tID\tNAME",
+                "GROUP\t1\tRhinoToRevit",
+                "*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE\tHIDEWHENNOVALUE",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550001\tR2R_Area\tAREA\t\t1\t1\tR2R Computed Surface Area\t1\t0",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550002\tR2R_Volume\tVOLUME\t\t1\t1\tR2R Computed Solid Volume\t1\t0",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550003\tR2R_Material\tTEXT\t\t1\t1\tR2R Material Takeoff Name\t1\t0",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550004\tR2R_Material_Volume\tVOLUME\t\t1\t1\tR2R Material Takeoff Volume\t1\t0",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550005\tR2R_Source_Layer\tTEXT\t\t1\t1\tR2R Source Rhino Layer\t1\t0",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550006\tR2R_Rhino_GUID\tTEXT\t\t1\t1\tR2R Source Rhino Object GUID\t1\t0",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550007\tR2R_Thickness\tLENGTH\t\t1\t1\tR2R Structural Thickness\t1\t0",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550008\tR2R_Building_Zone\tTEXT\t\t1\t1\tR2R Building Zone\t1\t0",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550009\tR2R_Category\tTEXT\t\t1\t1\tR2R Inferred Revit Category\t1\t0",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550010\tR2R_Area_sqm\tTEXT\t\t1\t1\tR2R Area in sqm\t1\t0",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550011\tR2R_Volume_cum\tTEXT\t\t1\t1\tR2R Volume in cum\t1\t0",
+            ]
+        else:
+            lines = [
+                "# This is a Revit shared parameter file.",
+                "# Do not edit manually.",
+                "*META\tVERSION\tMINVERS",
+                "META\t2\t1",
+                "*GROUP\tID\tNAME",
+                "GROUP\t1\tRhinoToRevit",
+                "*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550001\tR2R_Area\tAREA\t\t1\t1\tR2R Computed Surface Area\t1",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550002\tR2R_Volume\tVOLUME\t\t1\t1\tR2R Computed Solid Volume\t1",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550003\tR2R_Material\tTEXT\t\t1\t1\tR2R Material Takeoff Name\t1",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550004\tR2R_Material_Volume\tVOLUME\t\t1\t1\tR2R Material Takeoff Volume\t1",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550005\tR2R_Source_Layer\tTEXT\t\t1\t1\tR2R Source Rhino Layer\t1",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550006\tR2R_Rhino_GUID\tTEXT\t\t1\t1\tR2R Source Rhino Object GUID\t1",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550007\tR2R_Thickness\tLENGTH\t\t1\t1\tR2R Structural Thickness\t1",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550008\tR2R_Building_Zone\tTEXT\t\t1\t1\tR2R Building Zone\t1",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550009\tR2R_Category\tTEXT\t\t1\t1\tR2R Inferred Revit Category\t1",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550010\tR2R_Area_sqm\tTEXT\t\t1\t1\tR2R Area in sqm\t1",
+                "PARAM\te1a2b3c4-1111-2222-3333-444455550011\tR2R_Volume_cum\tTEXT\t\t1\t1\tR2R Volume in cum\t1",
+            ]
+
+        seen = set(k.lower() for k in R2R_PARAM_GUIDS.keys())
+        for cp in (custom_parameters or []):
+            cp_obj = CustomParameterSpec.from_dict(cp) if (CustomParameterSpec and isinstance(cp, dict)) else cp
+            cname = getattr(cp_obj, "name", "")
+            if not cname or cname.lower() in seen:
+                continue
+            seen.add(cname.lower())
+            cguid = getattr(cp_obj, "guid", "")
+            self.custom_param_guids[cname] = cguid
+            sp_dtype = cp_obj.revit_sp_datatype() if hasattr(cp_obj, "revit_sp_datatype") else "TEXT"
+            desc = "R2R Custom {} Parameter".format(getattr(cp_obj, "param_kind", "Data"))
+            if use_10_cols:
+                lines.append("PARAM\t{}\t{}\t{}\t\t1\t1\t{}\t1\t0".format(cguid, cname, sp_dtype, desc))
+            else:
+                lines.append("PARAM\t{}\t{}\t{}\t\t1\t1\t{}\t1".format(cguid, cname, sp_dtype, desc))
+
+        return "\n".join(lines) + "\n"
+
+    def _open_or_build_shared_parameter_group(self, custom_parameters=None):
+        """Writes UTF-16 LE BOM Shared Parameters file (including custom specs) and opens 'RhinoToRevit' group."""
+        app = self.doc.Application
+        orig_sp_path = getattr(app, "SharedParametersFilename", "")
+        sp_temp_path = os.path.join(tempfile.gettempdir(), "R2R_SharedParameters.txt")
+
+        revit_year = 2024
+        try:
+            ver_str = getattr(app, "VersionNumber", "2024")
+            revit_year = int(re.sub(r'[^0-9]', '', str(ver_str)) or "2024")
+        except Exception:
+            revit_year = 2024
+
+        use_10_cols = (revit_year >= 2022)
+        all_custom = list(self.project_custom_parameters or []) + list(custom_parameters or [])
+        sp_content = self._build_shared_parameter_content(custom_parameters=all_custom, use_10_cols=use_10_cols)
+
+        bundled_sp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "R2R_SharedParameters.txt")
+        if not os.path.exists(bundled_sp):
+            bundled_sp = os.path.join(os.environ.get("APPDATA", ""), r"pyRevit\Extensions\R2R.extension\templates\R2R_SharedParameters.txt")
+
+        # Always keep temp shared parameters file fresh in UTF-16 LE BOM format
+        raw_bytes = b'\xff\xfe' + sp_content.encode('utf-16-le')
+        with open(sp_temp_path, "wb") as f:
+            f.write(raw_bytes)
+
+        # Use dynamic file when user-defined custom parameters are present; otherwise allow static template if present
+        target_sp_file = sp_temp_path if (all_custom or not os.path.exists(bundled_sp)) else bundled_sp
+
+        app.SharedParametersFilename = os.path.abspath(target_sp_file)
+        sp_file = app.OpenSharedParameterFile()
+        if not sp_file:
+            return None, None, orig_sp_path
+
+        grp = sp_file.Groups.get_Item("RhinoToRevit")
+        if not grp:
+            try:
+                grp = sp_file.Groups.Create("RhinoToRevit")
+            except Exception:
+                grp = None
+
+        if grp and hasattr(grp, "Definitions"):
+            for def_obj in grp.Definitions:
+                d_name = getattr(def_obj, "Name", "")
+                if d_name:
+                    self.shared_param_defs[d_name] = def_obj
+
+        return sp_file, grp, orig_sp_path
+
+    def prepare_shared_parameter_file(self, custom_parameters=None):
+        """Pre-generates the UTF-16 LE BOM shared parameters file and caches ExternalDefinitions for Phase 1."""
+        if not REVIT_AVAILABLE or not self.doc or not hasattr(self.doc, "Application"):
+            return {}
+        app = self.doc.Application
+        orig_sp_path = ""
+        try:
+            _, _, orig_sp_path = self._open_or_build_shared_parameter_group(custom_parameters=custom_parameters)
+        except Exception:
+            pass
+        finally:
+            try:
+                if orig_sp_path:
+                    app.SharedParametersFilename = orig_sp_path
+            except Exception:
+                pass
+        return self.shared_param_defs
+
+    def ensure_shared_parameters_bound(self, custom_parameters=None, log_fn=None):
+        """Binds built-in R2R and user-defined Custom Shared Parameters to target categories.
 
         Uses deterministic GUIDs to ensure parameters appear in Revit Schedule Fields.
         Must be executed inside an active Revit Transaction.
@@ -2511,88 +2808,13 @@ class ConversionRouter(object):
 
         app = self.doc.Application
         orig_sp_path = getattr(app, "SharedParametersFilename", "")
-        sp_temp_path = os.path.join(tempfile.gettempdir(), "R2R_SharedParameters.txt")
-
-        # Determine Revit release year for 10-column (2022+) vs 9-column (<2022) format
-        revit_year = 2024
-        try:
-            ver_str = getattr(app, "VersionNumber", "2024")
-            revit_year = int(re.sub(r'[^0-9]', '', str(ver_str)) or "2024")
-        except Exception:
-            revit_year = 2024
-
-        use_10_cols = (revit_year >= 2022)
-
-        if use_10_cols:
-            sp_content = (
-                "# This is a Revit shared parameter file.\n"
-                "# Do not edit manually.\n"
-                "*META\tVERSION\tMINVERS\n"
-                "META\t2\t1\n"
-                "*GROUP\tID\tNAME\n"
-                "GROUP\t1\tRhinoToRevit\n"
-                "*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE\tHIDEWHENNOVALUE\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550001\tR2R_Area\tAREA\t\t1\t1\tR2R Computed Surface Area\t1\t0\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550002\tR2R_Volume\tVOLUME\t\t1\t1\tR2R Computed Solid Volume\t1\t0\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550003\tR2R_Material\tTEXT\t\t1\t1\tR2R Material Takeoff Name\t1\t0\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550004\tR2R_Material_Volume\tVOLUME\t\t1\t1\tR2R Material Takeoff Volume\t1\t0\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550005\tR2R_Source_Layer\tTEXT\t\t1\t1\tR2R Source Rhino Layer\t1\t0\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550006\tR2R_Rhino_GUID\tTEXT\t\t1\t1\tR2R Source Rhino Object GUID\t1\t0\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550007\tR2R_Thickness\tLENGTH\t\t1\t1\tR2R Structural Thickness\t1\t0\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550008\tR2R_Building_Zone\tTEXT\t\t1\t1\tR2R Building Zone\t1\t0\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550009\tR2R_Category\tTEXT\t\t1\t1\tR2R Inferred Revit Category\t1\t0\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550010\tR2R_Area_sqm\tTEXT\t\t1\t1\tR2R Area in sqm\t1\t0\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550011\tR2R_Volume_cum\tTEXT\t\t1\t1\tR2R Volume in cum\t1\t0\n"
-            )
-        else:
-            sp_content = (
-                "# This is a Revit shared parameter file.\n"
-                "# Do not edit manually.\n"
-                "*META\tVERSION\tMINVERS\n"
-                "META\t2\t1\n"
-                "*GROUP\tID\tNAME\n"
-                "GROUP\t1\tRhinoToRevit\n"
-                "*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550001\tR2R_Area\tAREA\t\t1\t1\tR2R Computed Surface Area\t1\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550002\tR2R_Volume\tVOLUME\t\t1\t1\tR2R Computed Solid Volume\t1\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550003\tR2R_Material\tTEXT\t\t1\t1\tR2R Material Takeoff Name\t1\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550004\tR2R_Material_Volume\tVOLUME\t\t1\t1\tR2R Material Takeoff Volume\t1\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550005\tR2R_Source_Layer\tTEXT\t\t1\t1\tR2R Source Rhino Layer\t1\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550006\tR2R_Rhino_GUID\tTEXT\t\t1\t1\tR2R Source Rhino Object GUID\t1\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550007\tR2R_Thickness\tLENGTH\t\t1\t1\tR2R Structural Thickness\t1\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550008\tR2R_Building_Zone\tTEXT\t\t1\t1\tR2R Building Zone\t1\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550009\tR2R_Category\tTEXT\t\t1\t1\tR2R Inferred Revit Category\t1\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550010\tR2R_Area_sqm\tTEXT\t\t1\t1\tR2R Area in sqm\t1\n"
-                "PARAM\te1a2b3c4-1111-2222-3333-444455550011\tR2R_Volume_cum\tTEXT\t\t1\t1\tR2R Volume in cum\t1\n"
-            )
 
         try:
-            # 0. Check bundled static template first
-            bundled_sp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "R2R_SharedParameters.txt")
-            if not os.path.exists(bundled_sp):
-                bundled_sp = os.path.join(os.environ.get("APPDATA", ""), r"pyRevit\Extensions\R2R.extension\templates\R2R_SharedParameters.txt")
-
-            target_sp_file = bundled_sp if os.path.exists(bundled_sp) else sp_temp_path
-            if target_sp_file == sp_temp_path or not os.path.exists(target_sp_file):
-                # Write with explicit UTF-16 LE BOM (0xFF 0xFE) across all Python 2/3 and IronPython runtimes
-                raw_bytes = b'\xff\xfe' + sp_content.encode('utf-16-le')
-                with open(sp_temp_path, "wb") as f:
-                    f.write(raw_bytes)
-                target_sp_file = sp_temp_path
-
-            app.SharedParametersFilename = os.path.abspath(target_sp_file)
-            sp_file = app.OpenSharedParameterFile()
+            sp_file, grp, orig_sp_path = self._open_or_build_shared_parameter_group(custom_parameters=custom_parameters)
             if not sp_file:
                 if log_fn:
                     log_fn("[SharedParams] Warning: OpenSharedParameterFile returned null.")
                 return False
-
-            grp = sp_file.Groups.get_Item("RhinoToRevit")
-            if not grp:
-                try:
-                    grp = sp_file.Groups.Create("RhinoToRevit")
-                except Exception:
-                    grp = None
             if not grp:
                 if log_fn:
                     log_fn("[SharedParams] Warning: Group 'RhinoToRevit' unavailable.")

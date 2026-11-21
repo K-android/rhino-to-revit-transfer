@@ -2275,5 +2275,637 @@ class TestR2RPipeline(unittest.TestCase):
             cr.DB = orig_db
 
 
+class TestStrategyRulesAndCustomParams(unittest.TestCase):
+    """Tests for Strategy Rule Engine, Mixed-Layer Splitting, Editability Routing, and Custom Parameters."""
+
+    def _make_mock_db_env(self):
+        """Creates a comprehensive MockDB & MockDoc pair safe for router dispatch tests."""
+        class MockBICMeta(type):
+            def __getattr__(cls, name):
+                return -2000150
+
+        class MockBIC(object, metaclass=MockBICMeta):
+            OST_GenericModel = -2000150
+            OST_Floors = -2000032
+            OST_Walls = -2000011
+            OST_Roofs = -2000035
+            OST_Ceilings = -2000038
+            OST_Toposolid = -2007120
+            OST_Topography = -2001340
+            OST_Site = -2001260
+
+        class MockElementId(object):
+            InvalidElementId = -1
+
+            def __init__(self, val=-1):
+                self.val = val
+                self.IntegerValue = val if isinstance(val, int) else -1
+
+            def __eq__(self, other):
+                return getattr(other, "val", other) == self.val
+
+        class MockMaterial(object):
+            def __init__(self, mid, name):
+                self.Id = MockElementId(mid)
+                self.Name = name
+
+        class MockLevel(object):
+            def __init__(self, lid, name, elev=0.0):
+                self.Id = MockElementId(lid)
+                self.Name = name
+                self.Elevation = elev
+
+        class MockStorageType(object):
+            String = 1
+            Integer = 2
+            Double = 3
+            ElementId = 4
+
+        class MockBIP(object):
+            ALL_MODEL_MARK = 1
+            ALL_MODEL_INSTANCE_COMMENTS = 2
+            MATERIAL_ID_PARAM = 3
+            ELEM_TYPE_PARAM = 4
+
+        class MockTransaction(object):
+            def __init__(self, doc, name="R2R"):
+                self.name = name
+
+            def Start(self):
+                return True
+
+            def Commit(self):
+                return True
+
+            def RollBack(self):
+                return True
+
+            def Dispose(self):
+                pass
+
+        mats = [MockMaterial(401, "Travertine"), MockMaterial(402, "Timber_Oak")]
+        levels = [MockLevel(101, "Level 00", 0.0)]
+
+        class MockCollector(object):
+            def __init__(self, doc):
+                self._items = []
+
+            def OfClass(self, cls):
+                if cls is MockDB.Material:
+                    self._items = list(mats)
+                elif cls is MockDB.Level:
+                    self._items = list(levels)
+                else:
+                    self._items = []
+                return self
+
+            def FirstElement(self):
+                return self._items[0] if self._items else None
+
+            def __iter__(self):
+                return iter(self._items)
+
+        class MockDB(object):
+            BuiltInCategory = MockBIC
+            ElementId = MockElementId
+            StorageType = MockStorageType
+            BuiltInParameter = MockBIP
+            Transaction = MockTransaction
+            Material = type("Material", (), {})
+            Level = type("Level", (), {})
+            FamilySymbol = type("FamilySymbol", (), {})
+            FloorType = type("FloorType", (), {})
+            WallType = type("WallType", (), {})
+            RoofType = type("RoofType", (), {})
+            CeilingType = type("CeilingType", (), {})
+            ElementTypeGroup = type("ETG", (), {"FloorType": 1, "WallType": 2, "RoofType": 3, "CeilingType": 4})()
+            FilteredElementCollector = MockCollector
+            XYZ = staticmethod(lambda x, y, z: (x, y, z))
+
+            class Structure(object):
+                class StructuralType(object):
+                    NonStructural = 0
+
+        class MockDoc(object):
+            def __init__(self):
+                self.Application = type("App", (), {"SharedParametersFilename": ""})()
+
+            def GetElement(self, eid):
+                return None
+
+        class MockRhinoGeom(object):
+            def Duplicate(self):
+                return MockRhinoGeom()
+
+            def Scale(self, s):
+                return True
+
+            def Translate(self, x, y, z):
+                return True
+
+        MockDB.RhinoGeom = MockRhinoGeom
+        MockDB.Options = staticmethod(lambda *a: object())
+        return MockDB, MockDoc
+
+    def test_strategy_rule_engine_all_strategies(self):
+        """Tests StrategyRuleEngine per-object evaluation, metadata, and compatibility scores."""
+        from strategy_rules import StrategyRuleEngine, STRATEGY_METADATA
+
+        # 1. Verify editability and constraint flags in STRATEGY_METADATA
+        self.assertTrue(STRATEGY_METADATA["ParametricFamily"]["supports_constraints"])
+        self.assertTrue(STRATEGY_METADATA["ParametricFamily"]["supports_type_params"])
+        self.assertFalse(STRATEGY_METADATA["FreeFormFamily"]["supports_constraints"])
+        self.assertTrue(STRATEGY_METADATA["FreeFormFamily"]["supports_type_params"])
+        self.assertFalse(STRATEGY_METADATA["DirectShape"]["supports_constraints"])
+        self.assertFalse(STRATEGY_METADATA["DirectShape"]["supports_type_params"])
+
+        # Box primitive passes ParametricFamily
+        box = ScannedObject("g-box")
+        box.object_type = "Brep"
+        box.geometry_primitive_type = "Box"
+        box.is_prismatic = True
+        box.is_closed = True
+        box.volume = 6.0
+        box.parametric_dims = {"width_m": 2.0, "depth_m": 1.0, "height_m": 3.0}
+        ok, fails, _, _ = StrategyRuleEngine.evaluate_object(box, "ParametricFamily")
+        self.assertTrue(ok, "Expected Box to pass ParametricFamily, got: {}".format(fails))
+
+        # Cylinder primitive passes ParametricFamily via dx/dy/dz
+        cyl = ScannedObject("g-cyl")
+        cyl.object_type = "Brep"
+        cyl.geometry_primitive_type = "Cylinder"
+        cyl.is_prismatic = True
+        cyl.is_closed = True
+        cyl.dx = 1.0
+        cyl.dy = 1.0
+        cyl.dz = 4.0
+        ok_cyl, fails_cyl, _, _ = StrategyRuleEngine.evaluate_object(cyl, "ParametricFamily")
+        self.assertTrue(ok_cyl, "Expected Cylinder to pass ParametricFamily: {}".format(fails_cyl))
+
+        # FreeFormSolid fails ParametricFamily -> recommends FreeFormFamily
+        ff = ScannedObject("g-ff")
+        ff.object_type = "Brep"
+        ff.geometry_primitive_type = "FreeFormSolid"
+        ff.is_closed = True
+        ff.volume = 12.0
+        ok_ff_param, _, _, fb_ff = StrategyRuleEngine.evaluate_object(ff, "ParametricFamily")
+        self.assertFalse(ok_ff_param)
+        self.assertEqual(fb_ff, "FreeFormFamily")
+        ok_ff_native, fails_ff_native, _, _ = StrategyRuleEngine.evaluate_object(ff, "FreeFormFamily")
+        self.assertTrue(ok_ff_native, "Expected closed FreeFormSolid to pass FreeFormFamily: {}".format(fails_ff_native))
+
+        # OpenMesh fails ParametricFamily and FreeFormFamily -> recommends DirectShape
+        omesh = ScannedObject("g-omesh")
+        omesh.object_type = "Mesh"
+        omesh.geometry_primitive_type = "OpenMesh"
+        omesh.is_closed = False
+        ok_om_param, _, _, fb_om = StrategyRuleEngine.evaluate_object(omesh, "ParametricFamily")
+        self.assertFalse(ok_om_param)
+        self.assertEqual(fb_om, "DirectShape")
+        ok_om_ff, _, _, _ = StrategyRuleEngine.evaluate_object(omesh, "FreeFormFamily")
+        self.assertFalse(ok_om_ff)
+        ok_om_ds, _, _, _ = StrategyRuleEngine.evaluate_object(omesh, "DirectShape")
+        self.assertTrue(ok_om_ds)
+
+        # Curve fails DirectShape -> recommends Exclude
+        crv = ScannedObject("g-crv")
+        crv.object_type = "Curve"
+        crv.geometry_primitive_type = "Curve"
+        crv.is_closed = False
+        ok_crv, _, _, fb_crv = StrategyRuleEngine.evaluate_object(crv, "DirectShape")
+        self.assertFalse(ok_crv)
+        self.assertEqual(fb_crv, "Exclude")
+
+        # AdaptiveComponent 4-pt panel vs 0-pt
+        panel = ScannedObject("g-adp")
+        panel.object_type = "Brep"
+        panel.geometry_primitive_type = "AdaptivePanel"
+        panel.adaptive_point_count = 4
+        ok_adp, _, _, _ = StrategyRuleEngine.evaluate_object(panel, "AdaptiveComponent")
+        self.assertTrue(ok_adp)
+        ok_adp_fail, _, _, _ = StrategyRuleEngine.evaluate_object(box, "AdaptiveComponent")
+        self.assertFalse(ok_adp_fail)
+
+        # Horizontal slab & vertical wall & block instance
+        slab = ScannedObject("g-slab")
+        slab.object_type = "Brep"
+        slab.is_horizontal = True
+        slab.is_vertical = False
+        slab.is_closed = True
+        self.assertTrue(StrategyRuleEngine.evaluate_object(slab, "FloorNative")[0])
+        self.assertTrue(StrategyRuleEngine.evaluate_object(slab, "RoofNative")[0])
+        self.assertTrue(StrategyRuleEngine.evaluate_object(slab, "Toposolid")[0])
+        self.assertFalse(StrategyRuleEngine.evaluate_object(slab, "WallByCurve")[0])
+
+        wall = ScannedObject("g-wall")
+        wall.object_type = "Brep"
+        wall.is_horizontal = False
+        wall.is_vertical = True
+        wall.is_closed = True
+        self.assertTrue(StrategyRuleEngine.evaluate_object(wall, "WallByCurve")[0])
+        self.assertFalse(StrategyRuleEngine.evaluate_object(wall, "FloorNative")[0])
+        self.assertFalse(StrategyRuleEngine.evaluate_object(wall, "Toposolid")[0])
+
+        blk = ScannedObject("g-blk")
+        blk.object_type = "InstanceReference"
+        blk.geometry_primitive_type = "BlockInstance"
+        self.assertTrue(StrategyRuleEngine.evaluate_object(blk, "RepetitiveFamily")[0])
+
+    def test_mixed_layer_geometry_bucketing_and_splitting(self):
+        """Tests mixed-layer bucket detection, StrategyEvaluation, Virtual Sub-Layer Splitting, and LayerRowItem."""
+        from strategy_rules import StrategyRuleEngine
+        from ui_dialog import LayerRowItem
+
+        objs = []
+        for i in range(2):
+            b = ScannedObject("mix-box-{}".format(i))
+            b.layer_name = "Mix_Layer"
+            b.object_type = "Brep"
+            b.geometry_primitive_type = "Box"
+            b.is_prismatic = True
+            b.is_closed = True
+            b.parametric_dims = {"width_m": 1.0, "depth_m": 1.0, "height_m": 2.0}
+            objs.append(b)
+
+        for i in range(2):
+            a = ScannedObject("mix-adp-{}".format(i))
+            a.layer_name = "Mix_Layer"
+            a.object_type = "Brep"
+            a.geometry_primitive_type = "AdaptivePanel"
+            a.adaptive_point_count = 4
+            a.is_closed = False
+            objs.append(a)
+
+        m = ScannedObject("mix-mesh-0")
+        m.layer_name = "Mix_Layer"
+        m.object_type = "Mesh"
+        m.geometry_primitive_type = "OpenMesh"
+        m.is_closed = False
+        objs.append(m)
+
+        c = ScannedObject("mix-crv-0")
+        c.layer_name = "Mix_Layer"
+        c.object_type = "Curve"
+        c.geometry_primitive_type = "Curve"
+        c.is_closed = False
+        objs.append(c)
+
+        ev = StrategyRuleEngine.evaluate_layer(objs, "ParametricFamily")
+        self.assertEqual(ev.status, "PARTIAL_MIXED")
+        self.assertEqual(ev.pass_count, 2)
+        self.assertEqual(ev.fail_count, 4)
+        self.assertEqual(ev.total_count, 6)
+        self.assertTrue(ev.is_mixed_geometry)
+        self.assertEqual(len(ev.bucket_counts), 4)
+        self.assertIn("2/6", ev.summary_text())
+
+        splits = StrategyRuleEngine.split_objects_by_geometry("Mix_Layer", objs)
+        self.assertEqual(len(splits), 4)
+        total_split_count = sum(len(sub) for _, _, sub in splits)
+        self.assertEqual(total_split_count, 6)
+        bucket_keys = [bk for _, bk, _ in splits]
+        self.assertEqual(set(bucket_keys), set(["PARAMETRIC_SOLID", "ADAPTIVE", "OPEN_MESH", "CURVE"]))
+        for vname, bk, sub in splits:
+            self.assertTrue(vname.startswith("Mix_Layer ["))
+            for o in sub:
+                obk, _ = StrategyRuleEngine.classify_geometry_bucket(o)
+                self.assertEqual(obk, bk)
+
+        # Homogeneous list returns 1 unsplit group with original layer name
+        homo = StrategyRuleEngine.split_objects_by_geometry("PureBoxes", objs[:2])
+        self.assertEqual(len(homo), 1)
+        self.assertEqual(homo[0][0], "PureBoxes")
+        self.assertEqual(homo[0][1], "PARAMETRIC_SOLID")
+
+        # UI LayerRowItem tracks mixed status & compatibility tag dynamically
+        cls_mix = ClassificationResult("mix-box-0")
+        cls_mix.inferred_category = "Generic"
+        cls_mix.revit_category_name = "Generic Models"
+        cls_mix.proposed_strategy = "ParametricFamily"
+        row = LayerRowItem("Mix_Layer", objs, cls_mix, None)
+        self.assertTrue(row.rule_eval.is_mixed_geometry)
+        self.assertEqual(row.compatibility_tag, "MIXED (2/6)")
+        self.assertTrue(any(p in row.rule_eval.editability_label for p in ("Editable", "Parametric")))
+
+    def test_mixed_policy_auto_fallback_vs_strict_skip(self):
+        """Tests per-object rule guard in ConversionRouter.convert_object under StrictSkip vs AutoFallback."""
+        import conversion_router as cr
+        from conversion_router import ConversionRouter
+        from profile_manager import MappingRule
+
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        try:
+            MockDB, MockDoc = self._make_mock_db_env()
+            cr.REVIT_AVAILABLE = True
+            cr.DB = MockDB
+
+            router = ConversionRouter(MockDoc(), global_mode="Hybrid", mixed_policy="AutoFallback")
+            called_pipelines = []
+            router._extract_element_quantities = lambda *a, **kw: None
+            router._write_parameters_to_element = lambda *a, **kw: None
+            dummy_cat = type("Cat", (), {"Name": "Generic Models"})()
+
+            def fake_ds(scanned_obj, geom_feet, classification_result=None, profile_rule=None, res=None, category_id=None):
+                called_pipelines.append(("DirectShape", scanned_obj.rhino_guid))
+                return type("DummyDS", (), {"Id": MockDB.ElementId(501), "UniqueId": "ds-501", "Category": dummy_cat, "get_Parameter": lambda s, p: None, "LookupParameter": lambda s, n: None})()
+
+            def fake_ff(scanned_obj, geom_feet, level_id=None, profile_rule=None, res=None):
+                called_pipelines.append(("FreeFormFamily", scanned_obj.rhino_guid))
+                return type("DummyFF", (), {"Id": MockDB.ElementId(502), "UniqueId": "ff-502", "Category": dummy_cat, "get_Parameter": lambda s, p: None, "LookupParameter": lambda s, n: None})()
+
+            router._pipeline_9_direct_shape = fake_ds
+            router._pipeline_8_family_placement = fake_ff
+
+            # OpenMesh assigned ParametricFamily under StrictSkip -> SKIPPED
+            omesh = ScannedObject("obj-omesh-1")
+            omesh.layer_name = "Mix_Layer"
+            omesh.object_type = "Mesh"
+            omesh.geometry_primitive_type = "OpenMesh"
+            omesh.is_closed = False
+            omesh.raw_geometry = MockDB.RhinoGeom()
+
+            rule_strict = MappingRule("Mix_Layer", revit_category="Generic Models", strategy="ParametricFamily", mixed_policy="StrictSkip")
+            cls_res = ClassificationResult("obj-omesh-1")
+            cls_res.revit_category_name = "Generic Models"
+            cls_res.proposed_strategy = "ParametricFamily"
+
+            res_strict = router.convert_object(omesh, cls_res, profile_rule=rule_strict)
+            self.assertEqual(res_strict.status, "SKIPPED")
+            self.assertEqual(len(called_pipelines), 0)
+
+            # OpenMesh assigned ParametricFamily under AutoFallback -> switches to DirectShape with Rule guard warning
+            rule_auto = MappingRule("Mix_Layer", revit_category="Generic Models", strategy="ParametricFamily", mixed_policy="AutoFallback")
+            res_auto = router.convert_object(omesh, cls_res, profile_rule=rule_auto)
+            self.assertIn(("DirectShape", "obj-omesh-1"), called_pipelines)
+            self.assertTrue(any("Rule guard:" in w for w in res_auto.warnings))
+            self.assertEqual(res_auto.strategy_used, "DirectShape")
+
+            # FreeFormSolid assigned ParametricFamily under AutoFallback -> falls back to FreeFormFamily
+            ff_obj = ScannedObject("obj-ff-1")
+            ff_obj.layer_name = "Mix_Layer"
+            ff_obj.object_type = "Brep"
+            ff_obj.geometry_primitive_type = "FreeFormSolid"
+            ff_obj.is_closed = True
+            ff_obj.volume = 8.0
+            ff_obj.raw_geometry = MockDB.RhinoGeom()
+
+            res_ff = router.convert_object(ff_obj, None, profile_rule=rule_auto)
+            self.assertIn(("FreeFormFamily", "obj-ff-1"), called_pipelines)
+            self.assertEqual(res_ff.strategy_used, "FreeFormFamily")
+            self.assertTrue(any("Rule guard:" in w for w in res_ff.warnings))
+
+            # Curve under AutoFallback -> fallback is Exclude -> SKIPPED
+            crv = ScannedObject("obj-crv-1")
+            crv.layer_name = "Mix_Layer"
+            crv.object_type = "Curve"
+            crv.geometry_primitive_type = "Curve"
+            crv.is_closed = False
+            crv.raw_geometry = MockDB.RhinoGeom()
+
+            res_crv = router.convert_object(crv, None, profile_rule=rule_auto)
+            self.assertEqual(res_crv.status, "SKIPPED")
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            cr.DB = orig_db
+
+    def test_custom_parameter_spec_deterministic_guid_and_resolution(self):
+        """Tests deterministic UUIDv5 GUIDs, token/@usertext resolution, profile persistence, and UTF-16 SharedParameters output."""
+        import tempfile
+        import codecs
+        import conversion_router as cr
+        from conversion_router import ConversionRouter
+        from profile_manager import ProfileManager, MappingRule, CustomParameterSpec, deterministic_param_guid
+
+        # 1. Deterministic GUID generation
+        g1 = deterministic_param_guid("Fire_Rating")
+        g2 = deterministic_param_guid("  Fire_Rating ")
+        g3 = deterministic_param_guid("Acoustic_Class")
+        self.assertEqual(g1, g2)
+        self.assertNotEqual(g1, g3)
+        self.assertEqual(len(g1), 36)
+        self.assertEqual(g1[14], "5")  # UUID version 5 nibble
+
+        # 2. Value expression resolution
+        obj = ScannedObject("param-obj-1")
+        obj.layer_name = "Facet_Wall"
+        obj.area_sqm = 25.5
+        obj.volume_cum = 12.25
+        obj.nearest_level_name = "Level 02"
+        obj.user_text = {"Zone": "NorthWing", "FireHrs": "2", "IsExternal": "yes"}
+        cres = ClassificationResult("param-obj-1")
+        cres.best_level = "Level 02"
+
+        p_ut = CustomParameterSpec("Zone_Name", "Text", "Data", True, "@usertext:Zone")
+        p_tok = CustomParameterSpec("Tag_Label", "Text", "Data", False, "{layer}_{level}")
+        p_int = CustomParameterSpec("Fire_Hours", "Integer", "Data", True, "@usertext:FireHrs")
+        p_bool = CustomParameterSpec("Is_External", "YesNo", "Data", True, "@usertext:IsExternal")
+        p_len = CustomParameterSpec("Clear_Offset", "Length", "Constraint", True, "3.048")
+        p_num = CustomParameterSpec("Panel_Area", "Number", "Data", True, "{area_sqm}")
+
+        self.assertEqual(p_ut.resolve_value(obj, cres), "NorthWing")
+        self.assertEqual(p_tok.resolve_value(obj, cres), "Facet_Wall_Level 02")
+        self.assertEqual(p_int.resolve_value(obj, cres), 2)
+        self.assertEqual(p_bool.resolve_value(obj, cres), 1)
+        self.assertAlmostEqual(p_len.resolve_value(obj, cres), 10.0, places=3)
+        self.assertAlmostEqual(p_num.resolve_value(obj, cres), 25.5, places=3)
+
+        # 3. ProfileManager save / load round-trip
+        tmp_path = os.path.join(tempfile.gettempdir(), "r2r_test_custom_params_profile.json")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        try:
+            pm = ProfileManager(profile_path=tmp_path)
+            pm.project_custom_parameters = [p_ut]
+            pm.add_rule(MappingRule(
+                layer_pattern="R2R_UnitTest_CustomLayer",
+                revit_category="Walls",
+                strategy="ParametricFamily",
+                custom_parameters=[p_tok, p_len],
+                mixed_policy="StrictSkip"
+            ))
+            pm.save(tmp_path)
+
+            pm2 = ProfileManager()
+            ok_load = pm2.load(tmp_path)
+            self.assertTrue(ok_load)
+            self.assertEqual(len(pm2.project_custom_parameters), 1)
+            self.assertEqual(pm2.project_custom_parameters[0].guid, p_ut.guid)
+            loaded_rule = pm2.find_matching_rule("R2R_UnitTest_CustomLayer")
+            self.assertIsNotNone(loaded_rule)
+            self.assertEqual(loaded_rule.mixed_policy, "StrictSkip")
+            self.assertEqual(len(loaded_rule.custom_parameters), 2)
+            self.assertEqual(loaded_rule.custom_parameters[1].guid, p_len.guid)
+            self.assertEqual(loaded_rule.custom_parameters[1].data_type, "Length")
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        # 4. UTF-16 LE BOM R2R_SharedParameters.txt generation with custom parameter GUIDs
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        try:
+            MockDB, MockDoc = self._make_mock_db_env()
+            doc = MockDoc()
+            doc.Application.OpenSharedParameterFile = lambda: None
+            cr.REVIT_AVAILABLE = True
+            cr.DB = MockDB
+
+            router = ConversionRouter(doc, project_custom_parameters=[p_ut])
+            router.ensure_shared_parameters_bound(custom_parameters=[p_ut, p_len])
+
+            sp_path = os.path.join(tempfile.gettempdir(), "R2R_SharedParameters.txt")
+            self.assertTrue(os.path.exists(sp_path))
+            with open(sp_path, "rb") as fb:
+                raw_bytes = fb.read()
+            self.assertTrue(raw_bytes.startswith(codecs.BOM_UTF16_LE))
+            decoded = raw_bytes.decode("utf-16")
+            self.assertIn("Zone_Name", decoded)
+            self.assertIn(p_ut.guid, decoded)
+            self.assertIn("Clear_Offset", decoded)
+            self.assertIn(p_len.guid, decoded)
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            cr.DB = orig_db
+
+    def test_editable_vs_non_editable_family_routing_and_custom_params(self):
+        """Tests pre_generate_families Editable vs Non-Editable routing and _write_parameters_to_element Instance/Type/Formula handling."""
+        import conversion_router as cr
+        from conversion_router import ConversionRouter, ConversionResult
+        from profile_manager import MappingRule, CustomParameterSpec
+
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        orig_ff = getattr(cr, "FamilyFactory", None)
+        try:
+            MockDB, MockDoc = self._make_mock_db_env()
+            cr.REVIT_AVAILABLE = True
+            cr.DB = MockDB
+
+            param_calls = []
+            freeform_calls = []
+
+            class MockSymbol(object):
+                def __init__(self, name):
+                    self.Name = name
+                    self.IsActive = True
+                    self.type_params = {}
+
+                def LookupParameter(self, pname):
+                    return self.type_params.get(pname)
+
+            class SpyFamilyFactory(object):
+                @staticmethod
+                def create_parametric_box_or_profile_family(
+                    app, doc, **kwargs
+                ):
+                    name = kwargs.get("family_name", "Param")
+                    param_calls.append((name, kwargs))
+                    return MockSymbol(name)
+
+                @staticmethod
+                def create_native_freeform_family(
+                    app, doc, **kwargs
+                ):
+                    name = kwargs.get("family_name", "FF")
+                    freeform_calls.append((name, kwargs))
+                    return MockSymbol(name)
+
+            cr.FamilyFactory = SpyFamilyFactory
+
+            obj_box = ScannedObject("route-box-1")
+            obj_box.layer_name = "Modular_Blocks"
+            obj_box.object_type = "Brep"
+            obj_box.geometry_primitive_type = "Box"
+            obj_box.is_prismatic = True
+            obj_box.is_closed = True
+            obj_box.centroid = (1.0, 2.0, 0.0)
+            obj_box.bbox_min = (0.0, 1.0, 0.0)
+            obj_box.bbox_max = (2.0, 3.0, 3.0)
+            obj_box.parametric_dims = {"width_m": 2.0, "depth_m": 2.0, "height_m": 3.0}
+            obj_box.raw_geometry = MockDB.RhinoGeom()
+
+            obj_ff = ScannedObject("route-ff-1")
+            obj_ff.layer_name = "Rock_Form"
+            obj_ff.object_type = "Brep"
+            obj_ff.geometry_primitive_type = "FreeFormSolid"
+            obj_ff.is_closed = True
+            obj_ff.volume = 15.0
+            obj_ff.centroid = (5.0, 5.0, 0.0)
+            obj_ff.bbox_min = (4.0, 4.0, 0.0)
+            obj_ff.bbox_max = (6.0, 6.0, 5.0)
+            obj_ff.raw_geometry = MockDB.RhinoGeom()
+
+            c_inst = CustomParameterSpec("Inst_Code", "Text", "Data", is_instance=True, value_expr="C-101")
+            c_type = CustomParameterSpec("Type_Finish", "Text", "Data", is_instance=False, value_expr="Honed")
+            c_mat = CustomParameterSpec("Custom_Mat", "Material", "Data", is_instance=True, value_expr="Travertine")
+            c_formula = CustomParameterSpec("Calc_Area", "Number", "Constraint", is_instance=True, value_expr="999", formula="Width * Depth", constraint_target="Width")
+
+            rules_by_layer = {
+                "Modular_Blocks": MappingRule("Modular_Blocks", revit_category="Generic Models", strategy="ParametricFamily", custom_parameters=[c_inst, c_type, c_formula]),
+                "Rock_Form": MappingRule("Rock_Form", revit_category="Generic Models", strategy="FreeFormFamily", custom_parameters=[c_inst, c_type, c_mat])
+            }
+            c_box = ClassificationResult("route-box-1")
+            c_box.proposed_strategy = "ParametricFamily"
+            c_box.revit_category_name = "Generic Models"
+            c_ff = ClassificationResult("route-ff-1")
+            c_ff.proposed_strategy = "FreeFormFamily"
+            c_ff.revit_category_name = "Generic Models"
+
+            classifications_map = {
+                "route-box-1": c_box,
+                "route-ff-1": c_ff
+            }
+
+            router = ConversionRouter(MockDoc())
+            router.pre_generate_families([obj_box, obj_ff], classifications_map, profile_rules=rules_by_layer)
+
+            # Box (Editable ParametricFamily) routes ONLY to parametric builder; FreeFormSolid routes ONLY to freeform builder
+            self.assertEqual(len(param_calls), 1)
+            self.assertEqual(param_calls[0][1].get("primitive_type"), "Box")
+            self.assertEqual(len(param_calls[0][1].get("custom_parameters", [])), 3)
+
+            self.assertEqual(len(freeform_calls), 1)
+            self.assertEqual(len(freeform_calls[0][1].get("custom_parameters", [])), 3)
+
+            # Verify _write_parameters_to_element splits Instance vs Symbol Type vs Material and skips Formula params
+            class MockParam(object):
+                def __init__(self, st, init_val=None):
+                    self.StorageType = st
+                    self.val = init_val
+                    self.IsReadOnly = False
+
+                def Set(self, v):
+                    self.val = v
+
+            sym = MockSymbol("Modular_Blocks_Sym")
+            sym.type_params["Type_Finish"] = MockParam(MockDB.StorageType.String)
+
+            inst = type("MockFamInst", (), {
+                "Symbol": sym,
+                "params": {
+                    "Inst_Code": MockParam(MockDB.StorageType.String),
+                    "Custom_Mat": MockParam(MockDB.StorageType.ElementId),
+                    "Calc_Area": MockParam(MockDB.StorageType.Double, init_val=12.0),
+                },
+                "get_Parameter": lambda s, k: None,
+                "LookupParameter": lambda s, k: s.params.get(k)
+            })()
+
+            res_write = ConversionResult("route-box-1")
+            rule_write = MappingRule("Modular_Blocks", revit_category="Generic Models", strategy="ParametricFamily", custom_parameters=[c_inst, c_type, c_mat, c_formula])
+            router._write_parameters_to_element(inst, obj_box, res_write, profile_rule=rule_write)
+
+            self.assertEqual(inst.params["Inst_Code"].val, "C-101")
+            self.assertEqual(sym.type_params["Type_Finish"].val, "Honed")
+            self.assertEqual(getattr(inst.params["Custom_Mat"].val, "val", inst.params["Custom_Mat"].val), 401)
+            # Formula-driven parameter must NOT be overwritten by Python value_expr ("999")
+            self.assertEqual(inst.params["Calc_Area"].val, 12.0)
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            cr.DB = orig_db
+            cr.FamilyFactory = orig_ff
+
+
 if __name__ == "__main__":
     unittest.main()

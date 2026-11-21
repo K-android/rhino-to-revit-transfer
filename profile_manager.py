@@ -11,6 +11,159 @@ Family/Type names, Conversion Strategies, Level snapping rules, and Room Boundin
 import os
 import json
 import re
+import hashlib
+import uuid
+
+
+_R2R_CUSTOM_PARAM_NS = uuid.UUID("7f3b9c1a-4d2e-4f8a-9b6c-1e2d3c4b5a6f").bytes
+
+
+def deterministic_param_guid(param_name):
+    """Generates a stable UUIDv5 string from a parameter name (consistent across IronPython 2.7 & CPython 3)."""
+    clean = str(param_name or "").strip().lower()
+    digest = hashlib.sha1(_R2R_CUSTOM_PARAM_NS + clean.encode("utf-8")).digest()
+    return str(uuid.UUID(bytes=digest[:16], version=5))
+
+
+class CustomParameterSpec(object):
+    """User-defined deterministic parameter definition (Data or Editable Family Constraint)."""
+
+    VALID_DATA_TYPES = ("Text", "Number", "Integer", "YesNo", "Length", "Area", "Volume", "Material")
+    VALID_KINDS = ("Data", "Constraint")
+    VALID_CONSTRAINT_TARGETS = ("", "Width", "Depth", "Height", "Base_Offset", "Radius", "Visibility", "Material")
+
+    _REVIT_SP_TYPES = {
+        "text": "TEXT",
+        "number": "NUMBER",
+        "integer": "INTEGER",
+        "yesno": "YESNO",
+        "length": "LENGTH",
+        "area": "AREA",
+        "volume": "VOLUME",
+        "material": "MATERIAL"
+    }
+
+    def __init__(self, name, data_type="Text", param_kind="Data", is_instance=True,
+                 value_expr="", formula="", constraint_target="", guid=""):
+        self.name = re.sub(r'[^a-zA-Z0-9_\-\s]', '_', str(name or "").strip()) or "R2R_Custom_Param"
+        self.data_type = str(data_type or "Text").strip()
+        if self.data_type not in self.VALID_DATA_TYPES:
+            self.data_type = "Text"
+        self.param_kind = str(param_kind or "Data").strip()
+        if self.param_kind not in self.VALID_KINDS:
+            self.param_kind = "Data"
+        self.is_instance = bool(is_instance)
+        self.value_expr = str(value_expr or "")
+        self.formula = str(formula or "").strip()
+        self.constraint_target = str(constraint_target or "").strip()
+        if self.constraint_target and self.param_kind != "Constraint":
+            self.param_kind = "Constraint"
+        self.guid = str(guid).strip() if guid else deterministic_param_guid(self.name)
+
+    def revit_sp_datatype(self):
+        """Maps data_type to Revit Shared Parameter file DATATYPE token."""
+        return self._REVIT_SP_TYPES.get(self.data_type.lower(), "TEXT")
+
+    def resolve_value(self, scanned_obj, conv_result=None):
+        """Deterministically resolves the parameter value for a scanned object and conversion result."""
+        expr = self.value_expr.strip()
+        raw_val = expr
+
+        if expr.lower().startswith("@usertext:"):
+            ut_key = expr[10:].strip()
+            user_text = getattr(scanned_obj, "user_text", {}) or {}
+            # Exact match first, then case-insensitive match
+            if ut_key in user_text:
+                raw_val = user_text[ut_key]
+            else:
+                low_key = ut_key.lower()
+                raw_val = ""
+                for k, v in user_text.items():
+                    if str(k).strip().lower() == low_key:
+                        raw_val = v
+                        break
+        elif "{" in expr and "}" in expr:
+            dims = getattr(scanned_obj, "parametric_dims", {}) or {}
+            tokens = {
+                "layer": str(getattr(scanned_obj, "layer_name", "") or ""),
+                "layer_path": str(getattr(scanned_obj, "layer_full_path", "") or ""),
+                "name": str(getattr(scanned_obj, "object_name", "") or getattr(scanned_obj, "layer_name", "") or ""),
+                "level": str(getattr(scanned_obj, "nearest_level_name", "") or ""),
+                "zone": str(getattr(scanned_obj, "building_zone", "") or "General"),
+                "material": str(
+                    getattr(conv_result, "primary_material", "")
+                    or getattr(scanned_obj, "material_name", "")
+                    or ""
+                ),
+                "area_sqm": "{:.2f}".format(float(getattr(conv_result, "area_sqm", 0.0) or getattr(scanned_obj, "area_sqm", 0.0) or 0.0)),
+                "volume_cum": "{:.2f}".format(float(getattr(conv_result, "volume_cum", 0.0) or getattr(scanned_obj, "volume_cum", 0.0) or 0.0)),
+                "width": "{:.3f}".format(float(dims.get("Width", getattr(scanned_obj, "dx", 0.0)) or 0.0)),
+                "depth": "{:.3f}".format(float(dims.get("Depth", getattr(scanned_obj, "dy", 0.0)) or 0.0)),
+                "height": "{:.3f}".format(float(dims.get("Height", getattr(scanned_obj, "dz", 0.0)) or 0.0)),
+                "guid": str(getattr(scanned_obj, "rhino_guid", "") or "")
+            }
+            resolved = expr
+            for tk, tv in tokens.items():
+                resolved = resolved.replace("{" + tk + "}", tv)
+            raw_val = resolved
+
+        # Convert raw_val according to declared data_type
+        dt = self.data_type
+        if dt == "YesNo":
+            return 1 if str(raw_val).strip().lower() in ("1", "true", "yes", "y", "on") else 0
+        if dt == "Integer":
+            try:
+                return int(float(str(raw_val).strip() or "0"))
+            except Exception:
+                return 0
+        if dt == "Number":
+            try:
+                return float(str(raw_val).strip() or "0.0")
+            except Exception:
+                return 0.0
+        if dt == "Length":
+            try:
+                return float(str(raw_val).strip() or "0.0") / 0.3048
+            except Exception:
+                return 0.0
+        if dt == "Area":
+            try:
+                return float(str(raw_val).strip() or "0.0") / 0.09290304
+            except Exception:
+                return 0.0
+        if dt == "Volume":
+            try:
+                return float(str(raw_val).strip() or "0.0") / 0.028316846592
+            except Exception:
+                return 0.0
+        return str(raw_val)
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "data_type": self.data_type,
+            "param_kind": self.param_kind,
+            "is_instance": self.is_instance,
+            "value_expr": self.value_expr,
+            "formula": self.formula,
+            "constraint_target": self.constraint_target,
+            "guid": self.guid
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        if isinstance(data, cls):
+            return data
+        return cls(
+            name=data.get("name", "R2R_Custom_Param"),
+            data_type=data.get("data_type", "Text"),
+            param_kind=data.get("param_kind", "Data"),
+            is_instance=data.get("is_instance", True),
+            value_expr=data.get("value_expr", ""),
+            formula=data.get("formula", ""),
+            constraint_target=data.get("constraint_target", ""),
+            guid=data.get("guid", "")
+        )
 
 
 class MappingRule(object):
@@ -20,16 +173,21 @@ class MappingRule(object):
                  revit_type="Default", strategy="DirectShape",
                  level_rule="Nearest", base_offset=0.0,
                  room_bounding=True, material="ByLayer",
-                 subcategory=""):
+                 subcategory="", custom_parameters=None,
+                 mixed_policy="AutoFallback"):
         self.layer_pattern = layer_pattern
         self.revit_category = revit_category
         self.revit_type = revit_type
-        self.strategy = strategy  # FloorNative, WallByCurve, WallByProfile, CeilingNative, RoofNative, FamilyInstance, DirectShape
+        self.strategy = strategy  # FloorNative, WallByCurve, WallByProfile, CeilingNative, RoofNative, FreeFormFamily, ParametricFamily, DirectShape
         self.level_rule = level_rule  # "Nearest", "Explicit", "BoundingBoxBase"
         self.base_offset = float(base_offset)
         self.room_bounding = bool(room_bounding)
         self.material = material
         self.subcategory = subcategory
+        self.mixed_policy = mixed_policy or "AutoFallback"
+        self.custom_parameters = [
+            CustomParameterSpec.from_dict(cp) for cp in (custom_parameters or [])
+        ]
         self.approved = True
 
     def matches(self, layer_full_path):
@@ -50,6 +208,8 @@ class MappingRule(object):
             "room_bounding": self.room_bounding,
             "material": self.material,
             "subcategory": self.subcategory,
+            "mixed_policy": self.mixed_policy,
+            "custom_parameters": [cp.to_dict() for cp in self.custom_parameters],
             "approved": self.approved
         }
 
@@ -64,7 +224,9 @@ class MappingRule(object):
             base_offset=data.get("base_offset", 0.0),
             room_bounding=data.get("room_bounding", True),
             material=data.get("material", "ByLayer"),
-            subcategory=data.get("subcategory", "")
+            subcategory=data.get("subcategory", ""),
+            custom_parameters=data.get("custom_parameters", []),
+            mixed_policy=data.get("mixed_policy", "AutoFallback")
         )
         rule.approved = data.get("approved", True)
         return rule
@@ -104,6 +266,7 @@ class ProfileManager(object):
                 self.profile_path = user_profile
 
         self.rules = []
+        self.project_custom_parameters = []
         self.metadata = {
             "profile_name": "Standard Architectural Transfer Profile",
             "author": "AEC Computational Design & BIM Team",
@@ -239,7 +402,11 @@ class ProfileManager(object):
         dest = filepath or self.profile_path
         payload = {
             "metadata": self.metadata,
-            "rules": [r.to_dict() for r in self.rules]
+            "rules": [r.to_dict() for r in self.rules],
+            "project_custom_parameters": [
+                CustomParameterSpec.from_dict(cp).to_dict()
+                for cp in (self.project_custom_parameters or [])
+            ]
         }
         try:
             dest_dir = os.path.dirname(os.path.abspath(dest))
@@ -263,6 +430,8 @@ class ProfileManager(object):
             self.metadata = payload.get("metadata", self.metadata)
             raw_rules = payload.get("rules", [])
             self.rules = [MappingRule.from_dict(r) for r in raw_rules]
+            raw_pcp = payload.get("project_custom_parameters", [])
+            self.project_custom_parameters = [CustomParameterSpec.from_dict(cp) for cp in raw_pcp]
             return True
         except Exception:
             return False

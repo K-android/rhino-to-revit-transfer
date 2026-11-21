@@ -13,6 +13,7 @@ Provides a 5-stage interactive workflow dashboard:
 
 import sys
 import os
+import re
 import traceback
 
 try:
@@ -41,7 +42,8 @@ try:
     from scanner import RhinoScanner
     from classifier import AecClassifier
     from ai_assistant import AISemanticInterpreter, PROVIDER_PRESETS
-    from profile_manager import ProfileManager, MappingRule
+    from profile_manager import ProfileManager, MappingRule, CustomParameterSpec
+    from strategy_rules import StrategyRuleEngine, STRATEGY_METADATA
     from conversion_router import ConversionRouter
     from graphics_validator import GraphicsValidator
     from sync_engine import SyncEngine
@@ -50,7 +52,8 @@ except (ImportError, ValueError):
     from .scanner import RhinoScanner
     from .classifier import AecClassifier
     from .ai_assistant import AISemanticInterpreter, PROVIDER_PRESETS
-    from .profile_manager import ProfileManager, MappingRule
+    from .profile_manager import ProfileManager, MappingRule, CustomParameterSpec
+    from .strategy_rules import StrategyRuleEngine, STRATEGY_METADATA
     from .conversion_router import ConversionRouter
     from .graphics_validator import GraphicsValidator
     from .sync_engine import SyncEngine
@@ -60,9 +63,14 @@ except (ImportError, ValueError):
 class LayerRowItem(object):
     """Data item model for the Review & Configure GridView."""
 
-    def __init__(self, layer_name, objects, classification, sync_eval, checked=True, selected_material="<Auto from Rhino>"):
+    def __init__(self, layer_name, objects, classification, sync_eval, checked=True,
+                 selected_material="<Auto from Rhino>", source_layer_path=None,
+                 bucket_key="", bucket_label="", custom_parameters=None):
         self.checked = checked
         self.layer_name = layer_name
+        self.source_layer_path = source_layer_path or layer_name
+        self.bucket_key = bucket_key or ""
+        self.bucket_label = bucket_label or ""
         self.objects = objects  # list of ScannedObject
         self.object_count = len(objects)
         self.classification = classification  # ClassificationResult
@@ -74,6 +82,11 @@ class LayerRowItem(object):
         self.sync_state = sync_eval.sync_state if sync_eval else "CREATE"
         self.sync_eval = sync_eval
         self.selected_material = selected_material or "<Auto from Rhino>"
+        self.custom_parameters = [
+            CustomParameterSpec.from_dict(cp) for cp in (custom_parameters or [])
+        ]
+        self.rule_eval = None
+        self.compatibility_tag = "OK"
 
         # Geometric pattern & adaptive summary tag
         adaptive_cnt = sum(1 for o in objects if getattr(o, "adaptive_point_count", 0) in (2, 3, 4))
@@ -87,61 +100,48 @@ class LayerRowItem(object):
             self.pattern_tag = "Block: {} ({}x)".format(blk_name[:12], len(objects))
         elif rep_cnt >= 2:
             self.pattern_tag = "Repetitive ({}x)".format(rep_cnt)
+        elif self.bucket_label:
+            self.pattern_tag = self.bucket_label
         else:
             self.pattern_tag = "Unique Mesh/Brep"
+
+        self._refresh_rule_eval()
+
+    def _refresh_rule_eval(self):
+        """Evaluates rule compatibility and flags mixed-geometry layers without mutating initial classification."""
+        eval_res = StrategyRuleEngine.evaluate_layer(self.objects, self.proposed_strategy)
+        self.rule_eval = eval_res
+        if eval_res.status == "COMPATIBLE":
+            self.compatibility_tag = "OK ({}/{})".format(eval_res.pass_count, eval_res.total_count)
+        elif eval_res.status == "PARTIAL_MIXED":
+            self.compatibility_tag = "MIXED ({}/{})".format(eval_res.pass_count, eval_res.total_count)
+        else:
+            self.compatibility_tag = "BLOCKED (0/{})".format(eval_res.total_count)
+
+        if eval_res.is_mixed_geometry:
+            mix_parts = [
+                "{} ({}x)".format(lbl.split(" (")[0].split("/")[0].strip(), cnt)
+                for lbl, cnt in sorted(eval_res.bucket_counts.items(), key=lambda x: -x[1])
+            ]
+            self.pattern_tag = "MIXED: " + ", ".join(mix_parts[:3])
 
     def update_material(self, new_material):
         """Updates selected Revit material for the layer."""
         self.selected_material = str(new_material).strip() if new_material else "<Auto from Rhino>"
 
     def update_strategy(self, new_strategy):
-        """Updates proposed strategy and recalculates confidence score based on geometric compatibility."""
+        """Updates proposed strategy and evaluates compatibility + confidence deterministically."""
         self.proposed_strategy = str(new_strategy).strip()
-        comp_score = 100.0
+        eval_res = StrategyRuleEngine.evaluate_layer(self.objects, self.proposed_strategy)
+        self.rule_eval = eval_res
+        comp_score = eval_res.compatibility_score
 
-        if self.proposed_strategy == "AdaptiveComponent":
-            pts = sum(1 for o in self.objects if getattr(o, "adaptive_point_count", 0) in (2, 3, 4))
-            if pts == len(self.objects):
-                comp_score = 98.0
-            elif pts > 0:
-                comp_score = round((float(pts) / len(self.objects)) * 85.0, 1)
-            else:
-                comp_score = 0.0  # 0% confidence: physically impossible to place without 2, 3, or 4 boundary points
-
-        elif self.proposed_strategy == "FloorNative":
-            horiz_cnt = sum(1 for o in self.objects if getattr(o, "is_horizontal", False))
-            comp_score = 96.0 if horiz_cnt == len(self.objects) else (round((float(horiz_cnt) / len(self.objects)) * 80.0, 1) if horiz_cnt > 0 else 0.0)
-
-        elif self.proposed_strategy == "WallByCurve":
-            vert_cnt = sum(1 for o in self.objects if getattr(o, "is_vertical", False))
-            comp_score = 96.0 if vert_cnt == len(self.objects) else (round((float(vert_cnt) / len(self.objects)) * 80.0, 1) if vert_cnt > 0 else 0.0)
-
-        elif self.proposed_strategy in ("RoofNative", "CeilingNative"):
-            horiz_cnt = sum(1 for o in self.objects if getattr(o, "is_horizontal", False))
-            comp_score = 95.0 if horiz_cnt > 0 else 0.0
-
-        elif self.proposed_strategy == "Toposolid":
-            horiz_cnt = sum(1 for o in self.objects if getattr(o, "is_horizontal", False))
-            vert_cnt = sum(1 for o in self.objects if getattr(o, "is_vertical", False))
-            if vert_cnt == len(self.objects):
-                comp_score = 0.0  # Vertical geometry cannot form a Toposolid
-            else:
-                comp_score = 96.0 if horiz_cnt > 0 else 85.0
-
-        elif self.proposed_strategy == "RepetitiveFamily":
-            rep_cnt = max([getattr(o, "repetition_count", 1) for o in self.objects] + [1])
-            is_blk = any(getattr(o, "object_type", "") == "InstanceReference" for o in self.objects)
-            comp_score = 98.0 if (rep_cnt >= 2 or is_blk) else 75.0
-
-        elif self.proposed_strategy == "ParametricFamily":
-            has_dims = all(bool(getattr(o, "parametric_dims", {})) for o in self.objects)
-            comp_score = 95.0 if has_dims else 0.0
-
-        elif self.proposed_strategy == "DirectShape":
-            comp_score = 100.0  # 100% universal geometric compatibility
-
+        if eval_res.status == "COMPATIBLE":
+            self.compatibility_tag = "OK ({}/{})".format(eval_res.pass_count, eval_res.total_count)
+        elif eval_res.status == "PARTIAL_MIXED":
+            self.compatibility_tag = "MIXED ({}/{})".format(eval_res.pass_count, eval_res.total_count)
         else:
-            comp_score = 95.0
+            self.compatibility_tag = "BLOCKED (0/{})".format(eval_res.total_count)
 
         self.confidence_score = comp_score
         if comp_score >= 85.0:
@@ -304,8 +304,231 @@ STANDARD_REVIT_CATEGORIES = [
 ]
 
 
+class CustomParametersDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
+    """Modal editor for deterministic Data parameters and Editable Family Constraints/Formulas."""
+
+    def __init__(self, custom_parameters=None, strategy="DirectShape", scope_label="Layer", parent=None):
+        self.strategy = str(strategy or "DirectShape").strip()
+        self.result_parameters = [
+            CustomParameterSpec.from_dict(cp) for cp in (custom_parameters or [])
+        ]
+        if not ETO_AVAILABLE:
+            return
+
+        super(CustomParametersDialog, self).__init__()
+        meta = STRATEGY_METADATA.get(self.strategy, {})
+        supports_type = bool(meta.get("supports_type_params", False))
+        supports_constraints = bool(meta.get("supports_constraints", False))
+
+        self.Title = "Custom Deterministic Parameters ({} - {})".format(scope_label, self.strategy)
+        self.ClientSize = ed.Size(680, 500)
+        self.Resizable = True
+        self.Padding = ed.Padding(14)
+
+        layout = ef.DynamicLayout()
+        layout.Spacing = ed.Size(8, 8)
+
+        lbl_head = ef.Label()
+        lbl_head.Text = "Deterministic Custom Parameters for: {} ({})".format(scope_label, self.strategy)
+        try:
+            lbl_head.Font = ed.Font(ed.SystemFont.Bold, 11)
+        except Exception:
+            pass
+        layout.Add(lbl_head)
+
+        # Grid listing current parameters
+        self.grid_params = ef.GridView()
+        self.grid_params.ShowHeader = True
+        self.grid_params.Size = ed.Size(-1, 160)
+        cols = [
+            ("Name", 130), ("Kind", 75), ("Type", 75), ("Scope", 70),
+            ("Value Rule / Formula", 190), ("Constraint Target", 100)
+        ]
+        for idx, (col_lbl, col_w) in enumerate(cols):
+            c = ef.GridColumn()
+            c.HeaderText = col_lbl
+            c.DataCell = ef.TextBoxCell(idx)
+            c.Width = col_w
+            self.grid_params.Columns.Add(c)
+        layout.Add(self.grid_params, True, True)
+
+        # Parameter Entry Form
+        lbl_name = ef.Label()
+        lbl_name.Text = "Param Name:"
+        self.txt_name = ef.TextBox()
+        self.txt_name.Size = ed.Size(160, 24)
+
+        lbl_type = ef.Label()
+        lbl_type.Text = "Data Type:"
+        self.dd_type = ef.DropDown()
+        for dt in CustomParameterSpec.VALID_DATA_TYPES:
+            self.dd_type.Items.Add(dt)
+        self.dd_type.SelectedIndex = 0
+
+        lbl_scope = ef.Label()
+        lbl_scope.Text = "Scope:"
+        self.dd_scope = ef.DropDown()
+        self.dd_scope.Items.Add("Instance")
+        if supports_type:
+            self.dd_scope.Items.Add("Type")
+        self.dd_scope.SelectedIndex = 0
+        self.dd_scope.Enabled = supports_type
+
+        row1 = ef.DynamicLayout()
+        row1.Spacing = ed.Size(8, 5)
+        row1.BeginHorizontal()
+        row1.Add(lbl_name)
+        row1.Add(self.txt_name, True)
+        row1.Add(lbl_type)
+        row1.Add(self.dd_type)
+        row1.Add(lbl_scope)
+        row1.Add(self.dd_scope)
+        row1.EndHorizontal()
+        layout.Add(row1)
+
+        if not supports_type:
+            lbl_scope_hint = ef.Label()
+            lbl_scope_hint.Text = "Note: DirectShape parameters are always Instance-scoped (no Edit Type in Revit)."
+            lbl_scope_hint.TextColor = ed.Colors.DimGray
+            layout.Add(lbl_scope_hint)
+
+        lbl_expr = ef.Label()
+        lbl_expr.Text = "Value Rule (literal, @usertext:Key, or {layer}/{level}/{name}/{material}):"
+        self.txt_value_expr = ef.TextBox()
+        layout.Add(lbl_expr)
+        layout.Add(self.txt_value_expr)
+
+        # Model & Constraint Controls (unlocked only for Editable Families)
+        lbl_const_sec = ef.Label()
+        if supports_constraints:
+            lbl_const_sec.Text = "Editable Family Constraints & Formulas (Model-Driving):"
+            lbl_const_sec.TextColor = ed.Colors.DarkGreen
+        else:
+            lbl_const_sec.Text = "Model constraints & formulas require an Editable Family (ParametricFamily / AdaptiveComponent)"
+            lbl_const_sec.TextColor = ed.Colors.DimGray
+        layout.Add(lbl_const_sec)
+
+        lbl_ct = ef.Label()
+        lbl_ct.Text = "Constraint Target:"
+        self.dd_constraint = ef.DropDown()
+        self.dd_constraint.Items.Add("None (Data Only)")
+        for ct in ("Width", "Depth", "Height", "Base_Offset", "Radius", "Visibility", "Material"):
+            self.dd_constraint.Items.Add(ct)
+        self.dd_constraint.SelectedIndex = 0
+        self.dd_constraint.Enabled = supports_constraints
+
+        lbl_form = ef.Label()
+        lbl_form.Text = "Revit Formula:"
+        self.txt_formula = ef.TextBox()
+        self.txt_formula.Enabled = supports_constraints
+
+        row2 = ef.DynamicLayout()
+        row2.Spacing = ed.Size(8, 5)
+        row2.BeginHorizontal()
+        row2.Add(lbl_ct)
+        row2.Add(self.dd_constraint)
+        row2.Add(lbl_form)
+        row2.Add(self.txt_formula, True)
+        row2.EndHorizontal()
+        layout.Add(row2)
+
+        btn_add = ef.Button()
+        btn_add.Text = "Add / Update Parameter"
+        btn_add.Click += self._on_add_or_update
+
+        btn_rem = ef.Button()
+        btn_rem.Text = "Remove Selected"
+        btn_rem.Click += self._on_remove_selected
+
+        row_btns = ef.DynamicLayout()
+        row_btns.Spacing = ed.Size(8, 5)
+        row_btns.BeginHorizontal()
+        row_btns.Add(btn_add)
+        row_btns.Add(btn_rem)
+        row_btns.Add(None, True)
+        row_btns.EndHorizontal()
+        layout.Add(row_btns)
+
+        btn_ok = ef.Button()
+        btn_ok.Text = "Save Parameters"
+        btn_ok.Click += self._on_ok
+
+        btn_cancel = ef.Button()
+        btn_cancel.Text = "Cancel"
+        btn_cancel.Click += self._on_cancel
+
+        footer = ef.DynamicLayout()
+        footer.Spacing = ed.Size(10, 5)
+        footer.BeginHorizontal()
+        footer.Add(None, True)
+        footer.Add(btn_ok)
+        footer.Add(btn_cancel)
+        footer.EndHorizontal()
+        layout.Add(footer)
+
+        self.Content = layout
+        self._refresh_param_grid()
+
+    def _refresh_param_grid(self):
+        data = []
+        for cp in self.result_parameters:
+            val_display = ("= " + cp.formula) if cp.formula else (cp.value_expr or "-")
+            data.append([
+                cp.name,
+                cp.param_kind,
+                cp.data_type,
+                "Instance" if cp.is_instance else "Type",
+                val_display,
+                cp.constraint_target or "-"
+            ])
+        self.grid_params.DataStore = data
+
+    def _on_add_or_update(self, sender, e):
+        raw_name = (self.txt_name.Text or "").strip()
+        if not raw_name:
+            return
+        dtype = str(self.dd_type.SelectedValue or "Text")
+        is_inst = (str(self.dd_scope.SelectedValue or "Instance") == "Instance")
+        expr = str(self.txt_value_expr.Text or "")
+        ct_sel = str(self.dd_constraint.SelectedValue or "None (Data Only)")
+        ct_val = "" if ct_sel.startswith("None") else ct_sel
+        formula_val = str(self.txt_formula.Text or "").strip() if self.txt_formula.Enabled else ""
+        kind = "Constraint" if (ct_val or formula_val) else "Data"
+
+        spec = CustomParameterSpec(
+            name=raw_name,
+            data_type=dtype,
+            param_kind=kind,
+            is_instance=is_inst,
+            value_expr=expr,
+            formula=formula_val,
+            constraint_target=ct_val
+        )
+        replaced = False
+        for i, existing in enumerate(self.result_parameters):
+            if existing.name.lower() == spec.name.lower():
+                self.result_parameters[i] = spec
+                replaced = True
+                break
+        if not replaced:
+            self.result_parameters.append(spec)
+        self._refresh_param_grid()
+
+    def _on_remove_selected(self, sender, e):
+        sel_idx = getattr(self.grid_params, "SelectedRow", -1)
+        if 0 <= sel_idx < len(self.result_parameters):
+            self.result_parameters.pop(sel_idx)
+            self._refresh_param_grid()
+
+    def _on_ok(self, sender, e):
+        self.Close(True)
+
+    def _on_cancel(self, sender, e):
+        self.Close(False)
+
+
 class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
-    """Direct modal dialog to inspect and edit category, strategy, material, and transfer inclusion for a layer."""
+    """Direct modal dialog to inspect and edit category, strategy, material, rules, and custom parameters."""
 
     def __init__(self, layer_row, parent=None, revit_materials=None):
         if not ETO_AVAILABLE:
@@ -313,9 +536,12 @@ class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         super(LayerConfigDialog, self).__init__()
         self.layer_row = layer_row
+        self.working_custom_params = [
+            CustomParameterSpec.from_dict(cp) for cp in (getattr(layer_row, "custom_parameters", []) or [])
+        ]
         self.Title = "Edit Layer Mapping: {}".format(layer_row.layer_name)
-        self.ClientSize = ed.Size(500, 370)
-        self.Resizable = False
+        self.ClientSize = ed.Size(560, 500)
+        self.Resizable = True
         self.Padding = ed.Padding(16)
 
         layout = ef.DynamicLayout()
@@ -359,17 +585,24 @@ class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         row_cat.EndHorizontal()
         layout.Add(row_cat)
 
-        # Strategy Dropdown
+        # Strategy Dropdown (Explicit Editable vs Non-Editable Split)
         lbl_strat = ef.Label()
         lbl_strat.Text = "Conversion Strategy:"
         self.dd_strat = ef.DropDown()
-        strategies = ["DirectShape", "FamilyInstance", "RepetitiveFamily", "ParametricFamily", "AdaptiveComponent", "FloorNative", "WallByCurve", "RoofNative", "Toposolid"]
+        strategies = [
+            "DirectShape", "FreeFormFamily", "ParametricFamily", "RepetitiveFamily",
+            "AdaptiveComponent", "FloorNative", "WallByCurve", "RoofNative",
+            "CeilingNative", "Toposolid"
+        ]
         for s in strategies:
             self.dd_strat.Items.Add(s)
 
         curr_strat = layer_row.proposed_strategy or ""
+        if curr_strat == "FamilyInstance":
+            curr_strat = "FreeFormFamily"
         match_strat_idx = next((i for i, s in enumerate(strategies) if s.lower() == curr_strat.lower()), 0)
         self.dd_strat.SelectedIndex = match_strat_idx
+        self.dd_strat.SelectedIndexChanged += self._on_strategy_selection_changed
 
         row_strat = ef.DynamicLayout()
         row_strat.Spacing = ed.Size(8, 5)
@@ -378,6 +611,25 @@ class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         row_strat.Add(self.dd_strat, True)
         row_strat.EndHorizontal()
         layout.Add(row_strat)
+
+        # Editability Badge + Live Rule Compatibility Banner
+        self.lbl_editability = ef.Label()
+        self.lbl_compat_banner = ef.Label()
+        self.lbl_compat_banner.Wrap = ef.WrapMode.Word if hasattr(ef, "WrapMode") else None
+
+        self.btn_use_rec = ef.Button()
+        self.btn_use_rec.Text = "Use Recommended"
+        self.btn_use_rec.Click += self._on_use_recommended
+
+        compat_row = ef.DynamicLayout()
+        compat_row.Spacing = ed.Size(8, 5)
+        compat_row.BeginHorizontal()
+        compat_row.Add(self.lbl_compat_banner, True)
+        compat_row.Add(self.btn_use_rec)
+        compat_row.EndHorizontal()
+
+        layout.Add(self.lbl_editability)
+        layout.Add(compat_row)
 
         # Material Dropdown
         lbl_mat = ef.Label()
@@ -402,6 +654,12 @@ class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         row_mat.Add(self.dd_material, True)
         row_mat.EndHorizontal()
         layout.Add(row_mat)
+
+        # Custom Deterministic Parameters Button
+        self.btn_custom_params = ef.Button()
+        self.btn_custom_params.Text = "Custom Parameters ({})...".format(len(self.working_custom_params))
+        self.btn_custom_params.Click += self._on_edit_custom_params
+        layout.Add(self.btn_custom_params)
 
         # Checkbox
         self.chk_include = ef.CheckBox()
@@ -430,6 +688,49 @@ class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         layout.Add(btn_layout)
 
         self.Content = layout
+        self._last_recommended = "DirectShape"
+        self._on_strategy_selection_changed(None, None)
+
+    def _on_strategy_selection_changed(self, sender, e):
+        sel_strat = str(self.dd_strat.SelectedValue or "DirectShape")
+        meta = STRATEGY_METADATA.get(sel_strat, {})
+        self.lbl_editability.Text = "Revit Mode: {}".format(meta.get("editability", sel_strat))
+        eval_res = StrategyRuleEngine.evaluate_layer(self.layer_row.objects, sel_strat)
+        self._last_recommended = eval_res.recommended_strategy or "DirectShape"
+        self.lbl_compat_banner.Text = eval_res.summary_text()
+        try:
+            if eval_res.status == "COMPATIBLE":
+                self.lbl_compat_banner.TextColor = ed.Colors.DarkGreen
+                self.btn_use_rec.Enabled = False
+            elif eval_res.status == "PARTIAL_MIXED":
+                self.lbl_compat_banner.TextColor = ed.Colors.DarkOrange
+                self.btn_use_rec.Enabled = True
+            else:
+                self.lbl_compat_banner.TextColor = ed.Colors.DarkRed
+                self.btn_use_rec.Enabled = True
+        except Exception:
+            pass
+
+    def _on_use_recommended(self, sender, e):
+        rec = self._last_recommended or "DirectShape"
+        for i, item in enumerate(self.dd_strat.Items):
+            item_txt = getattr(item, "Text", str(item))
+            if item_txt.lower() == rec.lower():
+                self.dd_strat.SelectedIndex = i
+                break
+        self._on_strategy_selection_changed(None, None)
+
+    def _on_edit_custom_params(self, sender, e):
+        sel_strat = str(self.dd_strat.SelectedValue or "DirectShape")
+        dlg = CustomParametersDialog(
+            custom_parameters=self.working_custom_params,
+            strategy=sel_strat,
+            scope_label=self.layer_row.layer_name,
+            parent=self
+        )
+        if dlg.ShowModal(self):
+            self.working_custom_params = list(dlg.result_parameters)
+            self.btn_custom_params.Text = "Custom Parameters ({})...".format(len(self.working_custom_params))
 
     def _on_apply(self, sender, e):
         sel_cat = str(self.dd_cat.SelectedValue or "Generic Models")
@@ -437,6 +738,7 @@ class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         sel_mat = str(self.dd_material.SelectedValue or "<Auto from Rhino>")
 
         self.layer_row.checked = bool(self.chk_include.Checked)
+        self.layer_row.custom_parameters = list(self.working_custom_params)
         self.layer_row.update_category(sel_cat)
         self.layer_row.update_strategy(sel_strat)
         self.layer_row.update_material(sel_mat)
@@ -705,6 +1007,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         # Query Revit Materials
         self.revit_materials = self._get_project_materials()
+        self.project_custom_parameters = list(getattr(self.profile_mgr, "project_custom_parameters", []) or [])
 
         # Build UI Structure
         self._init_ui()
@@ -865,6 +1168,10 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.chk_include_locked.Text = "Include Locked Layers"
         self.chk_include_locked.Checked = False
 
+        self.chk_auto_split_mixed = ef.CheckBox()
+        self.chk_auto_split_mixed.Text = "Auto-split mixed-geometry layers into sub-rows"
+        self.chk_auto_split_mixed.Checked = True
+
         self.btn_scan = ef.Button()
         self.btn_scan.Text = "Scan Active Rhino Document"
         self._set_bold_font(self.btn_scan, 11)
@@ -875,6 +1182,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         layout.BeginHorizontal()
         layout.Add(self.chk_include_hidden)
         layout.Add(self.chk_include_locked)
+        layout.Add(self.chk_auto_split_mixed)
         layout.EndHorizontal()
         layout.Add(self.btn_scan)
         layout.Add(self._create_separator())
@@ -1067,11 +1375,12 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.dd_strat_override.Items.Add("AdaptiveComponent")
         self.dd_strat_override.Items.Add("RepetitiveFamily")
         self.dd_strat_override.Items.Add("ParametricFamily")
+        self.dd_strat_override.Items.Add("FreeFormFamily")
         self.dd_strat_override.Items.Add("FloorNative")
         self.dd_strat_override.Items.Add("WallByCurve")
         self.dd_strat_override.Items.Add("RoofNative")
+        self.dd_strat_override.Items.Add("CeilingNative")
         self.dd_strat_override.Items.Add("Toposolid")
-        self.dd_strat_override.Items.Add("FamilyInstance")
         self.dd_strat_override.Items.Add("DirectShape")
         self.dd_strat_override.SelectedIndex = 0
 
@@ -1135,6 +1444,38 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         strat_layout.EndHorizontal()
 
         layout.Add(strat_layout)
+
+        # Mixed-Layer Control & Deterministic Custom Parameters Toolbar
+        rule_bar = ef.DynamicLayout()
+        rule_bar.Spacing = ed.Size(8, 5)
+
+        btn_split_mixed = ef.Button()
+        btn_split_mixed.Text = "Split Mixed Layers"
+        btn_split_mixed.ToolTip = "Split any heterogeneous layers into clean homogeneous sub-rows by geometry type"
+        btn_split_mixed.Click += self._on_split_mixed_layers
+
+        lbl_mixed_policy = ef.Label()
+        lbl_mixed_policy.Text = "Mixed/Incompatible Policy:"
+        lbl_mixed_policy.VerticalAlignment = ef.VerticalAlignment.Center
+
+        self.dd_mixed_policy = ef.DropDown()
+        self.dd_mixed_policy.Items.Add("Auto-Fallback")
+        self.dd_mixed_policy.Items.Add("Strict Skip")
+        self.dd_mixed_policy.SelectedIndex = 0
+
+        self.btn_project_params = ef.Button()
+        self.btn_project_params.Text = "Custom Params (Project: {})...".format(len(self.project_custom_parameters))
+        self.btn_project_params.ToolTip = "Define deterministic Data/Schedule parameters applied to all transferred elements"
+        self.btn_project_params.Click += self._on_edit_project_params
+
+        rule_bar.BeginHorizontal()
+        rule_bar.Add(btn_split_mixed)
+        rule_bar.Add(lbl_mixed_policy)
+        rule_bar.Add(self.dd_mixed_policy)
+        rule_bar.Add(self.btn_project_params)
+        rule_bar.Add(None, True)
+        rule_bar.EndHorizontal()
+        layout.Add(rule_bar)
 
         # DataGridView
         self.grid_review = ef.GridView()
@@ -1218,6 +1559,13 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         col_pattern.Width = 140
         self.grid_review.Columns.Add(col_pattern)
 
+        # Rule Compatibility Status
+        col_compat = ef.GridColumn()
+        col_compat.HeaderText = "Rule Compatibility"
+        col_compat.DataCell = ef.TextBoxCell(10)
+        col_compat.Width = 120
+        self.grid_review.Columns.Add(col_compat)
+
         # Wire Double-Click to open LayerConfigDialog
         try:
             self.grid_review.CellDoubleClick += self._on_grid_cell_double_click
@@ -1248,7 +1596,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
             strat_menu = ef.ButtonMenuItem()
             strat_menu.Text = "Quick Set Strategy"
-            for q_strat in ["DirectShape", "FamilyInstance", "RepetitiveFamily", "ParametricFamily", "AdaptiveComponent", "FloorNative", "WallByCurve"]:
+            for q_strat in ["DirectShape", "FreeFormFamily", "ParametricFamily", "RepetitiveFamily", "AdaptiveComponent", "FloorNative", "WallByCurve", "RoofNative", "CeilingNative", "Toposolid"]:
                 q_item = ef.ButtonMenuItem()
                 q_item.Text = q_strat
                 def _make_strat_cb(s_name):
@@ -1305,11 +1653,15 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.lbl_prev_missing = ef.Label()
         self.lbl_prev_missing.Text = "Revit Elements MISSING in Rhino (Preserved): 0"
 
+        self.lbl_prev_compat = ef.Label()
+        self.lbl_prev_compat.Text = "Rule Compatibility: 0 Compatible | 0 Mixed | 0 Blocked"
+
         layout.Add(self.lbl_prev_create)
         layout.Add(self.lbl_prev_update)
         layout.Add(self.lbl_prev_skip)
         layout.Add(self.lbl_prev_review)
         layout.Add(self.lbl_prev_missing)
+        layout.Add(self.lbl_prev_compat)
         layout.Add(self._create_separator())
 
         notice = ef.Label()
@@ -1587,6 +1939,8 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                                     row_data[5] = row.revit_type
                                 if len(row_data) > 7:
                                     row_data[7] = "{:.0f}%".format(row.confidence_score)
+                                if len(row_data) > 10:
+                                    row_data[10] = getattr(row, "compatibility_tag", "OK")
                                 changed = True
 
                         # If strategy was modified in-place (column 4)
@@ -1602,6 +1956,8 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                                         c.confidence_tier = row.confidence_tier
                                 if len(row_data) > 7:
                                     row_data[7] = "{:.0f}%".format(row.confidence_score)
+                                if len(row_data) > 10:
+                                    row_data[10] = getattr(row, "compatibility_tag", "OK")
                                 changed = True
 
                         # If material was modified in-place (column 6)
@@ -1641,32 +1997,128 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self._refresh_review_grid_datastore()
         self._update_preview_kpis()
 
+    def _build_rows_for_layer(self, layer_name, objs, auto_split=False, inherit_material="<Auto from Rhino>", inherit_params=None):
+        """Creates one LayerRowItem (if homogeneous or unsplit) or multiple virtual sub-rows if split."""
+        created_rows = []
+        matched_rule = self.profile_mgr.find_matching_rule(layer_name) if getattr(self, "profile_mgr", None) else None
+        base_mat = inherit_material
+        if (not base_mat or base_mat == "<Auto from Rhino>") and matched_rule and getattr(matched_rule, "material", "ByLayer") not in ("ByLayer", "<Auto from Rhino>", ""):
+            base_mat = matched_rule.material
+        base_params = list(inherit_params or (getattr(matched_rule, "custom_parameters", None) or []))
+
+        if auto_split:
+            splits = StrategyRuleEngine.split_objects_by_geometry(layer_name, objs)
+        else:
+            only_bk, _ = StrategyRuleEngine.classify_geometry_bucket(objs[0]) if objs else ("", "")
+            splits = [(layer_name, only_bk, objs)]
+
+        if len(splits) <= 1:
+            rep_obj = objs[0]
+            c_res = self.classifications.get(rep_obj.rhino_guid)
+            s_ev = self.sync_evaluations.get(rep_obj.rhino_guid)
+            checked = c_res.is_prechecked if c_res else True
+            row = LayerRowItem(
+                layer_name, objs, c_res, s_ev, checked=checked,
+                selected_material=base_mat, source_layer_path=layer_name,
+                bucket_key=splits[0][1] if splits else "", custom_parameters=base_params
+            )
+            return [row]
+
+        for v_name, bk, sub_objs in splits:
+            rep_obj = sub_objs[0]
+            c_res = self.classifications.get(rep_obj.rhino_guid)
+            s_ev = self.sync_evaluations.get(rep_obj.rhino_guid)
+            _, b_label = StrategyRuleEngine.classify_geometry_bucket(rep_obj)
+            rec_strat = StrategyRuleEngine.recommend_best_strategy(
+                sub_objs, c_res.inferred_category if c_res else None
+            )
+            checked = (bk != "CURVE")
+            row = LayerRowItem(
+                v_name, sub_objs, c_res, s_ev, checked=checked,
+                selected_material=base_mat, source_layer_path=layer_name,
+                bucket_key=bk, bucket_label=b_label, custom_parameters=base_params
+            )
+            row.update_strategy(rec_strat)
+            if bk == "CURVE":
+                row.checked = False
+            created_rows.append(row)
+
+        return created_rows
+
     def _populate_review_grid(self):
-        """Groups scanned objects by layer and populates DataGridView."""
+        """Groups scanned objects by layer (auto-splitting mixed layers when enabled) and populates DataGridView."""
         layer_groups = {}
+        layer_order = []
         for obj in self.scanned_objects:
             lp = obj.layer_full_path
             if lp not in layer_groups:
                 layer_groups[lp] = []
+                layer_order.append(lp)
             layer_groups[lp].append(obj)
 
-        self.layer_rows = []
-        for lp, objs in layer_groups.items():
-            rep_obj = objs[0]
-            c_res = self.classifications.get(rep_obj.rhino_guid)
-            s_ev = self.sync_evaluations.get(rep_obj.rhino_guid)
+        auto_split = bool(
+            hasattr(self, "chk_auto_split_mixed") and self.chk_auto_split_mixed and self.chk_auto_split_mixed.Checked
+        )
 
-            checked = c_res.is_prechecked if c_res else True
-            row = LayerRowItem(lp, objs, c_res, s_ev, checked=checked)
-            self.layer_rows.append(row)
+        self.layer_rows = []
+        for lp in layer_order:
+            objs = layer_groups[lp]
+            self.layer_rows.extend(self._build_rows_for_layer(lp, objs, auto_split=auto_split))
 
         # If no layers met the high auto-ready threshold (e.g., generic Rhino layer names
-        # like 'Default' or 'Layer 01'), pre-check all layers so user can transfer immediately
+        # like 'Default' or 'Layer 01'), pre-check all compatible non-curve layers
         if self.layer_rows and not any(r.checked for r in self.layer_rows):
             for r in self.layer_rows:
-                r.checked = True
+                if getattr(r, "bucket_key", "") != "CURVE":
+                    r.checked = True
 
         self._apply_review_filters(None, None)
+
+    def _on_split_mixed_layers(self, sender, e):
+        """Manually splits all mixed-geometry LayerRowItem rows into clean homogeneous virtual sub-rows."""
+        self._sync_grid_check_states()
+        new_rows = []
+        split_count = 0
+        for r in self.layer_rows:
+            if r.rule_eval and r.rule_eval.is_mixed_geometry:
+                sub_rows = self._build_rows_for_layer(
+                    r.source_layer_path or r.layer_name,
+                    r.objects,
+                    auto_split=True,
+                    inherit_material=getattr(r, "selected_material", "<Auto from Rhino>"),
+                    inherit_params=getattr(r, "custom_parameters", [])
+                )
+                if len(sub_rows) > 1:
+                    split_count += 1
+                new_rows.extend(sub_rows)
+            else:
+                new_rows.append(r)
+
+        if split_count > 0:
+            self.layer_rows = new_rows
+            self._apply_review_filters(None, None)
+            self._update_preview_kpis()
+            self.lbl_global_status.Text = "Split {} mixed-geometry layer(s) into {} total homogeneous row(s).".format(
+                split_count, len(self.layer_rows)
+            )
+        else:
+            self.lbl_global_status.Text = "All visible layers already contain homogeneous geometry."
+
+    def _on_edit_project_params(self, sender, e):
+        """Opens CustomParametersDialog for project-wide deterministic data parameters."""
+        dlg = CustomParametersDialog(
+            custom_parameters=self.project_custom_parameters,
+            strategy="DirectShape",
+            scope_label="All Layers (Project-Wide)",
+            parent=self
+        )
+        if dlg.ShowModal(self):
+            self.project_custom_parameters = list(dlg.result_parameters)
+            if hasattr(self, "btn_project_params") and self.btn_project_params:
+                self.btn_project_params.Text = "Custom Params (Project: {})...".format(len(self.project_custom_parameters))
+            self.lbl_global_status.Text = "Updated {} project-wide deterministic parameter(s).".format(
+                len(self.project_custom_parameters)
+            )
 
     def _refresh_review_grid_datastore(self):
         """Rebinds filtered_layer_rows to self.grid_review.DataStore."""
@@ -1682,7 +2134,8 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 getattr(r, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>",
                 "{:.0f}%".format(r.confidence_score),
                 r.sync_state,
-                getattr(r, "pattern_tag", "-")
+                getattr(r, "pattern_tag", "-"),
+                getattr(r, "compatibility_tag", "OK")
             ])
 
         self.grid_review.DataStore = grid_data
@@ -1717,11 +2170,14 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self._refresh_review_grid_datastore()
 
     def _update_preview_kpis(self):
-        """Calculates exact execution counts for the Preview tab."""
+        """Calculates exact execution counts and rule compatibility gates for the Preview tab."""
         cnt_create = 0
         cnt_update = 0
         cnt_skip = 0
         cnt_review = 0
+        cnt_compat = 0
+        cnt_mixed = 0
+        cnt_blocked = 0
 
         for r in self.layer_rows:
             if not r.checked:
@@ -1736,11 +2192,24 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             if r.confidence_score < 60.0:
                 cnt_review += r.object_count
 
+            ev = getattr(r, "rule_eval", None)
+            if ev:
+                if ev.status == "COMPATIBLE":
+                    cnt_compat += 1
+                elif ev.status == "PARTIAL_MIXED":
+                    cnt_mixed += 1
+                else:
+                    cnt_blocked += 1
+
         self.lbl_prev_create.Text = "Elements to CREATE: {}".format(cnt_create)
         self.lbl_prev_update.Text = "Elements to UPDATE (Modified Geometry): {}".format(cnt_update)
         self.lbl_prev_skip.Text = "Elements to SKIP (Unchanged Geometry): {}".format(cnt_skip)
         self.lbl_prev_review.Text = "Elements in REVIEW QUEUE (<60% Confidence): {}".format(cnt_review)
         self.lbl_prev_missing.Text = "Revit Elements MISSING in Rhino (Preserved): {}".format(len(self.missing_in_rhino))
+        if hasattr(self, "lbl_prev_compat") and self.lbl_prev_compat:
+            self.lbl_prev_compat.Text = "Rule Compatibility (Checked Layers): {} Compatible | {} Mixed (Auto-Fallback/Split) | {} Blocked".format(
+                cnt_compat, cnt_mixed, cnt_blocked
+            )
 
     def _get_target_review_rows(self):
         """Returns the list of LayerRowItem objects to target for overrides.
@@ -2005,6 +2474,9 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         """Loads transfer profile from disk."""
         try:
             if self.profile_mgr.load():
+                self.project_custom_parameters = list(getattr(self.profile_mgr, "project_custom_parameters", []) or [])
+                if hasattr(self, "btn_project_params") and self.btn_project_params:
+                    self.btn_project_params.Text = "Custom Params (Project: {})...".format(len(self.project_custom_parameters))
                 self._run_classification_and_sync()
                 self._populate_review_grid()
                 self._update_preview_kpis()
@@ -2018,6 +2490,9 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         """Saves current layer table configurations as persistent profile rules."""
         try:
             self._sync_grid_check_states()
+            mixed_policy = "StrictSkip" if (
+                hasattr(self, "dd_mixed_policy") and str(self.dd_mixed_policy.SelectedValue or "") == "Strict Skip"
+            ) else "AutoFallback"
             saved_count = 0
             for r in self.layer_rows:
                 if r.checked:
@@ -2027,11 +2502,14 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                         revit_type=r.revit_type,
                         strategy=r.proposed_strategy,
                         material=getattr(r, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>",
-                        room_bounding=True
+                        room_bounding=True,
+                        custom_parameters=getattr(r, "custom_parameters", []),
+                        mixed_policy=mixed_policy
                     )
                     self.profile_mgr.add_rule(rule)
                     saved_count += 1
 
+            self.profile_mgr.project_custom_parameters = list(self.project_custom_parameters or [])
             self.profile_mgr.save()
             self.lbl_global_status.Text = "Saved {} active layer mapping rule(s) to Transfer_Profile.json.".format(saved_count)
         except Exception as ex:
@@ -2072,13 +2550,18 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.txt_exec_log.Text = "Beginning R2R Transfer TransactionGroup (Unit Scale: {})...\n".format(scale_label)
 
         move_to_origin = self.chk_move_to_origin.Checked if hasattr(self, "chk_move_to_origin") else True
+        mixed_policy = "StrictSkip" if (
+            hasattr(self, "dd_mixed_policy") and str(self.dd_mixed_policy.SelectedValue or "") == "Strict Skip"
+        ) else "AutoFallback"
 
         router = ConversionRouter(
             self.revit_doc,
             global_mode=str(self.dd_global_mode.SelectedValue),
             generate_bua=self.chk_gen_bua.Checked or False,
             unit_scale=chosen_scale,
-            move_to_origin=move_to_origin
+            move_to_origin=move_to_origin,
+            mixed_policy=mixed_policy,
+            project_custom_parameters=self.project_custom_parameters
         )
 
         # Collect objects to transfer
@@ -2096,12 +2579,32 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 router.origin_shift_feet[0], router.origin_shift_feet[1], router.origin_shift_feet[2]
             )
 
+        guid_to_row = {}
         layer_to_row = {}
         for r in self.layer_rows:
             layer_to_row[r.layer_name] = r
             for o in getattr(r, "objects", []):
+                if getattr(o, "rhino_guid", None):
+                    guid_to_row[o.rhino_guid] = r
                 layer_to_row[getattr(o, "layer_name", "")] = r
                 layer_to_row[getattr(o, "layer_full_path", "")] = r
+
+        # Collect all custom parameters (Project-Wide + Active Layer Rules)
+        all_custom_params = list(self.project_custom_parameters or [])
+        seen_cp = set(cp.name.lower() for cp in all_custom_params if getattr(cp, "name", ""))
+        for r in self.layer_rows:
+            if r.checked:
+                for cp in (getattr(r, "custom_parameters", []) or []):
+                    cname = getattr(cp, "name", "")
+                    if cname and cname.lower() not in seen_cp:
+                        seen_cp.add(cname.lower())
+                        all_custom_params.append(cp)
+
+        # Pre-generate UTF-16 LE BOM shared parameters file so Phase 1 .rfa families receive ExternalDefinitions
+        try:
+            router.prepare_shared_parameter_file(custom_parameters=all_custom_params)
+        except Exception as ex_sp_prep:
+            self.txt_exec_log.Text += "Shared Parameter pre-prep notice: {}\n".format(ex_sp_prep)
 
         total = len(approved_objs)
         if total == 0:
@@ -2124,7 +2627,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         # Revit API transaction nesting deadlocks with LoadFamily()
         # =========================================================================
         try:
-            self.txt_exec_log.Text += "Phase 1: Pre-generating and loading parametric/repetitive .rfa families...\n"
+            self.txt_exec_log.Text += "Phase 1: Pre-generating and loading parametric/freeform/repetitive .rfa families...\n"
             profile_rules_map = {}
             for r in self.layer_rows:
                 if r.checked:
@@ -2135,10 +2638,14 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                         revit_type=r.revit_type,
                         strategy=r.proposed_strategy,
                         material=getattr(r, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>",
-                        room_bounding=True
+                        room_bounding=True,
+                        custom_parameters=getattr(r, "custom_parameters", []),
+                        mixed_policy=mixed_policy
                     )
                     profile_rules_map[r.layer_name] = rule_item
                     for o in getattr(r, "objects", []):
+                        if getattr(o, "rhino_guid", None):
+                            profile_rules_map[o.rhino_guid] = rule_item
                         profile_rules_map[getattr(o, "layer_name", "")] = rule_item
                         profile_rules_map[getattr(o, "layer_full_path", "")] = rule_item
 
@@ -2151,8 +2658,11 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             pregen_cnt = len(pregen_symbols) if pregen_symbols else 0
             fam_req_objs = [
                 o for o in approved_objs
-                if (profile_rules_map.get(o.layer_name) and profile_rules_map.get(o.layer_name).strategy in ("ParametricFamily", "FamilyInstance", "RepetitiveFamily"))
-                or (self.classifications.get(o.rhino_guid) and self.classifications.get(o.rhino_guid).proposed_strategy in ("ParametricFamily", "FamilyInstance", "RepetitiveFamily"))
+                if (
+                    (profile_rules_map.get(o.rhino_guid) or profile_rules_map.get(o.layer_name))
+                    and (profile_rules_map.get(o.rhino_guid) or profile_rules_map.get(o.layer_name)).strategy in ("ParametricFamily", "FreeFormFamily", "FamilyInstance", "RepetitiveFamily")
+                )
+                or (self.classifications.get(o.rhino_guid) and self.classifications.get(o.rhino_guid).proposed_strategy in ("ParametricFamily", "FreeFormFamily", "FamilyInstance", "RepetitiveFamily"))
             ]
             if pregen_cnt > 0:
                 self.txt_exec_log.Text += "Phase 1 Complete: {} native .rfa family definition(s) loaded into project.\n".format(pregen_cnt)
@@ -2166,11 +2676,14 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         tg = DB.TransactionGroup(self.revit_doc, "R2R One-Click Transfer")
         tg.Start()
 
-        # Phase 2A: Ensure R2R Shared Parameters are bound for Scheduling
+        # Phase 2A: Ensure R2R Shared Parameters (Built-In + User Custom) are bound for Scheduling
         try:
             with DB.Transaction(self.revit_doc, "Bind R2R Shared Parameters") as trans_sp:
                 trans_sp.Start()
-                sp_bound = router.ensure_shared_parameters_bound(log_fn=lambda msg: setattr(self.txt_exec_log, "Text", self.txt_exec_log.Text + msg + "\n"))
+                sp_bound = router.ensure_shared_parameters_bound(
+                    custom_parameters=all_custom_params,
+                    log_fn=lambda msg: setattr(self.txt_exec_log, "Text", self.txt_exec_log.Text + msg + "\n")
+                )
                 trans_sp.Commit()
                 if sp_bound:
                     self.txt_exec_log.Text += "Phase 2A: R2R Schedulable Shared Parameters successfully bound to model categories.\n"
@@ -2209,18 +2722,20 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                         except Exception:
                             pass
 
-                    # Resolve layer override rule if configured by user
-                    row = layer_to_row.get(obj.layer_full_path) or layer_to_row.get(getattr(obj, "layer_name", ""))
+                    # Resolve row rule GUID-first so virtual split sub-layers never overwrite each other
+                    row = guid_to_row.get(guid) or layer_to_row.get(obj.layer_full_path) or layer_to_row.get(getattr(obj, "layer_name", ""))
                     layer_rule = None
                     if row:
                         cat_name = row.revit_type if (row.revit_type and row.revit_type.startswith("OST_")) else (c_res.revit_category_name if c_res else "OST_GenericModel")
                         layer_rule = MappingRule(
-                            layer_pattern=obj.layer_full_path,
+                            layer_pattern=row.layer_name,
                             revit_category=cat_name,
                             revit_type=row.revit_type,
                             strategy=row.proposed_strategy,
                             material=getattr(row, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>",
-                            room_bounding=True
+                            room_bounding=True,
+                            custom_parameters=getattr(row, "custom_parameters", []),
+                            mixed_policy=mixed_policy
                         )
 
                     conv_res = router.convert_object(obj, c_res, profile_rule=layer_rule)
@@ -2281,6 +2796,13 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                             "bua_area": conv_res.bua_area,
                             "issues": val_rep.issues
                         })
+
+                    elif conv_res.status == "SKIPPED":
+                        trans.RollBack()
+                        skipped_cnt += 1
+                        self.txt_exec_log.Text += "[SKIPPED BY RULE] {} ({}) -> {}\n".format(
+                            obj.layer_name, conv_res.strategy_used, conv_res.error_message
+                        )
 
                     else:
                         trans.RollBack()

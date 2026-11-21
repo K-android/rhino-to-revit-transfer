@@ -182,41 +182,291 @@ class FamilyFactory(object):
     """Factory service creating real native loadable .rfa families in Revit."""
 
     @staticmethod
-    def _add_or_get_parameter(fam_mgr, name, param_type="Length", is_instance=True):
-        """Safely creates or retrieves a FamilyParameter across Revit 2021-2027+."""
+    def _resolve_revit_spec_and_group(param_type="Length", param_kind="Data"):
+        """Resolves ForgeTypeId (2022+) or legacy (ParameterType, BuiltInParameterGroup) tuples safely."""
+        pt = str(param_type or "Text").strip().lower()
+        is_constraint = (str(param_kind or "").strip().lower() == "constraint")
+
+        if hasattr(DB, "SpecTypeId") and hasattr(DB, "GroupTypeId"):
+            st = DB.SpecTypeId
+            gt = DB.GroupTypeId
+            str_grp = getattr(st, "String", None)
+            int_grp = getattr(st, "Int", None)
+            bool_grp = getattr(st, "Boolean", None)
+            ref_grp = getattr(st, "Reference", None)
+
+            text_spec = getattr(str_grp, "Text", None) or getattr(st, "Text", None)
+            int_spec = getattr(int_grp, "Integer", None) or getattr(st, "Integer", None)
+            yesno_spec = getattr(bool_grp, "YesNo", None) or getattr(st, "YesNo", None)
+            mat_spec = getattr(ref_grp, "Material", None) or getattr(st, "Material", None)
+
+            spec_map = {
+                "length": (getattr(st, "Length", text_spec), getattr(gt, "Geometry", getattr(gt, "Data", None))),
+                "area": (getattr(st, "Area", text_spec), getattr(gt, "Geometry", getattr(gt, "Data", None))),
+                "volume": (getattr(st, "Volume", text_spec), getattr(gt, "Geometry", getattr(gt, "Data", None))),
+                "number": (getattr(st, "Number", text_spec), getattr(gt, "Data", getattr(gt, "General", None))),
+                "integer": (int_spec, getattr(gt, "Data", getattr(gt, "General", None))),
+                "yesno": (yesno_spec, getattr(gt, "Visibility", getattr(gt, "Constraints", getattr(gt, "Data", None)))),
+                "material": (mat_spec, getattr(gt, "Materials", getattr(gt, "Geometry", None))),
+                "text": (text_spec, getattr(gt, "Data", getattr(gt, "General", None)))
+            }
+            spec, group = spec_map.get(pt, (text_spec, getattr(gt, "Data", getattr(gt, "General", None))))
+            if is_constraint and pt in ("length", "number"):
+                group = getattr(gt, "Constraints", group)
+            return True, spec, group
+
+        if hasattr(DB, "ParameterType") and hasattr(DB, "BuiltInParameterGroup"):
+            pt_cls = DB.ParameterType
+            pg_cls = DB.BuiltInParameterGroup
+            leg_map = {
+                "length": (getattr(pt_cls, "Length", None), getattr(pg_cls, "PG_GEOMETRY", None)),
+                "area": (getattr(pt_cls, "Area", None), getattr(pg_cls, "PG_GEOMETRY", None)),
+                "volume": (getattr(pt_cls, "Volume", None), getattr(pg_cls, "PG_GEOMETRY", None)),
+                "number": (getattr(pt_cls, "Number", None), getattr(pg_cls, "PG_DATA", None)),
+                "integer": (getattr(pt_cls, "Integer", None), getattr(pg_cls, "PG_DATA", None)),
+                "yesno": (getattr(pt_cls, "YesNo", None), getattr(pg_cls, "PG_VISIBILITY", getattr(pg_cls, "PG_DATA", None))),
+                "material": (getattr(pt_cls, "Material", None), getattr(pg_cls, "PG_MATERIALS", None)),
+                "text": (getattr(pt_cls, "Text", None), getattr(pg_cls, "PG_DATA", None))
+            }
+            ptype, pgroup = leg_map.get(pt, (getattr(pt_cls, "Text", None), getattr(pg_cls, "PG_DATA", None)))
+            if is_constraint and pt in ("length", "number"):
+                pgroup = getattr(pg_cls, "PG_CONSTRAINTS", pgroup)
+            return False, ptype, pgroup
+
+        return None, None, None
+
+    @classmethod
+    def _add_or_get_parameter(cls, fam_mgr, name, param_type="Length", is_instance=True, external_def=None, param_kind="Data"):
+        """Safely creates or retrieves a FamilyParameter across Revit 2020-2027+."""
         for p in fam_mgr.Parameters:
-            if p.Definition.Name.lower() == name.lower():
+            if p.Definition.Name.lower() == str(name).lower():
                 return p
 
         try:
-            if hasattr(DB, "SpecTypeId") and hasattr(DB, "GroupTypeId"):
-                # Revit 2022+ ForgeTypeId API
-                if param_type == "Length":
-                    spec = DB.SpecTypeId.Length
-                    group = getattr(DB.GroupTypeId, "Geometry", getattr(DB.GroupTypeId, "Data", None))
-                elif param_type == "Material":
-                    spec = DB.SpecTypeId.Reference.Material
-                    group = getattr(DB.GroupTypeId, "Materials", getattr(DB.GroupTypeId, "Geometry", None))
-                else:
-                    spec = DB.SpecTypeId.String.Text
-                    group = getattr(DB.GroupTypeId, "General", getattr(DB.GroupTypeId, "Data", None))
+            use_forge, spec_or_ptype, group = cls._resolve_revit_spec_and_group(param_type, param_kind)
+            if use_forge is None:
+                return None
 
-                return fam_mgr.AddParameter(name, group, spec, is_instance)
-            else:
-                # Legacy Revit 2020-2021 ParameterType API
-                if param_type == "Length":
-                    ptype = DB.ParameterType.Length
-                    pgroup = DB.BuiltInParameterGroup.PG_GEOMETRY
-                elif param_type == "Material":
-                    ptype = DB.ParameterType.Material
-                    pgroup = DB.BuiltInParameterGroup.PG_MATERIALS
-                else:
-                    ptype = DB.ParameterType.Text
-                    pgroup = DB.BuiltInParameterGroup.PG_DATA
+            if external_def is not None:
+                try:
+                    return fam_mgr.AddParameter(external_def, group, bool(is_instance))
+                except Exception:
+                    pass
 
-                return fam_mgr.AddParameter(name, pgroup, ptype, is_instance)
+            if spec_or_ptype is not None:
+                return fam_mgr.AddParameter(name, group, spec_or_ptype, bool(is_instance))
         except Exception:
             return None
+        return None
+
+    @staticmethod
+    def _resolve_custom_target_spec(custom_parameters, target_name, default_name, default_instance=True):
+        """Returns (param_name, is_instance) overridden by a custom Constraint parameter if defined."""
+        for cp in (custom_parameters or []):
+            t = getattr(cp, "constraint_target", "") or (cp.get("constraint_target", "") if isinstance(cp, dict) else "")
+            if str(t).strip().lower() == str(target_name).strip().lower():
+                cp_name = getattr(cp, "name", None) or (cp.get("name") if isinstance(cp, dict) else None)
+                cp_inst = getattr(cp, "is_instance", default_instance) if not isinstance(cp, dict) else cp.get("is_instance", default_instance)
+                if cp_name:
+                    return str(cp_name), bool(cp_inst)
+        return default_name, bool(default_instance)
+
+    @classmethod
+    def _apply_custom_family_parameters(cls, fam_mgr, target_elem, custom_parameters,
+                                        shared_param_defs=None, allow_constraints=False):
+        """Adds user-defined Data/Constraint parameters, associations, and formulas inside fam_doc."""
+        if not fam_mgr or not custom_parameters:
+            return
+
+        sp_defs = shared_param_defs or {}
+        for cp in custom_parameters:
+            try:
+                cp_name = getattr(cp, "name", None) or (cp.get("name") if isinstance(cp, dict) else "")
+                cp_dtype = getattr(cp, "data_type", "Text") if not isinstance(cp, dict) else cp.get("data_type", "Text")
+                cp_kind = getattr(cp, "param_kind", "Data") if not isinstance(cp, dict) else cp.get("param_kind", "Data")
+                cp_inst = getattr(cp, "is_instance", True) if not isinstance(cp, dict) else cp.get("is_instance", True)
+                cp_target = getattr(cp, "constraint_target", "") if not isinstance(cp, dict) else cp.get("constraint_target", "")
+                cp_formula = getattr(cp, "formula", "") if not isinstance(cp, dict) else cp.get("formula", "")
+                cp_expr = getattr(cp, "value_expr", "") if not isinstance(cp, dict) else cp.get("value_expr", "")
+
+                if not cp_name:
+                    continue
+
+                ext_def = sp_defs.get(cp_name)
+                fp = cls._add_or_get_parameter(
+                    fam_mgr,
+                    cp_name,
+                    param_type=cp_dtype,
+                    is_instance=cp_inst,
+                    external_def=ext_def,
+                    param_kind=cp_kind if allow_constraints else "Data"
+                )
+                if not fp:
+                    continue
+
+                if allow_constraints and cp_target and target_elem is not None:
+                    t_low = str(cp_target).strip().lower()
+                    if t_low == "visibility" and hasattr(DB.BuiltInParameter, "IS_VISIBLE_PARAM"):
+                        try:
+                            vis_p = target_elem.get_Parameter(DB.BuiltInParameter.IS_VISIBLE_PARAM)
+                            if vis_p:
+                                fam_mgr.AssociateElementParameterToFamilyParameter(vis_p, fp)
+                        except Exception:
+                            pass
+                    elif t_low == "material" and hasattr(DB.BuiltInParameter, "MATERIAL_ID_PARAM"):
+                        try:
+                            m_p = target_elem.get_Parameter(DB.BuiltInParameter.MATERIAL_ID_PARAM)
+                            if m_p:
+                                fam_mgr.AssociateElementParameterToFamilyParameter(m_p, fp)
+                        except Exception:
+                            pass
+
+                if allow_constraints and cp_formula and hasattr(fam_mgr, "SetFormula"):
+                    try:
+                        fam_mgr.SetFormula(fp, str(cp_formula).strip())
+                    except Exception as ex_f:
+                        print("[FamilyFactory Formula Notice '{}']: {}".format(cp_name, ex_f))
+                elif cp_expr and not str(cp_expr).startswith("@") and "{" not in str(cp_expr) and not cp_target:
+                    # Static literal default inside family
+                    try:
+                        dt_low = str(cp_dtype).lower()
+                        if dt_low == "yesno":
+                            val = 1 if str(cp_expr).strip().lower() in ("1", "true", "yes", "y", "on") else 0
+                            fam_mgr.Set(fp, int(val))
+                        elif dt_low == "integer":
+                            fam_mgr.Set(fp, int(float(cp_expr)))
+                        elif dt_low in ("number",):
+                            fam_mgr.Set(fp, float(cp_expr))
+                        elif dt_low == "length":
+                            fam_mgr.Set(fp, float(cp_expr) / 0.3048)
+                        elif dt_low == "area":
+                            fam_mgr.Set(fp, float(cp_expr) / 0.09290304)
+                        elif dt_low == "volume":
+                            fam_mgr.Set(fp, float(cp_expr) / 0.028316846592)
+                        elif dt_low == "text":
+                            fam_mgr.Set(fp, str(cp_expr))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    @classmethod
+    def _find_plan_view(cls, fam_doc):
+        """Locates a floor/ref-level ViewPlan inside a family document."""
+        try:
+            if not hasattr(DB, "FilteredElementCollector") or not hasattr(DB, "ViewPlan"):
+                return None
+            col = DB.FilteredElementCollector(fam_doc).OfClass(DB.ViewPlan)
+            for v in col:
+                if v and not getattr(v, "IsTemplate", False):
+                    return v
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def _lock_box_to_reference_planes(cls, fam_doc, fam_mgr, extrusion, p_width, p_depth, hw, hd):
+        """Builds Center/Edge Reference Planes, EQ & Width/Depth labeled dimensions, and locks extrusion faces."""
+        plan_view = cls._find_plan_view(fam_doc)
+        if not plan_view or not extrusion or not hasattr(fam_doc, "FamilyCreate"):
+            return
+
+        fc = fam_doc.FamilyCreate
+        if not hasattr(fc, "NewReferencePlane"):
+            return
+
+        # 1. Create Left / Right / Center_LR and Front / Back / Center_FB reference planes
+        rp_left = fc.NewReferencePlane(DB.XYZ(-hw, -hd - 1.0, 0.0), DB.XYZ(-hw, hd + 1.0, 0.0), DB.XYZ.BasisZ, plan_view)
+        rp_right = fc.NewReferencePlane(DB.XYZ(hw, -hd - 1.0, 0.0), DB.XYZ(hw, hd + 1.0, 0.0), DB.XYZ.BasisZ, plan_view)
+        rp_ctr_lr = fc.NewReferencePlane(DB.XYZ(0.0, -hd - 1.0, 0.0), DB.XYZ(0.0, hd + 1.0, 0.0), DB.XYZ.BasisZ, plan_view)
+
+        rp_front = fc.NewReferencePlane(DB.XYZ(-hw - 1.0, -hd, 0.0), DB.XYZ(hw + 1.0, -hd, 0.0), DB.XYZ.BasisZ, plan_view)
+        rp_back = fc.NewReferencePlane(DB.XYZ(-hw - 1.0, hd, 0.0), DB.XYZ(hw + 1.0, hd, 0.0), DB.XYZ.BasisZ, plan_view)
+        rp_ctr_fb = fc.NewReferencePlane(DB.XYZ(-hw - 1.0, 0.0, 0.0), DB.XYZ(hw + 1.0, 0.0, 0.0), DB.XYZ.BasisZ, plan_view)
+
+        for rp_name, rp_obj in (
+            ("R2R_Left", rp_left), ("R2R_Right", rp_right), ("R2R_Center_LR", rp_ctr_lr),
+            ("R2R_Front", rp_front), ("R2R_Back", rp_back), ("R2R_Center_FB", rp_ctr_fb)
+        ):
+            try:
+                if rp_obj:
+                    rp_obj.Name = rp_name
+            except Exception:
+                pass
+
+        for ctr_rp in (rp_ctr_lr, rp_ctr_fb):
+            try:
+                if ctr_rp and hasattr(ctr_rp, "Pinned"):
+                    ctr_rp.Pinned = True
+            except Exception:
+                pass
+
+        fam_doc.Regenerate()
+
+        # 2. Create EQ + Labeled Dimensions if ReferenceArray & NewDimension exist
+        if hasattr(DB, "ReferenceArray") and hasattr(fc, "NewDimension"):
+            if p_width and rp_left and rp_ctr_lr and rp_right:
+                try:
+                    ra_eq_w = DB.ReferenceArray()
+                    ra_eq_w.Append(rp_left.GetReference())
+                    ra_eq_w.Append(rp_ctr_lr.GetReference())
+                    ra_eq_w.Append(rp_right.GetReference())
+                    dim_eq_w = fc.NewDimension(plan_view, DB.Line.CreateBound(DB.XYZ(-hw, 0.0, 0.0), DB.XYZ(hw, 0.0, 0.0)), ra_eq_w)
+                    if dim_eq_w and hasattr(dim_eq_w, "AreSegmentsEqual"):
+                        dim_eq_w.AreSegmentsEqual = True
+
+                    ra_w = DB.ReferenceArray()
+                    ra_w.Append(rp_left.GetReference())
+                    ra_w.Append(rp_right.GetReference())
+                    dim_w = fc.NewDimension(plan_view, DB.Line.CreateBound(DB.XYZ(-hw, hd + 0.5, 0.0), DB.XYZ(hw, hd + 0.5, 0.0)), ra_w)
+                    if dim_w:
+                        dim_w.FamilyLabel = p_width
+                except Exception:
+                    pass
+
+            if p_depth and rp_front and rp_ctr_fb and rp_back:
+                try:
+                    ra_eq_d = DB.ReferenceArray()
+                    ra_eq_d.Append(rp_front.GetReference())
+                    ra_eq_d.Append(rp_ctr_fb.GetReference())
+                    ra_eq_d.Append(rp_back.GetReference())
+                    dim_eq_d = fc.NewDimension(plan_view, DB.Line.CreateBound(DB.XYZ(0.0, -hd, 0.0), DB.XYZ(0.0, hd, 0.0)), ra_eq_d)
+                    if dim_eq_d and hasattr(dim_eq_d, "AreSegmentsEqual"):
+                        dim_eq_d.AreSegmentsEqual = True
+
+                    ra_d = DB.ReferenceArray()
+                    ra_d.Append(rp_front.GetReference())
+                    ra_d.Append(rp_back.GetReference())
+                    dim_d = fc.NewDimension(plan_view, DB.Line.CreateBound(DB.XYZ(hw + 0.5, -hd, 0.0), DB.XYZ(hw + 0.5, hd, 0.0)), ra_d)
+                    if dim_d:
+                        dim_d.FamilyLabel = p_depth
+                except Exception:
+                    pass
+
+        # 3. Align & lock the 4 vertical planar faces of the extrusion to the edge reference planes
+        if hasattr(fc, "NewAlignment") and hasattr(DB, "Options"):
+            try:
+                opt = DB.Options()
+                opt.ComputeReferences = True
+                geom_elem = extrusion.get_Geometry(opt)
+                if geom_elem:
+                    for g in geom_elem:
+                        if not hasattr(g, "Faces"):
+                            continue
+                        for f in g.Faces:
+                            if not getattr(f, "Reference", None) or not hasattr(f, "FaceNormal"):
+                                continue
+                            n = f.FaceNormal
+                            if n.X < -0.95 and abs(n.Z) < 0.05 and rp_left:
+                                fc.NewAlignment(plan_view, rp_left.GetReference(), f.Reference)
+                            elif n.X > 0.95 and abs(n.Z) < 0.05 and rp_right:
+                                fc.NewAlignment(plan_view, rp_right.GetReference(), f.Reference)
+                            elif n.Y < -0.95 and abs(n.Z) < 0.05 and rp_front:
+                                fc.NewAlignment(plan_view, rp_front.GetReference(), f.Reference)
+                            elif n.Y > 0.95 and abs(n.Z) < 0.05 and rp_back:
+                                fc.NewAlignment(plan_view, rp_back.GetReference(), f.Reference)
+            except Exception:
+                pass
 
     @classmethod
     def create_parametric_box_or_profile_family(
@@ -229,20 +479,18 @@ class FamilyFactory(object):
         height=1.0,
         profile_curve_loops=None,
         category_hint="Generic Model",
-        target_bic=None
+        target_bic=None,
+        primitive_type="Box",
+        radius=None,
+        base_offset=0.0,
+        custom_parameters=None,
+        shared_param_defs=None,
+        is_type_driven=False
     ):
-        """Mode A: Creates a true dimension-driven native .rfa family with Width/Depth/Height parameters.
+        """Mode A: Creates a true dimension-driven, reference-plane locked editable .rfa family.
 
-        :param app: Autodesk.Revit.ApplicationServices.Application
-        :param project_doc: Target project Document
-        :param family_name: Desired family name in project
-        :param width: Initial width in feet
-        :param depth: Initial depth in feet
-        :param height: Initial height/offset in feet
-        :param profile_curve_loops: Optional list of closed DB.CurveLoop or Rhino curves for custom profiles
-        :param category_hint: Category hint for template selection
-        :param target_bic: Optional DB.BuiltInCategory override
-        :return: Loaded DB.FamilySymbol, or None on failure
+        Supports orthogonal Box (Width/Depth/Height flexed on Reference Planes), Cylinder (Radius/Height),
+        and 2D Profile Extrusion (Height/Base_Offset), plus custom parameters, formulas, and visibility.
         """
         if not REVIT_AVAILABLE or not app or not project_doc:
             return None
@@ -273,29 +521,55 @@ class FamilyFactory(object):
                 except Exception:
                     pass
 
-            # Add Family Parameters
-            p_width = cls._add_or_get_parameter(fam_mgr, "Width", "Length", is_instance=True)
-            p_depth = cls._add_or_get_parameter(fam_mgr, "Depth", "Length", is_instance=True)
-            p_height = cls._add_or_get_parameter(fam_mgr, "Height", "Length", is_instance=True)
-            p_mat = cls._add_or_get_parameter(fam_mgr, "Element_Material", "Material", is_instance=True)
+            sp_defs = shared_param_defs or {}
+            def_inst = not bool(is_type_driven)
+            is_cyl = (str(primitive_type or "Box").strip().lower() == "cylinder")
 
-            # Set initial values
+            # Resolve optional user overrides for driver parameter names/scopes
+            w_name, w_inst = cls._resolve_custom_target_spec(custom_parameters, "Width", "Width", def_inst)
+            d_name, d_inst = cls._resolve_custom_target_spec(custom_parameters, "Depth", "Depth", def_inst)
+            h_name, h_inst = cls._resolve_custom_target_spec(custom_parameters, "Height", "Height", def_inst)
+            bo_name, bo_inst = cls._resolve_custom_target_spec(custom_parameters, "Base_Offset", "Base_Offset", def_inst)
+            r_name, r_inst = cls._resolve_custom_target_spec(custom_parameters, "Radius", "Radius", def_inst)
+            m_name, m_inst = cls._resolve_custom_target_spec(custom_parameters, "Material", "Element_Material", True)
+
+            p_width = None
+            p_depth = None
+            p_radius = None
+            if is_cyl:
+                p_radius = cls._add_or_get_parameter(fam_mgr, r_name, "Length", is_instance=r_inst, external_def=sp_defs.get(r_name), param_kind="Constraint")
+            else:
+                p_width = cls._add_or_get_parameter(fam_mgr, w_name, "Length", is_instance=w_inst, external_def=sp_defs.get(w_name), param_kind="Constraint")
+                p_depth = cls._add_or_get_parameter(fam_mgr, d_name, "Length", is_instance=d_inst, external_def=sp_defs.get(d_name), param_kind="Constraint")
+
+            p_height = cls._add_or_get_parameter(fam_mgr, h_name, "Length", is_instance=h_inst, external_def=sp_defs.get(h_name), param_kind="Constraint")
+            p_base_off = cls._add_or_get_parameter(fam_mgr, bo_name, "Length", is_instance=bo_inst, external_def=sp_defs.get(bo_name), param_kind="Constraint")
+            p_mat = cls._add_or_get_parameter(fam_mgr, m_name, "Material", is_instance=m_inst, external_def=sp_defs.get(m_name))
+
+            rad_val = float(radius) if (radius and float(radius) > 0.001) else max(0.05, float(width) / 2.0)
+
+            # Set initial parameter values
             try:
                 if p_width and width > 0.001:
                     fam_mgr.Set(p_width, float(width))
                 if p_depth and depth > 0.001:
                     fam_mgr.Set(p_depth, float(depth))
+                if p_radius and rad_val > 0.001:
+                    fam_mgr.Set(p_radius, float(rad_val))
                 if p_height and height > 0.001:
                     fam_mgr.Set(p_height, float(height))
+                if p_base_off:
+                    fam_mgr.Set(p_base_off, float(base_offset or 0.0))
             except Exception:
                 pass
 
             # 2. Build 2D Extrusion Profile centered at (0, 0, 0)
-            sketch_plane = None
             plane = DB.Plane.CreateByNormalAndOrigin(DB.XYZ.BasisZ, DB.XYZ.Zero)
             sketch_plane = DB.SketchPlane.Create(fam_doc, plane)
-
             curve_arr_array = DB.CurveArrArray()
+
+            hw = max(0.05, float(width) / 2.0)
+            hd = max(0.05, float(depth) / 2.0)
 
             if profile_curve_loops and len(profile_curve_loops) > 0:
                 # Custom 2D profile loop provided
@@ -304,10 +578,14 @@ class FamilyFactory(object):
                     for c in cl:
                         ca.Append(c)
                     curve_arr_array.Append(ca)
+            elif is_cyl:
+                # Circular profile (2 semi-circular arcs) for Cylinder primitives
+                ca = DB.CurveArray()
+                ca.Append(DB.Arc.Create(DB.XYZ(-rad_val, 0.0, 0.0), DB.XYZ(rad_val, 0.0, 0.0), DB.XYZ(0.0, rad_val, 0.0)))
+                ca.Append(DB.Arc.Create(DB.XYZ(rad_val, 0.0, 0.0), DB.XYZ(-rad_val, 0.0, 0.0), DB.XYZ(0.0, -rad_val, 0.0)))
+                curve_arr_array.Append(ca)
             else:
                 # Rectangular box profile centered at (0,0)
-                hw = max(0.05, float(width) / 2.0)
-                hd = max(0.05, float(depth) / 2.0)
                 pt0 = DB.XYZ(-hw, -hd, 0.0)
                 pt1 = DB.XYZ(hw, -hd, 0.0)
                 pt2 = DB.XYZ(hw, hd, 0.0)
@@ -324,12 +602,27 @@ class FamilyFactory(object):
             ext_height = max(0.1, float(height))
             extrusion = fam_doc.FamilyCreate.NewExtrusion(True, curve_arr_array, sketch_plane, ext_height)
 
-            # 4. Associate Extrusion End Offset to Height Parameter
+            # 4. True Reference-Plane Locking for Box primitives (Width / Depth flex!)
+            if extrusion and not profile_curve_loops and not is_cyl:
+                try:
+                    cls._lock_box_to_reference_planes(fam_doc, fam_mgr, extrusion, p_width, p_depth, hw, hd)
+                except Exception:
+                    pass
+
+            # Associate Extrusion End Offset & Start Offset to Height / Base_Offset
             if extrusion and p_height:
                 try:
                     end_param = extrusion.get_Parameter(DB.BuiltInParameter.EXTRUSION_END_OFFSET)
                     if end_param:
                         fam_mgr.AssociateElementParameterToFamilyParameter(end_param, p_height)
+                except Exception:
+                    pass
+
+            if extrusion and p_base_off and hasattr(DB.BuiltInParameter, "EXTRUSION_START_OFFSET"):
+                try:
+                    start_param = extrusion.get_Parameter(DB.BuiltInParameter.EXTRUSION_START_OFFSET)
+                    if start_param:
+                        fam_mgr.AssociateElementParameterToFamilyParameter(start_param, p_base_off)
                 except Exception:
                     pass
 
@@ -341,6 +634,13 @@ class FamilyFactory(object):
                         fam_mgr.AssociateElementParameterToFamilyParameter(mat_param, p_mat)
                 except Exception:
                     pass
+
+            # 5. Apply User-Defined Custom Data & Constraint Parameters + Formulas
+            if custom_parameters:
+                cls._apply_custom_family_parameters(
+                    fam_mgr, extrusion, custom_parameters,
+                    shared_param_defs=sp_defs, allow_constraints=True
+                )
 
             t.Commit()
 
@@ -420,20 +720,17 @@ class FamilyFactory(object):
         category_hint="Generic Model",
         target_bic=None,
         geom_feet=None,
-        unit_scale=1.0
+        unit_scale=1.0,
+        default_material=None,
+        custom_parameters=None,
+        shared_param_defs=None,
+        *args,
+        **kwargs
     ):
-        """Mode B: Creates a bespoke 3D solid native .rfa family using DB.FreeFormElement.Create.
+        """Mode B: Creates a non-editable 3D solid native .rfa family using DB.FreeFormElement.Create.
 
-        :param app: Autodesk.Revit.ApplicationServices.Application
-        :param project_doc: Target project Document
-        :param family_name: Desired family name in project
-        :param rh_brep_or_solid: Rhino Brep, Mesh, or pre-converted DB.Solid
-        :param subcategory_name: Subcategory name to assign within family
-        :param category_hint: Category hint for template selection
-        :param target_bic: Optional DB.BuiltInCategory override
-        :param geom_feet: Optional geometry pre-scaled to Revit internal feet for TSB
-        :param unit_scale: Scale factor from Rhino document units to Revit internal feet
-        :return: Loaded DB.FamilySymbol, or None on failure
+        Metadata, Type/Instance custom data parameters, and Material remain editable in Revit,
+        while the complex 3D sculpted/mesh solid geometry stays fixed without geometric flexing.
         """
         if not REVIT_AVAILABLE or not app or not project_doc or not rh_brep_or_solid:
             return None
@@ -574,7 +871,9 @@ class FamilyFactory(object):
                     pass
 
             # Add Material Parameter
-            p_mat = cls._add_or_get_parameter(fam_mgr, "Element_Material", "Material", is_instance=True)
+            sp_defs = shared_param_defs or {}
+            m_name, m_inst = cls._resolve_custom_target_spec(custom_parameters, "Material", "Element_Material", True)
+            p_mat = cls._add_or_get_parameter(fam_mgr, m_name, "Material", is_instance=m_inst, external_def=sp_defs.get(m_name))
 
             # 2. Create Native Revit FreeFormElement
             free_form = DB.FreeFormElement.Create(fam_doc, revit_solid)
@@ -602,6 +901,13 @@ class FamilyFactory(object):
                         fam_mgr.AssociateElementParameterToFamilyParameter(mat_param, p_mat)
                 except Exception:
                     pass
+
+            # 5. Apply User-Defined Deterministic Data Parameters (Instance & Type)
+            if custom_parameters:
+                cls._apply_custom_family_parameters(
+                    fam_mgr, free_form, custom_parameters,
+                    shared_param_defs=sp_defs, allow_constraints=False
+                )
 
             t.Commit()
 

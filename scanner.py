@@ -71,6 +71,13 @@ class ScannedObject(object):
         self.repetition_count = 1
         self.geo_hash = ""
 
+        # Primitive & Rule Bucketing Metadata
+        self.geometry_primitive_type = "Unknown"  # Box | Cylinder | ProfileExtrusion | AdaptivePanel | FreeFormSolid | OpenMesh | OpenSurface | BlockInstance | Curve | Unknown
+        self.is_prismatic = False
+        self.obb_fill_ratio = 0.0
+        self.cylinder_radius = 0.0
+        self.geometry_bucket = "Unknown"
+
         # Adaptive & Parametric Family Metadata
         self.adaptive_points = []       # Ordered list of (x, y, z) tuples in Rhino units
         self.adaptive_point_count = 0   # 2, 3, 4, or N adaptive placement points
@@ -128,6 +135,10 @@ class ScannedObject(object):
             "is_vertical": self.is_vertical,
             "thickness": self.thickness,
             "loop_count": self.loop_count,
+            "geometry_primitive_type": self.geometry_primitive_type,
+            "is_prismatic": self.is_prismatic,
+            "obb_fill_ratio": self.obb_fill_ratio,
+            "geometry_bucket": self.geometry_bucket,
             "repetition_signature": self.repetition_signature,
             "repetition_count": self.repetition_count,
             "adaptive_point_count": self.adaptive_point_count,
@@ -504,10 +515,19 @@ class RhinoScanner(object):
             scale_to_m = 1.0
 
         # Brep / Extrusion
+        horiz_face_count = 0
+        vert_face_count = 0
+        sample_count = 0
+        face_count = 0
         working_brep = None
         if isinstance(geom, rg.Brep):
             working_brep = geom
         elif isinstance(geom, rg.Extrusion):
+            try:
+                working_brep = geom.ToBrep()
+            except Exception:
+                working_brep = None
+        elif isinstance(geom, rg.Surface):
             try:
                 working_brep = geom.ToBrep()
             except Exception:
@@ -659,12 +679,36 @@ class RhinoScanner(object):
                 scanned.has_open_loops = True
                 scanned.preflight_warnings.append("Open curve detected (cannot form closed boundary).")
 
+        elif isinstance(geom, rg.SubD):
+            scanned.is_closed = bool(getattr(geom, "IsSolid", getattr(geom, "IsClosed", False)))
+            scanned.area = round(2.0 * (scanned.dx * scanned.dy + scanned.dy * scanned.dz + scanned.dx * scanned.dz), 3)
+            scanned.volume = round(scanned.dx * scanned.dy * scanned.dz * 0.65, 3) if scanned.is_closed else 0.0
+            try:
+                sub_b = geom.ToBrep() if hasattr(geom, "ToBrep") else None
+                if sub_b:
+                    mp = rg.MassProperties.Compute(sub_b)
+                    if mp:
+                        scanned.area = round(mp.Area, 3)
+                        scanned.volume = round(mp.Volume, 3) if scanned.is_closed else 0.0
+            except Exception:
+                pass
+            scanned.thickness = min(scanned.dx, scanned.dy, scanned.dz)
+
         elif scanned.object_type == "InstanceReference":
             scanned.is_closed = True
             scanned.repetition_signature = "Block_{}".format(scanned.block_name)
 
         # Extract Adaptive Points and Parametric Dimensions
         self._extract_adaptive_and_parametric_features(scanned, geom, working_brep)
+
+        # Classify Geometry Primitive Type & Geometry Bucket
+        self._classify_geometry_primitive(
+            scanned, geom, working_brep,
+            horiz_face_count=horiz_face_count,
+            vert_face_count=vert_face_count,
+            sample_count=sample_count,
+            face_count=face_count
+        )
 
         if not scanned.repetition_signature:
             # Normalized shape signature: plan dimensions sorted (rotation invariant) + Z height + volume + area
@@ -676,6 +720,66 @@ class RhinoScanner(object):
         # Normalized metric quantities in m² and m³
         scanned.area_sqm = round(scanned.area * (scale_to_m ** 2), 3)
         scanned.volume_cum = round(scanned.volume * (scale_to_m ** 3), 3)
+
+    def _classify_geometry_primitive(self, scanned, geom, working_brep,
+                                     horiz_face_count=0, vert_face_count=0,
+                                     sample_count=0, face_count=0):
+        """Deterministically classifies geometry primitive type and geometry bucket for strategy rules."""
+        scanned.is_prismatic = False
+        scanned.obb_fill_ratio = 0.0
+        scanned.cylinder_radius = 0.0
+
+        if scanned.object_type == "InstanceReference":
+            scanned.geometry_primitive_type = "BlockInstance"
+        elif (geom is not None and isinstance(geom, rg.Curve)) or scanned.object_type == "Curve":
+            scanned.geometry_primitive_type = "Curve"
+        elif scanned.adaptive_point_count in (2, 3, 4) and not scanned.is_closed:
+            scanned.geometry_primitive_type = "AdaptivePanel"
+        elif (geom is not None and isinstance(geom, rg.Mesh)) and not scanned.is_closed:
+            scanned.geometry_primitive_type = "OpenMesh"
+        elif working_brep is not None and not scanned.is_closed:
+            scanned.geometry_primitive_type = "OpenSurface"
+        elif scanned.is_closed:
+            bbox_vol = max(1e-9, float(scanned.dx) * float(scanned.dy) * float(scanned.dz))
+            fill_ratio = round(float(scanned.volume) / bbox_vol, 4) if float(scanned.volume or 0.0) > 0.0 else 0.0
+            scanned.obb_fill_ratio = fill_ratio
+
+            is_extrusion_geom = (geom is not None and isinstance(geom, rg.Extrusion))
+            max_plan = max(1e-6, max(float(scanned.dx), float(scanned.dy)))
+            plan_diff_ratio = abs(float(scanned.dx) - float(scanned.dy)) / max_plan
+
+            if ((working_brep is not None and face_count == 6 and fill_ratio >= 0.94) or
+                    (is_extrusion_geom and fill_ratio >= 0.94)):
+                scanned.geometry_primitive_type = "Box"
+                scanned.is_prismatic = True
+            elif (working_brep is not None and face_count in (3, 4) and
+                    plan_diff_ratio < 0.05 and 0.72 <= fill_ratio <= 0.84):
+                scanned.geometry_primitive_type = "Cylinder"
+                scanned.is_prismatic = True
+                scanned.cylinder_radius = round((float(scanned.dx) + float(scanned.dy)) / 4.0, 4)
+            elif (is_extrusion_geom or
+                    (working_brep is not None and sample_count > 0 and horiz_face_count >= 2 and
+                     (horiz_face_count + vert_face_count) == sample_count)):
+                scanned.geometry_primitive_type = "ProfileExtrusion"
+                scanned.is_prismatic = True
+            else:
+                scanned.geometry_primitive_type = "FreeFormSolid"
+        elif scanned.object_type in ("Surface", "Brep", "Extrusion", "SubD") and not scanned.is_closed:
+            scanned.geometry_primitive_type = "OpenSurface"
+        elif scanned.object_type == "Mesh" and not scanned.is_closed:
+            scanned.geometry_primitive_type = "OpenMesh"
+        else:
+            scanned.geometry_primitive_type = "Unknown"
+
+        try:
+            try:
+                from strategy_rules import StrategyRuleEngine
+            except (ImportError, ValueError):
+                from .strategy_rules import StrategyRuleEngine
+            _, bucket_label = StrategyRuleEngine.classify_geometry_bucket(scanned)
+            scanned.geometry_bucket = bucket_label
+        except Exception:
+            scanned.geometry_bucket = scanned.geometry_primitive_type
 
     @staticmethod
     def order_adaptive_points_ccw(points):
