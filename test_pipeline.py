@@ -2907,5 +2907,142 @@ class TestStrategyRulesAndCustomParams(unittest.TestCase):
             cr.FamilyFactory = orig_ff
 
 
+class TestWpfXamlUiIntegrity(unittest.TestCase):
+    """Validates WPF XAML resources, FindName bindings, and Master-Detail UI helpers."""
+
+    XAML_FILES = (
+        "ui_dashboard.xaml",
+        "ui_settings.xaml",
+        "ui_custom_params.xaml",
+        "ui_layer_config.xaml",
+    )
+
+    def test_all_xaml_files_valid_xml_and_no_codebehind_attributes(self):
+        """Ensures all XAML files parse cleanly, allow resizing, and omit x:Class/inline events."""
+        import xml.etree.ElementTree as ET
+
+        disallowed_events = {
+            "Click", "SelectionChanged", "TextChanged",
+            "Checked", "Unchecked", "MouseDoubleClick"
+        }
+        x_ns = "{http://schemas.microsoft.com/winfx/2006/xaml}"
+
+        for fname in self.XAML_FILES:
+            fpath = os.path.join(pkg_dir, fname)
+            self.assertTrue(os.path.exists(fpath), "Missing XAML file: {}".format(fname))
+            tree = ET.parse(fpath)
+            root = tree.getroot()
+            self.assertTrue(root.tag.endswith("Window"), "Root element must be Window in {}".format(fname))
+            self.assertEqual(root.attrib.get("ResizeMode"), "CanResize", "Window must be resizable in {}".format(fname))
+
+            for elem in root.iter():
+                self.assertNotIn(x_ns + "Class", elem.attrib, "x:Class not allowed in {}".format(fname))
+                for attr_name in elem.attrib:
+                    local_name = attr_name.split("}")[-1]
+                    self.assertNotIn(local_name, disallowed_events, "Inline event {} found in {}".format(local_name, fname))
+
+    def test_every_findname_exists_in_xaml(self):
+        """Verifies every FindName('...') call in ui_dialog.py maps to an x:Name in XAML."""
+        import re
+        import xml.etree.ElementTree as ET
+
+        x_ns = "{http://schemas.microsoft.com/winfx/2006/xaml}"
+        xaml_names = {}
+        all_names = set()
+
+        for fname in self.XAML_FILES:
+            fpath = os.path.join(pkg_dir, fname)
+            root = ET.parse(fpath).getroot()
+            names = set()
+            for elem in root.iter():
+                xname = elem.attrib.get(x_ns + "Name") or elem.attrib.get("Name")
+                if xname:
+                    names.add(xname)
+                    all_names.add(xname)
+            xaml_names[fname] = names
+
+        ui_src_path = os.path.join(pkg_dir, "ui_dialog.py")
+        with open(ui_src_path, "r", encoding="utf-8") as f:
+            src = f.read()
+
+        referenced = re.findall(r'FindName\(\s*["\']([A-Za-z0-9_]+)["\']\s*\)', src)
+        self.assertGreater(len(referenced), 20)
+        for name in referenced:
+            self.assertIn(name, all_names, "FindName('{}') missing from XAML files".format(name))
+
+        # Per-class check using _load_xaml_window("<file>") blocks in ui_dialog.py
+        class_to_xaml = [
+            ("CustomParametersDialog", "ui_custom_params.xaml"),
+            ("LayerConfigDialog", "ui_layer_config.xaml"),
+            ("SettingsDialog", "ui_settings.xaml"),
+            ("TransferDashboardDialog", "ui_dashboard.xaml"),
+        ]
+        for idx, (cls_name, xfile) in enumerate(class_to_xaml):
+            start_pos = src.find("class " + cls_name)
+            self.assertNotEqual(start_pos, -1)
+            next_pos = len(src)
+            for other_cls, _ in class_to_xaml[idx + 1:]:
+                p = src.find("class " + other_cls, start_pos + 1)
+                if p != -1:
+                    next_pos = min(next_pos, p)
+            cls_src = src[start_pos:next_pos]
+            cls_refs = re.findall(r'FindName\(\s*["\']([A-Za-z0-9_]+)["\']\s*\)', cls_src)
+            for name in cls_refs:
+                self.assertIn(name, xaml_names[xfile], "{}: FindName('{}') not in {}".format(cls_name, name, xfile))
+
+    def test_friendly_strategy_mapping_and_row_display_helpers(self):
+        """Tests friendly strategy round-trips and LayerRowItem display/pill helpers."""
+        from ui_dialog import (
+            STRATEGY_UI_CHOICES, LayerRowItem,
+            strategy_to_friendly, friendly_to_strategy, strategy_to_short
+        )
+        from profile_manager import CustomParameterSpec
+
+        for key, friendly, short in STRATEGY_UI_CHOICES:
+            self.assertEqual(strategy_to_friendly(key), friendly)
+            self.assertEqual(friendly_to_strategy(friendly), key)
+            self.assertEqual(friendly_to_strategy(key), key)
+            self.assertEqual(strategy_to_short(key), short)
+
+        self.assertEqual(friendly_to_strategy(strategy_to_friendly("FamilyInstance")), "FreeFormFamily")
+        self.assertEqual(strategy_to_short("FamilyInstance"), "Static .rfa")
+
+        # Compatible single-bucket layer
+        box = ScannedObject("ui-box-1")
+        box.layer_name = "Pods"
+        box.object_type = "Brep"
+        box.geometry_primitive_type = "Box"
+        box.is_prismatic = True
+        box.is_closed = True
+        box.parametric_dims = {"width_m": 2.0, "depth_m": 2.0, "height_m": 3.0}
+
+        cp = CustomParameterSpec("Fire_Rating", "Text", "Data", True, "2HR")
+        row_ok = LayerRowItem(
+            "Pods", [box], None, None,
+            selected_material="Travertine", custom_parameters=[cp]
+        )
+        row_ok.update_strategy("ParametricFamily")
+        self.assertEqual(row_ok.status_style_key(), "OK")
+        line1, line2 = row_ok.target_summary_lines()
+        self.assertIn("Parametric .rfa", line1)
+        self.assertIn("Travertine", line2)
+        self.assertIn("1 param", line2)
+        self.assertIn("Parametric Primitive", row_ok.geometry_breakdown_text())
+
+        # Mixed layer -> MIXED status key
+        crv = ScannedObject("ui-crv-1")
+        crv.layer_name = "Mixed_Facade"
+        crv.object_type = "Curve"
+        crv.geometry_primitive_type = "Curve"
+        row_mix = LayerRowItem("Mixed_Facade", [box, crv], None, None)
+        row_mix.update_strategy("ParametricFamily")
+        self.assertEqual(row_mix.status_style_key(), "MIXED")
+
+        # Blocked layer -> BLOCKED status key
+        row_blk = LayerRowItem("Only_Curves", [crv], None, None)
+        row_blk.update_strategy("DirectShape")
+        self.assertEqual(row_blk.status_style_key(), "BLOCKED")
+
+
 if __name__ == "__main__":
     unittest.main()

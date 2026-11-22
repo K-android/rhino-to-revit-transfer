@@ -7,7 +7,7 @@ Executes inside Rhino.Inside.Revit (RIR) Python Script Editor, Grasshopper Pytho
 or as a pyRevit ribbon push-button command.
 
 Initializes Revit and Rhino contexts, checks API dependencies, and launches
-the TransferDashboardDialog Eto.Forms dashboard.
+the TransferDashboardDialog WPF XAML dashboard.
 """
 
 import sys
@@ -159,19 +159,12 @@ def launch_transfer(revit_doc=None, revit_uidoc=None):
     if not dialog or not getattr(dialog, 'IsValid', True):
         return None
 
-    # 4. Show modal anchored to Rhino Main Window if available
+    # 4. Show modal anchored to Revit Main Window handle
     try:
-        import Rhino.UI as rui
-        if hasattr(rui, 'RhinoEtoApp') and hasattr(rui.RhinoEtoApp, 'MainWindow') and rui.RhinoEtoApp.MainWindow:
-            dialog.ShowModal(rui.RhinoEtoApp.MainWindow)
-        else:
-            dialog.ShowModal()
+        dialog.ShowModal()
     except Exception:
-        try:
-            dialog.ShowModal()
-        except Exception:
-            import traceback
-            print("[R2R Transfer] Dialog presentation notice:\n{}".format(traceback.format_exc()))
+        import traceback
+        print("[R2R Transfer] Dialog presentation notice:\n{}".format(traceback.format_exc()))
 
     return dialog
 

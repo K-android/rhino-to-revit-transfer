@@ -1,32 +1,46 @@
 # -*- coding: utf-8 -*-
 """
 One-Click Rhino-to-Revit Transfer (RIR): Module 9
-ui_dialog.py - Eto.Forms Multi-Step Wizard & Dashboard UI
+ui_dialog.py - Pure-Python WPF XAML Master-Detail 3-Step Dashboard UI
 
-Provides a 5-stage interactive workflow dashboard:
-  1. SCAN - Rhino model scanning & preflight metrics
-  2. REVIEW & CONFIGURE - Filtering, classification overrides, profile rules, AI assist
-  3. PREVIEW - Transaction count KPIs & pre-execution validation
-  4. EXECUTE - Controlled Revit API TransactionGroup execution with real-time logging
-  5. VALIDATE & QA REPORT - Dual-Status BIM & Graphics grid, Isolate in Revit, HTML/CSV export
+Provides a responsive, non-clipping 3-stage Revit-native WPF workflow:
+  1. SCAN - Rhino model scanning, unit/origin check, and geometric health KPIs
+  2. CONFIGURE LAYERS - Master-detail split view with live Inspector, bulk-edit,
+     searchable Revit categories/materials, rule compatibility, and custom parameters
+  3. TRANSFER & QA - Progress + collapsible log, Dual-Status audit grid, Isolate & Export
 """
 
 import sys
 import os
 import re
+import codecs
 import traceback
+
+ETO_AVAILABLE = False
+WPF_AVAILABLE = False
 
 try:
     import clr
     clr.AddReference("System")
-    clr.AddReference("Eto")
-    clr.AddReference("RhinoCommon")
-    import Eto.Forms as ef
-    import Eto.Drawing as ed
-    import Rhino
-    ETO_AVAILABLE = True
+    clr.AddReference("System.Xml")
+    clr.AddReference("PresentationFramework")
+    clr.AddReference("PresentationCore")
+    clr.AddReference("WindowsBase")
+
+    import System
+    import System.IO
+    import System.Xml
+    import System.Windows as sw
+    import System.Windows.Media as swm
+    import System.Windows.Markup as swma
+    import System.Windows.Controls as swc
+    import System.Windows.Controls.Primitives as swcp
+    import System.Windows.Interop as swi
+    import Microsoft.Win32 as mw32
+    from System.Collections.Generic import Dictionary, List
+    WPF_AVAILABLE = True
 except Exception:
-    ETO_AVAILABLE = False
+    WPF_AVAILABLE = False
 
 try:
     clr.AddReference("RevitAPI")
@@ -60,8 +74,240 @@ except (ImportError, ValueError):
     from .reporting import TransferQAReport, ReportExporter
 
 
+STANDARD_REVIT_CATEGORIES = [
+    # Architecture - Core Systems
+    "Floors", "Walls", "Roofs", "Ceilings", "Columns", "Structural Columns",
+    "Doors", "Windows", "Curtain Panels", "Curtain Wall Mullions",
+    "Stairs", "Railings", "Ramps",
+    # FF&E, Casework & Specialties
+    "Furniture", "Furniture Systems", "Casework", "Specialty Equipment",
+    # MEP (Services)
+    "Plumbing Fixtures", "Mechanical Equipment", "Electrical Equipment", "Electrical Fixtures", "Lighting Fixtures",
+    # Structure
+    "Structural Framing", "Structural Foundation",
+    # Site, Topo & Civil
+    "Toposolid", "Site", "Planting", "Parking", "Roads", "Hardscape",
+    # Mass, Context & Generic
+    "Mass", "Entourage", "Signage", "Generic Models"
+]
+
+STRATEGY_UI_CHOICES = [
+    ("DirectShape", "Fast 3D Mesh / Solid (DirectShape) [Non-Editable]", "DirectShape"),
+    ("FreeFormFamily", "Static Solid .rfa Family (Edit Type & Material)", "Static .rfa"),
+    ("ParametricFamily", "Editable Parametric .rfa Family (Flex Width/Depth/Ht)", "Parametric .rfa"),
+    ("RepetitiveFamily", "Instanced Block / Repeated .rfa Family", "Repetitive .rfa"),
+    ("AdaptiveComponent", "Adaptive Component .rfa (2/3/4-Pt Panels)", "Adaptive .rfa"),
+    ("FloorNative", "Revit Native System Floor", "Native Floor"),
+    ("WallByCurve", "Revit Native System Wall (by Curve)", "Native Wall"),
+    ("RoofNative", "Revit Native System Roof", "Native Roof"),
+    ("CeilingNative", "Revit Native System Ceiling", "Native Ceiling"),
+    ("Toposolid", "Revit Native Toposolid / Terrain", "Toposolid"),
+]
+
+_UNIT_SCALE_SHORT = [
+    "Auto Units", "mm", "Meters", "cm", "Inches", "Feet"
+]
+
+
+def strategy_to_friendly(strategy_key):
+    """Maps an internal strategy identifier to its plain-English dropdown label."""
+    key = str(strategy_key or "DirectShape").strip()
+    if key == "FamilyInstance":
+        key = "FreeFormFamily"
+    for k, friendly, _ in STRATEGY_UI_CHOICES:
+        if k.lower() == key.lower():
+            return friendly
+    return key
+
+
+def friendly_to_strategy(label_or_key):
+    """Maps a plain-English dropdown label (or strategy key) back to the canonical strategy key."""
+    txt = str(label_or_key or "").strip()
+    if not txt:
+        return "DirectShape"
+    low = txt.lower()
+    for k, friendly, short in STRATEGY_UI_CHOICES:
+        if low == k.lower() or low == friendly.lower() or low == short.lower():
+            return k
+    if low == "familyinstance":
+        return "FreeFormFamily"
+    return txt
+
+
+def strategy_to_short(strategy_key):
+    """Maps an internal strategy identifier to a compact table display tag."""
+    key = str(strategy_key or "DirectShape").strip()
+    if key == "FamilyInstance":
+        key = "FreeFormFamily"
+    for k, _, short in STRATEGY_UI_CHOICES:
+        if k.lower() == key.lower():
+            return short
+    return key
+
+
+# =============================================================================
+# WPF INFRASTRUCTURE HELPERS
+# =============================================================================
+def _ui_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_xaml_window(xaml_filename):
+    """Loads a pure WPF XAML window from the package directory using XamlReader."""
+    if not WPF_AVAILABLE:
+        return None
+    xaml_path = os.path.join(_ui_dir(), xaml_filename)
+    with codecs.open(xaml_path, "r", "utf-8-sig") as f:
+        xaml_text = f.read()
+    sr = System.IO.StringReader(xaml_text)
+    xr = System.Xml.XmlReader.Create(sr)
+    try:
+        return swma.XamlReader.Load(xr)
+    finally:
+        xr.Close()
+        sr.Dispose()
+
+
+def _make_brush(hex_str):
+    """Creates a frozen WPF SolidColorBrush from a #RRGGBB hex string."""
+    h = str(hex_str or "#FFFFFF").lstrip("#")
+    r = int(h[0:2], 16)
+    g = int(h[2:4], 16)
+    b = int(h[4:6], 16)
+    color = swm.Color.FromRgb(System.Byte(r), System.Byte(g), System.Byte(b))
+    brush = swm.SolidColorBrush(color)
+    try:
+        brush.Freeze()
+    except Exception:
+        pass
+    return brush
+
+
+def _make_clr_dict(py_dict):
+    """Builds a CLR Dictionary[String, Object] so WPF {Binding [Key]} works across IPy 2.7 & CPython 3."""
+    d = Dictionary[System.String, System.Object]()
+    for k, v in py_dict.items():
+        d[str(k)] = v
+    return d
+
+
+def _make_clr_list(items):
+    """Builds a CLR List[Object] suitable for WPF ItemsControl.ItemsSource."""
+    lst = List[System.Object]()
+    for item in items:
+        lst.Add(item)
+    return lst
+
+
+def _clamp_window_to_screen(window, desired_w, desired_h):
+    """Clamps initial window size against WPF SystemParameters.WorkArea for small/HiDPI displays."""
+    if not WPF_AVAILABLE or window is None:
+        return
+    try:
+        wa = sw.SystemParameters.WorkArea
+        max_w = max(500.0, float(wa.Width) - 36.0)
+        max_h = max(420.0, float(wa.Height) - 36.0)
+        window.Width = min(float(desired_w), max_w)
+        window.Height = min(float(desired_h), max_h)
+        if float(window.MinWidth) > window.Width:
+            window.MinWidth = max(420.0, window.Width - 20.0)
+        if float(window.MinHeight) > window.Height:
+            window.MinHeight = max(360.0, window.Height - 20.0)
+    except Exception:
+        pass
+
+
+def _set_revit_owner(window, revit_uidoc=None, parent_window=None):
+    """Anchors a WPF window to the calling WPF parent or Revit's main window handle."""
+    if not WPF_AVAILABLE or window is None:
+        return
+    try:
+        if parent_window is not None and isinstance(parent_window, sw.Window):
+            window.Owner = parent_window
+            window.WindowStartupLocation = sw.WindowStartupLocation.CenterOwner
+            return
+
+        hwnd = None
+        if revit_uidoc is not None:
+            try:
+                app = revit_uidoc.Application
+                if hasattr(app, "MainWindowHandle") and app.MainWindowHandle != System.IntPtr.Zero:
+                    hwnd = app.MainWindowHandle
+            except Exception:
+                hwnd = None
+
+        if hwnd is None:
+            try:
+                proc_hwnd = System.Diagnostics.Process.GetCurrentProcess().MainWindowHandle
+                if proc_hwnd != System.IntPtr.Zero:
+                    hwnd = proc_hwnd
+            except Exception:
+                hwnd = None
+
+        if hwnd is not None and hwnd != System.IntPtr.Zero:
+            helper = swi.WindowInteropHelper(window)
+            helper.Owner = hwnd
+            window.WindowStartupLocation = sw.WindowStartupLocation.CenterOwner
+        else:
+            window.WindowStartupLocation = sw.WindowStartupLocation.CenterScreen
+    except Exception:
+        try:
+            window.WindowStartupLocation = sw.WindowStartupLocation.CenterScreen
+        except Exception:
+            pass
+
+
+def _pump_wpf_events():
+    """Flushes WPF Dispatcher render/layout queue gently during long transaction loops."""
+    if not WPF_AVAILABLE:
+        return
+    try:
+        import System.Windows.Threading as swt
+        swt.Dispatcher.CurrentDispatcher.Invoke(
+            swt.DispatcherPriority.Background,
+            System.Action(lambda: None)
+        )
+    except Exception:
+        pass
+
+
+def _set_combo_value(cb, text_value):
+    """Selects matching item in a WPF ComboBox or assigns editable text cleanly."""
+    if cb is None:
+        return
+    target = str(text_value or "").strip()
+    low = target.lower()
+    for i, item in enumerate(cb.Items):
+        if str(item).strip().lower() == low:
+            cb.SelectedIndex = i
+            return
+    if getattr(cb, "IsEditable", False):
+        cb.SelectedIndex = -1
+        cb.Text = target
+    elif cb.Items.Count > 0:
+        cb.SelectedIndex = 0
+
+
+def _get_combo_value(cb, default_val=""):
+    """Reads selected item or typed text from a WPF ComboBox."""
+    if cb is None:
+        return default_val
+    if cb.SelectedItem is not None:
+        txt = str(cb.SelectedItem).strip()
+        if txt:
+            return txt
+    if getattr(cb, "IsEditable", False):
+        txt = str(cb.Text or "").strip()
+        if txt:
+            return txt
+    return default_val
+
+
+# =============================================================================
+# PURE PYTHON DATA MODELS (TESTED HEADLESSLY IN CPYTHON & IPY2.7)
+# =============================================================================
 class LayerRowItem(object):
-    """Data item model for the Review & Configure GridView."""
+    """Data item model for the Configure Layers list & Inspector."""
 
     def __init__(self, layer_name, objects, classification, sync_eval, checked=True,
                  selected_material="<Auto from Rhino>", source_layer_path=None,
@@ -125,13 +371,52 @@ class LayerRowItem(object):
             ]
             self.pattern_tag = "MIXED: " + ", ".join(mix_parts[:3])
 
+    def status_style_key(self):
+        """Returns canonical badge key ('OK', 'MIXED', 'BLOCKED') for UI pill rendering."""
+        if self.rule_eval:
+            if self.rule_eval.status == "COMPATIBLE":
+                return "OK"
+            if self.rule_eval.status == "PARTIAL_MIXED":
+                return "MIXED"
+            return "BLOCKED"
+        if str(self.compatibility_tag or "").startswith("MIXED"):
+            return "MIXED"
+        if str(self.compatibility_tag or "").startswith("BLOCKED"):
+            return "BLOCKED"
+        return "OK"
+
+    def geometry_breakdown_text(self):
+        """Formats human-readable object geometry counts for the Layer Inspector."""
+        if self.rule_eval and self.rule_eval.bucket_counts:
+            parts = [
+                "{} {}".format(cnt, lbl)
+                for lbl, cnt in sorted(self.rule_eval.bucket_counts.items(), key=lambda x: -x[1])
+            ]
+            return ", ".join(parts)
+        return getattr(self, "pattern_tag", "3D Geometry") or "3D Geometry"
+
+    def target_summary_lines(self):
+        """Returns compact two-line summary strings for the Layer List target column."""
+        line1 = "{} · {}".format(
+            self.inferred_category or "Generic",
+            strategy_to_short(self.proposed_strategy)
+        )
+        mat = getattr(self, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>"
+        mat_short = "Auto Mat" if mat == "<Auto from Rhino>" else (mat[:18] + ".." if len(mat) > 20 else mat)
+        cp_cnt = len(getattr(self, "custom_parameters", []) or [])
+        if cp_cnt > 0:
+            line2 = "Mat: {} · {} param(s)".format(mat_short, cp_cnt)
+        else:
+            line2 = "Mat: {}".format(mat_short)
+        return (line1, line2)
+
     def update_material(self, new_material):
         """Updates selected Revit material for the layer."""
         self.selected_material = str(new_material).strip() if new_material else "<Auto from Rhino>"
 
     def update_strategy(self, new_strategy):
         """Updates proposed strategy and evaluates compatibility + confidence deterministically."""
-        self.proposed_strategy = str(new_strategy).strip()
+        self.proposed_strategy = friendly_to_strategy(new_strategy)
         eval_res = StrategyRuleEngine.evaluate_layer(self.objects, self.proposed_strategy)
         self.rule_eval = eval_res
         comp_score = eval_res.compatibility_score
@@ -266,7 +551,7 @@ class LayerRowItem(object):
 
 
 class ValidationRowItem(object):
-    """Data item model for the Validate & QA Report GridView."""
+    """Data item model for the Validate & QA Audit table."""
 
     def __init__(self, val_report, layer_name, strategy, area_sqm=0.0, volume_cum=0.0, material_name="", material_vol=0.0):
         self.revit_id = str(val_report.revit_element_id)
@@ -286,213 +571,157 @@ class ValidationRowItem(object):
         self.raw_report = val_report
 
 
-STANDARD_REVIT_CATEGORIES = [
-    # Architecture - Core Systems
-    "Floors", "Walls", "Roofs", "Ceilings", "Columns", "Structural Columns",
-    "Doors", "Windows", "Curtain Panels", "Curtain Wall Mullions",
-    "Stairs", "Railings", "Ramps",
-    # FF&E, Casework & Specialties
-    "Furniture", "Furniture Systems", "Casework", "Specialty Equipment",
-    # MEP (Services)
-    "Plumbing Fixtures", "Mechanical Equipment", "Electrical Equipment", "Electrical Fixtures", "Lighting Fixtures",
-    # Structure
-    "Structural Framing", "Structural Foundation",
-    # Site, Topo & Civil
-    "Toposolid", "Site", "Planting", "Parking", "Roads", "Hardscape",
-    # Mass, Context & Generic
-    "Mass", "Entourage", "Signage", "Generic Models"
-]
-
-
-class CustomParametersDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
-    """Modal editor for deterministic Data parameters and Editable Family Constraints/Formulas."""
+# =============================================================================
+# WPF MODAL DIALOGS
+# =============================================================================
+class CustomParametersDialog(object):
+    """WPF modal editor for deterministic Data parameters and Editable Family Constraints/Formulas."""
 
     def __init__(self, custom_parameters=None, strategy="DirectShape", scope_label="Layer", parent=None):
-        self.strategy = str(strategy or "DirectShape").strip()
+        self.strategy = friendly_to_strategy(strategy or "DirectShape")
+        self.scope_label = scope_label
+        self.parent = parent
         self.result_parameters = [
             CustomParameterSpec.from_dict(cp) for cp in (custom_parameters or [])
         ]
-        if not ETO_AVAILABLE:
+        self.window = None
+        if not WPF_AVAILABLE:
             return
 
-        super(CustomParametersDialog, self).__init__()
+        win = _load_xaml_window("ui_custom_params.xaml")
+        self.window = win
+        _clamp_window_to_screen(win, 740, 560)
+
         meta = STRATEGY_METADATA.get(self.strategy, {})
         supports_type = bool(meta.get("supports_type_params", False))
         supports_constraints = bool(meta.get("supports_constraints", False))
+        self.supports_type = supports_type
+        self.supports_constraints = supports_constraints
 
-        self.Title = "Custom Deterministic Parameters ({} - {})".format(scope_label, self.strategy)
-        self.ClientSize = ed.Size(680, 500)
-        self.Resizable = True
-        self.Padding = ed.Padding(14)
+        win.Title = "Custom Parameters - {}".format(scope_label)
+        self.lbl_cp_header = win.FindName("lbl_cp_header")
+        self.border_cp_scope = win.FindName("border_cp_scope")
+        self.lbl_cp_scope = win.FindName("lbl_cp_scope")
+        self.grid_params = win.FindName("grid_params")
+        self.txt_name = win.FindName("txt_name")
+        self.dd_type = win.FindName("dd_type")
+        self.dd_scope = win.FindName("dd_scope")
+        self.lbl_scope_hint = win.FindName("lbl_scope_hint")
+        self.txt_value_expr = win.FindName("txt_value_expr")
+        self.lbl_const_sec = win.FindName("lbl_const_sec")
+        self.dd_constraint = win.FindName("dd_constraint")
+        self.txt_formula = win.FindName("txt_formula")
 
-        layout = ef.DynamicLayout()
-        layout.Spacing = ed.Size(8, 8)
+        self.lbl_cp_header.Text = "Deterministic Custom Parameters: {}".format(scope_label)
+        editability = meta.get("editability", self.strategy)
+        self.lbl_cp_scope.Text = "{}  |  Mode: {}".format(strategy_to_short(self.strategy), editability)
 
-        lbl_head = ef.Label()
-        lbl_head.Text = "Deterministic Custom Parameters for: {} ({})".format(scope_label, self.strategy)
-        try:
-            lbl_head.Font = ed.Font(ed.SystemFont.Bold, 11)
-        except Exception:
-            pass
-        layout.Add(lbl_head)
-
-        # Grid listing current parameters
-        self.grid_params = ef.GridView()
-        self.grid_params.ShowHeader = True
-        self.grid_params.Size = ed.Size(-1, 160)
-        cols = [
-            ("Name", 130), ("Kind", 75), ("Type", 75), ("Scope", 70),
-            ("Value Rule / Formula", 190), ("Constraint Target", 100)
-        ]
-        for idx, (col_lbl, col_w) in enumerate(cols):
-            c = ef.GridColumn()
-            c.HeaderText = col_lbl
-            c.DataCell = ef.TextBoxCell(idx)
-            c.Width = col_w
-            self.grid_params.Columns.Add(c)
-        layout.Add(self.grid_params, True, True)
-
-        # Parameter Entry Form
-        lbl_name = ef.Label()
-        lbl_name.Text = "Param Name:"
-        self.txt_name = ef.TextBox()
-        self.txt_name.Size = ed.Size(160, 24)
-
-        lbl_type = ef.Label()
-        lbl_type.Text = "Data Type:"
-        self.dd_type = ef.DropDown()
         for dt in CustomParameterSpec.VALID_DATA_TYPES:
             self.dd_type.Items.Add(dt)
         self.dd_type.SelectedIndex = 0
 
-        lbl_scope = ef.Label()
-        lbl_scope.Text = "Scope:"
-        self.dd_scope = ef.DropDown()
         self.dd_scope.Items.Add("Instance")
         if supports_type:
             self.dd_scope.Items.Add("Type")
-        self.dd_scope.SelectedIndex = 0
-        self.dd_scope.Enabled = supports_type
-
-        row1 = ef.DynamicLayout()
-        row1.Spacing = ed.Size(8, 5)
-        row1.BeginHorizontal()
-        row1.Add(lbl_name)
-        row1.Add(self.txt_name, True)
-        row1.Add(lbl_type)
-        row1.Add(self.dd_type)
-        row1.Add(lbl_scope)
-        row1.Add(self.dd_scope)
-        row1.EndHorizontal()
-        layout.Add(row1)
-
-        if not supports_type:
-            lbl_scope_hint = ef.Label()
-            lbl_scope_hint.Text = "Note: DirectShape parameters are always Instance-scoped (no Edit Type in Revit)."
-            lbl_scope_hint.TextColor = ed.Colors.DimGray
-            layout.Add(lbl_scope_hint)
-
-        lbl_expr = ef.Label()
-        lbl_expr.Text = "Value Rule (literal, @usertext:Key, or {layer}/{level}/{name}/{material}):"
-        self.txt_value_expr = ef.TextBox()
-        layout.Add(lbl_expr)
-        layout.Add(self.txt_value_expr)
-
-        # Model & Constraint Controls (unlocked only for Editable Families)
-        lbl_const_sec = ef.Label()
-        if supports_constraints:
-            lbl_const_sec.Text = "Editable Family Constraints & Formulas (Model-Driving):"
-            lbl_const_sec.TextColor = ed.Colors.DarkGreen
+            self.lbl_scope_hint.Visibility = sw.Visibility.Collapsed
         else:
-            lbl_const_sec.Text = "Model constraints & formulas require an Editable Family (ParametricFamily / AdaptiveComponent)"
-            lbl_const_sec.TextColor = ed.Colors.DimGray
-        layout.Add(lbl_const_sec)
+            self.lbl_scope_hint.Visibility = sw.Visibility.Visible
+        self.dd_scope.SelectedIndex = 0
+        self.dd_scope.IsEnabled = supports_type
 
-        lbl_ct = ef.Label()
-        lbl_ct.Text = "Constraint Target:"
-        self.dd_constraint = ef.DropDown()
         self.dd_constraint.Items.Add("None (Data Only)")
         for ct in ("Width", "Depth", "Height", "Base_Offset", "Radius", "Visibility", "Material"):
             self.dd_constraint.Items.Add(ct)
         self.dd_constraint.SelectedIndex = 0
-        self.dd_constraint.Enabled = supports_constraints
+        self.dd_constraint.IsEnabled = supports_constraints
+        self.txt_formula.IsEnabled = supports_constraints
 
-        lbl_form = ef.Label()
-        lbl_form.Text = "Revit Formula:"
-        self.txt_formula = ef.TextBox()
-        self.txt_formula.Enabled = supports_constraints
+        if supports_constraints:
+            self.lbl_const_sec.Text = "Editable Family Constraints & Formulas (Model-Driving):"
+            self.lbl_const_sec.Foreground = _make_brush("#166534")
+        else:
+            self.lbl_const_sec.Text = "Model constraints & formulas require Editable Parametric / Adaptive Families:"
+            self.lbl_const_sec.Foreground = _make_brush("#64748B")
 
-        row2 = ef.DynamicLayout()
-        row2.Spacing = ed.Size(8, 5)
-        row2.BeginHorizontal()
-        row2.Add(lbl_ct)
-        row2.Add(self.dd_constraint)
-        row2.Add(lbl_form)
-        row2.Add(self.txt_formula, True)
-        row2.EndHorizontal()
-        layout.Add(row2)
+        win.FindName("btn_tok_usertext").Click += self._on_tok_usertext
+        win.FindName("btn_tok_layer").Click += self._on_tok_layer
+        win.FindName("btn_tok_level").Click += self._on_tok_level
+        win.FindName("btn_tok_material").Click += self._on_tok_material
+        win.FindName("btn_tok_area").Click += self._on_tok_area
 
-        btn_add = ef.Button()
-        btn_add.Text = "Add / Update Parameter"
-        btn_add.Click += self._on_add_or_update
+        win.FindName("btn_add_param").Click += self._on_add_or_update
+        win.FindName("btn_rem_param").Click += self._on_remove_selected
+        win.FindName("btn_cp_ok").Click += self._on_ok
+        win.FindName("btn_cp_cancel").Click += self._on_cancel
+        self.grid_params.SelectionChanged += self._on_grid_selected
 
-        btn_rem = ef.Button()
-        btn_rem.Text = "Remove Selected"
-        btn_rem.Click += self._on_remove_selected
-
-        row_btns = ef.DynamicLayout()
-        row_btns.Spacing = ed.Size(8, 5)
-        row_btns.BeginHorizontal()
-        row_btns.Add(btn_add)
-        row_btns.Add(btn_rem)
-        row_btns.Add(None, True)
-        row_btns.EndHorizontal()
-        layout.Add(row_btns)
-
-        btn_ok = ef.Button()
-        btn_ok.Text = "Save Parameters"
-        btn_ok.Click += self._on_ok
-
-        btn_cancel = ef.Button()
-        btn_cancel.Text = "Cancel"
-        btn_cancel.Click += self._on_cancel
-
-        footer = ef.DynamicLayout()
-        footer.Spacing = ed.Size(10, 5)
-        footer.BeginHorizontal()
-        footer.Add(None, True)
-        footer.Add(btn_ok)
-        footer.Add(btn_cancel)
-        footer.EndHorizontal()
-        layout.Add(footer)
-
-        self.Content = layout
         self._refresh_param_grid()
 
+    def ShowModal(self, parent=None):
+        if not WPF_AVAILABLE or self.window is None:
+            return False
+        _set_revit_owner(self.window, parent_window=parent or self.parent)
+        return bool(self.window.ShowDialog() == True)
+
+    def _append_token(self, tok):
+        curr = str(self.txt_value_expr.Text or "")
+        if tok == "@usertext:Key" and not curr:
+            self.txt_value_expr.Text = "@usertext:Key"
+        elif tok == "@usertext:Key":
+            self.txt_value_expr.Text = tok
+        else:
+            self.txt_value_expr.Text = curr + tok
+
+    def _on_tok_usertext(self, s, e):
+        self._append_token("@usertext:Key")
+
+    def _on_tok_layer(self, s, e):
+        self._append_token("{layer}")
+
+    def _on_tok_level(self, s, e):
+        self._append_token("{level}")
+
+    def _on_tok_material(self, s, e):
+        self._append_token("{material}")
+
+    def _on_tok_area(self, s, e):
+        self._append_token("{area_sqm}")
+
     def _refresh_param_grid(self):
-        data = []
+        rows = []
         for cp in self.result_parameters:
             val_display = ("= " + cp.formula) if cp.formula else (cp.value_expr or "-")
-            data.append([
-                cp.name,
-                cp.param_kind,
-                cp.data_type,
-                "Instance" if cp.is_instance else "Type",
-                val_display,
-                cp.constraint_target or "-"
-            ])
-        self.grid_params.DataStore = data
+            rows.append(_make_clr_dict({
+                "Name": cp.name,
+                "Kind": cp.param_kind,
+                "Type": cp.data_type,
+                "Scope": "Instance" if cp.is_instance else "Type",
+                "ValueRule": val_display,
+                "ConstraintTarget": cp.constraint_target or "-"
+            }))
+        self.grid_params.ItemsSource = _make_clr_list(rows)
 
-    def _on_add_or_update(self, sender, e):
-        raw_name = (self.txt_name.Text or "").strip()
+    def _on_grid_selected(self, s, e):
+        idx = int(self.grid_params.SelectedIndex)
+        if 0 <= idx < len(self.result_parameters):
+            cp = self.result_parameters[idx]
+            self.txt_name.Text = cp.name
+            _set_combo_value(self.dd_type, cp.data_type)
+            _set_combo_value(self.dd_scope, "Instance" if cp.is_instance else "Type")
+            self.txt_value_expr.Text = cp.value_expr or ""
+            _set_combo_value(self.dd_constraint, cp.constraint_target or "None (Data Only)")
+            self.txt_formula.Text = cp.formula or ""
+
+    def _on_add_or_update(self, s, e):
+        raw_name = str(self.txt_name.Text or "").strip()
         if not raw_name:
             return
-        dtype = str(self.dd_type.SelectedValue or "Text")
-        is_inst = (str(self.dd_scope.SelectedValue or "Instance") == "Instance")
+        dtype = _get_combo_value(self.dd_type, "Text")
+        is_inst = (_get_combo_value(self.dd_scope, "Instance") == "Instance")
         expr = str(self.txt_value_expr.Text or "")
-        ct_sel = str(self.dd_constraint.SelectedValue or "None (Data Only)")
+        ct_sel = _get_combo_value(self.dd_constraint, "None (Data Only)")
         ct_val = "" if ct_sel.startswith("None") else ct_sel
-        formula_val = str(self.txt_formula.Text or "").strip() if self.txt_formula.Enabled else ""
+        formula_val = str(self.txt_formula.Text or "").strip() if self.txt_formula.IsEnabled else ""
         kind = "Constraint" if (ct_val or formula_val) else "Data"
 
         spec = CustomParameterSpec(
@@ -514,127 +743,63 @@ class CustomParametersDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             self.result_parameters.append(spec)
         self._refresh_param_grid()
 
-    def _on_remove_selected(self, sender, e):
-        sel_idx = getattr(self.grid_params, "SelectedRow", -1)
-        if 0 <= sel_idx < len(self.result_parameters):
-            self.result_parameters.pop(sel_idx)
+    def _on_remove_selected(self, s, e):
+        idx = int(self.grid_params.SelectedIndex)
+        if 0 <= idx < len(self.result_parameters):
+            self.result_parameters.pop(idx)
             self._refresh_param_grid()
 
-    def _on_ok(self, sender, e):
-        self.Close(True)
+    def _on_ok(self, s, e):
+        self.window.DialogResult = True
+        self.window.Close()
 
-    def _on_cancel(self, sender, e):
-        self.Close(False)
+    def _on_cancel(self, s, e):
+        self.window.DialogResult = False
+        self.window.Close()
 
 
-class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
-    """Direct modal dialog to inspect and edit category, strategy, material, rules, and custom parameters."""
+class LayerConfigDialog(object):
+    """Modal WPF dialog to inspect/edit one LayerRowItem (invoked on double-click or standalone)."""
 
     def __init__(self, layer_row, parent=None, revit_materials=None):
-        if not ETO_AVAILABLE:
-            return
-
-        super(LayerConfigDialog, self).__init__()
         self.layer_row = layer_row
+        self.parent = parent
         self.working_custom_params = [
             CustomParameterSpec.from_dict(cp) for cp in (getattr(layer_row, "custom_parameters", []) or [])
         ]
-        self.Title = "Edit Layer Mapping: {}".format(layer_row.layer_name)
-        self.ClientSize = ed.Size(560, 500)
-        self.Resizable = True
-        self.Padding = ed.Padding(16)
+        self.window = None
+        self._last_recommended = "DirectShape"
+        if not WPF_AVAILABLE:
+            return
 
-        layout = ef.DynamicLayout()
-        layout.Spacing = ed.Size(10, 8)
+        win = _load_xaml_window("ui_layer_config.xaml")
+        self.window = win
+        _clamp_window_to_screen(win, 560, 530)
 
-        lbl_header = ef.Label()
-        lbl_header.Text = "Configure Layer: {}".format(layer_row.layer_name)
-        try:
-            lbl_header.Font = ed.Font(ed.SystemFont.Bold, 12)
-        except Exception:
-            pass
-        layout.Add(lbl_header)
-
-        lbl_info = ef.Label()
-        lbl_info.Text = "Objects: {} | Geometry: {}".format(
-            layer_row.object_count, getattr(layer_row, "pattern_tag", "Standard")
+        win.Title = "Edit Layer Mapping: {}".format(layer_row.layer_name)
+        win.FindName("lbl_lc_header").Text = "Configure Layer: {}".format(layer_row.layer_name)
+        win.FindName("lbl_lc_info").Text = "Objects: {}  |  Geometry: {}".format(
+            layer_row.object_count, layer_row.geometry_breakdown_text()
         )
-        try:
-            lbl_info.TextColor = ed.Colors.DimGray
-        except Exception:
-            pass
-        layout.Add(lbl_info)
 
-        # Category Dropdown
-        lbl_cat = ef.Label()
-        lbl_cat.Text = "Revit Category:"
-        self.dd_cat = ef.DropDown()
-        categories = list(STANDARD_REVIT_CATEGORIES)
-        for c in categories:
+        self.dd_cat = win.FindName("dd_cat")
+        for c in STANDARD_REVIT_CATEGORIES:
             self.dd_cat.Items.Add(c)
+        _set_combo_value(self.dd_cat, layer_row.inferred_category or "Generic Models")
 
-        curr_cat = layer_row.inferred_category or ""
-        match_idx = next((i for i, c in enumerate(categories) if c.lower() in curr_cat.lower() or curr_cat.lower() in c.lower()), 0)
-        self.dd_cat.SelectedIndex = match_idx
+        self.dd_strat = win.FindName("dd_strat")
+        for _, friendly, _ in STRATEGY_UI_CHOICES:
+            self.dd_strat.Items.Add(friendly)
+        _set_combo_value(self.dd_strat, strategy_to_friendly(layer_row.proposed_strategy))
+        self.dd_strat.SelectionChanged += self._on_strategy_selection_changed
 
-        row_cat = ef.DynamicLayout()
-        row_cat.Spacing = ed.Size(8, 5)
-        row_cat.BeginHorizontal()
-        row_cat.Add(lbl_cat)
-        row_cat.Add(self.dd_cat, True)
-        row_cat.EndHorizontal()
-        layout.Add(row_cat)
-
-        # Strategy Dropdown (Explicit Editable vs Non-Editable Split)
-        lbl_strat = ef.Label()
-        lbl_strat.Text = "Conversion Strategy:"
-        self.dd_strat = ef.DropDown()
-        strategies = [
-            "DirectShape", "FreeFormFamily", "ParametricFamily", "RepetitiveFamily",
-            "AdaptiveComponent", "FloorNative", "WallByCurve", "RoofNative",
-            "CeilingNative", "Toposolid"
-        ]
-        for s in strategies:
-            self.dd_strat.Items.Add(s)
-
-        curr_strat = layer_row.proposed_strategy or ""
-        if curr_strat == "FamilyInstance":
-            curr_strat = "FreeFormFamily"
-        match_strat_idx = next((i for i, s in enumerate(strategies) if s.lower() == curr_strat.lower()), 0)
-        self.dd_strat.SelectedIndex = match_strat_idx
-        self.dd_strat.SelectedIndexChanged += self._on_strategy_selection_changed
-
-        row_strat = ef.DynamicLayout()
-        row_strat.Spacing = ed.Size(8, 5)
-        row_strat.BeginHorizontal()
-        row_strat.Add(lbl_strat)
-        row_strat.Add(self.dd_strat, True)
-        row_strat.EndHorizontal()
-        layout.Add(row_strat)
-
-        # Editability Badge + Live Rule Compatibility Banner
-        self.lbl_editability = ef.Label()
-        self.lbl_compat_banner = ef.Label()
-        self.lbl_compat_banner.Wrap = ef.WrapMode.Word if hasattr(ef, "WrapMode") else None
-
-        self.btn_use_rec = ef.Button()
-        self.btn_use_rec.Text = "Use Recommended"
+        self.lbl_editability = win.FindName("lbl_editability")
+        self.border_compat = win.FindName("border_compat")
+        self.lbl_compat_banner = win.FindName("lbl_compat_banner")
+        self.btn_use_rec = win.FindName("btn_use_rec")
         self.btn_use_rec.Click += self._on_use_recommended
 
-        compat_row = ef.DynamicLayout()
-        compat_row.Spacing = ed.Size(8, 5)
-        compat_row.BeginHorizontal()
-        compat_row.Add(self.lbl_compat_banner, True)
-        compat_row.Add(self.btn_use_rec)
-        compat_row.EndHorizontal()
-
-        layout.Add(self.lbl_editability)
-        layout.Add(compat_row)
-
-        # Material Dropdown
-        lbl_mat = ef.Label()
-        lbl_mat.Text = "Revit Material:"
-        self.dd_material = ef.DropDown()
+        self.dd_material = win.FindName("dd_material")
         mats_list = list(revit_materials) if revit_materials else (
             list(parent.revit_materials) if parent and hasattr(parent, "revit_materials") and parent.revit_materials else ["<Auto from Rhino>"]
         )
@@ -642,102 +807,71 @@ class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             mats_list.insert(0, "<Auto from Rhino>")
         for m in mats_list:
             self.dd_material.Items.Add(m)
+        _set_combo_value(self.dd_material, getattr(layer_row, "selected_material", "<Auto from Rhino>"))
 
-        curr_mat = getattr(layer_row, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>"
-        match_mat_idx = next((i for i, m in enumerate(mats_list) if m.lower() == curr_mat.lower()), 0)
-        self.dd_material.SelectedIndex = match_mat_idx
-
-        row_mat = ef.DynamicLayout()
-        row_mat.Spacing = ed.Size(8, 5)
-        row_mat.BeginHorizontal()
-        row_mat.Add(lbl_mat)
-        row_mat.Add(self.dd_material, True)
-        row_mat.EndHorizontal()
-        layout.Add(row_mat)
-
-        # Custom Deterministic Parameters Button
-        self.btn_custom_params = ef.Button()
-        self.btn_custom_params.Text = "Custom Parameters ({})...".format(len(self.working_custom_params))
+        self.btn_custom_params = win.FindName("btn_custom_params")
+        self.btn_custom_params.Content = "Custom Parameters ({})...".format(len(self.working_custom_params))
         self.btn_custom_params.Click += self._on_edit_custom_params
-        layout.Add(self.btn_custom_params)
 
-        # Checkbox
-        self.chk_include = ef.CheckBox()
-        self.chk_include.Text = "Include this layer in Revit transfer"
-        self.chk_include.Checked = bool(layer_row.checked)
-        layout.Add(self.chk_include)
+        self.chk_include = win.FindName("chk_include")
+        self.chk_include.IsChecked = bool(layer_row.checked)
 
-        # Buttons
-        btn_apply = ef.Button()
-        btn_apply.Text = "Apply Changes"
-        btn_apply.Click += self._on_apply
+        win.FindName("btn_apply").Click += self._on_apply
+        win.FindName("btn_cancel").Click += self._on_cancel
 
-        btn_cancel = ef.Button()
-        btn_cancel.Text = "Cancel"
-        btn_cancel.Click += self._on_cancel
-
-        btn_layout = ef.DynamicLayout()
-        btn_layout.Spacing = ed.Size(10, 5)
-        btn_layout.BeginHorizontal()
-        btn_layout.Add(None, True)
-        btn_layout.Add(btn_apply)
-        btn_layout.Add(btn_cancel)
-        btn_layout.EndHorizontal()
-
-        layout.Add(None, True)
-        layout.Add(btn_layout)
-
-        self.Content = layout
-        self._last_recommended = "DirectShape"
         self._on_strategy_selection_changed(None, None)
 
+    def ShowModal(self, parent=None):
+        if not WPF_AVAILABLE or self.window is None:
+            return False
+        _set_revit_owner(self.window, parent_window=parent or self.parent)
+        return bool(self.window.ShowDialog() == True)
+
     def _on_strategy_selection_changed(self, sender, e):
-        sel_strat = str(self.dd_strat.SelectedValue or "DirectShape")
+        sel_strat = friendly_to_strategy(_get_combo_value(self.dd_strat, "DirectShape"))
         meta = STRATEGY_METADATA.get(sel_strat, {})
         self.lbl_editability.Text = "Revit Mode: {}".format(meta.get("editability", sel_strat))
         eval_res = StrategyRuleEngine.evaluate_layer(self.layer_row.objects, sel_strat)
         self._last_recommended = eval_res.recommended_strategy or "DirectShape"
         self.lbl_compat_banner.Text = eval_res.summary_text()
-        try:
-            if eval_res.status == "COMPATIBLE":
-                self.lbl_compat_banner.TextColor = ed.Colors.DarkGreen
-                self.btn_use_rec.Enabled = False
-            elif eval_res.status == "PARTIAL_MIXED":
-                self.lbl_compat_banner.TextColor = ed.Colors.DarkOrange
-                self.btn_use_rec.Enabled = True
-            else:
-                self.lbl_compat_banner.TextColor = ed.Colors.DarkRed
-                self.btn_use_rec.Enabled = True
-        except Exception:
-            pass
+        if eval_res.status == "COMPATIBLE":
+            self.border_compat.Background = _make_brush("#F0FDF4")
+            self.border_compat.BorderBrush = _make_brush("#BBF7D0")
+            self.lbl_compat_banner.Foreground = _make_brush("#166534")
+            self.btn_use_rec.Visibility = sw.Visibility.Collapsed
+        elif eval_res.status == "PARTIAL_MIXED":
+            self.border_compat.Background = _make_brush("#FFFBEB")
+            self.border_compat.BorderBrush = _make_brush("#FDE68A")
+            self.lbl_compat_banner.Foreground = _make_brush("#92400E")
+            self.btn_use_rec.Visibility = sw.Visibility.Visible
+        else:
+            self.border_compat.Background = _make_brush("#FEF2F2")
+            self.border_compat.BorderBrush = _make_brush("#FECACA")
+            self.lbl_compat_banner.Foreground = _make_brush("#991B1B")
+            self.btn_use_rec.Visibility = sw.Visibility.Visible
 
     def _on_use_recommended(self, sender, e):
-        rec = self._last_recommended or "DirectShape"
-        for i, item in enumerate(self.dd_strat.Items):
-            item_txt = getattr(item, "Text", str(item))
-            if item_txt.lower() == rec.lower():
-                self.dd_strat.SelectedIndex = i
-                break
+        _set_combo_value(self.dd_strat, strategy_to_friendly(self._last_recommended))
         self._on_strategy_selection_changed(None, None)
 
     def _on_edit_custom_params(self, sender, e):
-        sel_strat = str(self.dd_strat.SelectedValue or "DirectShape")
+        sel_strat = friendly_to_strategy(_get_combo_value(self.dd_strat, "DirectShape"))
         dlg = CustomParametersDialog(
             custom_parameters=self.working_custom_params,
             strategy=sel_strat,
             scope_label=self.layer_row.layer_name,
-            parent=self
+            parent=self.window
         )
-        if dlg.ShowModal(self):
+        if dlg.ShowModal(self.window):
             self.working_custom_params = list(dlg.result_parameters)
-            self.btn_custom_params.Text = "Custom Parameters ({})...".format(len(self.working_custom_params))
+            self.btn_custom_params.Content = "Custom Parameters ({})...".format(len(self.working_custom_params))
 
     def _on_apply(self, sender, e):
-        sel_cat = str(self.dd_cat.SelectedValue or "Generic Models")
-        sel_strat = str(self.dd_strat.SelectedValue or "DirectShape")
-        sel_mat = str(self.dd_material.SelectedValue or "<Auto from Rhino>")
+        sel_cat = _get_combo_value(self.dd_cat, "Generic Models")
+        sel_strat = friendly_to_strategy(_get_combo_value(self.dd_strat, "DirectShape"))
+        sel_mat = _get_combo_value(self.dd_material, "<Auto from Rhino>")
 
-        self.layer_row.checked = bool(self.chk_include.Checked)
+        self.layer_row.checked = bool(self.chk_include.IsChecked)
         self.layer_row.custom_parameters = list(self.working_custom_params)
         self.layer_row.update_category(sel_cat)
         self.layer_row.update_strategy(sel_strat)
@@ -752,195 +886,127 @@ class LayerConfigDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 c.confidence_score = self.layer_row.confidence_score
                 c.confidence_tier = self.layer_row.confidence_tier
 
-        self.Close(True)
+        if self.window is not None:
+            self.window.DialogResult = True
+            self.window.Close()
 
     def _on_cancel(self, sender, e):
-        self.Close(False)
+        if self.window is not None:
+            self.window.DialogResult = False
+            self.window.Close()
 
 
-class AISettingsDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
-    """Configuration modal for LLM Provider, API Key, Model Engine, and Custom Endpoints."""
+class SettingsDialog(object):
+    """Unified WPF modal for Transfer Rules, Units, Origin/BUA, and AI Classifier settings."""
 
-    def __init__(self, ai_interpreter, parent=None):
-        if not ETO_AVAILABLE:
+    def __init__(self, ai_interpreter, dashboard_state=None, parent=None):
+        self.ai_interpreter = ai_interpreter
+        self.parent = parent
+        self.state = dict(dashboard_state or {})
+        self.window = None
+        if not WPF_AVAILABLE:
             return
 
-        super(AISettingsDialog, self).__init__()
-        self.Title = "R2R AI Model & API Key Configuration"
-        self.ClientSize = ed.Size(560, 420)
-        self.Resizable = False
-        self.Padding = ed.Padding(16)
-        self.ai_interpreter = ai_interpreter
+        win = _load_xaml_window("ui_settings.xaml")
+        self.window = win
+        _clamp_window_to_screen(win, 620, 590)
 
-        layout = ef.DynamicLayout()
-        layout.Spacing = ed.Size(10, 10)
+        self.dd_global_mode = win.FindName("dd_global_mode")
+        for m in ("Hybrid", "Native BIM", "Geometry-First"):
+            self.dd_global_mode.Items.Add(m)
+        _set_combo_value(self.dd_global_mode, self.state.get("global_mode", "Hybrid"))
 
-        # Header Title
-        lbl_header = ef.Label()
-        lbl_header.Text = "AI Semantic Classifier & Model Settings"
-        try:
-            lbl_header.Font = ed.Font(ed.SystemFont.Bold, 12)
-        except Exception:
-            pass
-        layout.Add(lbl_header)
+        self.dd_unit_scale = win.FindName("dd_unit_scale")
+        for u in (
+            "Auto-Detect", "mm -> Feet (x0.00328)", "Meters -> Feet (x3.28084)",
+            "cm -> Feet (x0.0328)", "Inches -> Feet (x0.0833)", "Feet -> Feet (1.0)"
+        ):
+            self.dd_unit_scale.Items.Add(u)
+        self.dd_unit_scale.SelectedIndex = int(self.state.get("unit_scale_idx", 0))
 
-        lbl_desc = ef.Label()
-        lbl_desc.Text = (
-            "Configure an AI provider to automatically decode complex layer names, foreign\n"
-            "architectural naming conventions, and ambiguous geometric categories."
-        )
-        try:
-            lbl_desc.TextColor = ed.Colors.DimGray
-        except Exception:
-            pass
-        layout.Add(lbl_desc)
+        self.dd_mixed_policy = win.FindName("dd_mixed_policy")
+        self.dd_mixed_policy.Items.Add("Auto-Fallback")
+        self.dd_mixed_policy.Items.Add("Strict Skip")
+        self.dd_mixed_policy.SelectedIndex = 1 if self.state.get("mixed_policy", "AutoFallback") == "StrictSkip" else 0
 
-        # Provider Selection
-        lbl_provider = ef.Label()
-        lbl_provider.Text = "LLM Provider:"
-        self.dd_provider = ef.DropDown()
+        self.dd_rep_threshold = win.FindName("dd_rep_threshold")
+        for r_opt in (">= 2 identical", ">= 3 identical", ">= 5 identical", ">= 10 identical"):
+            self.dd_rep_threshold.Items.Add(r_opt)
+        self.dd_rep_threshold.SelectedIndex = int(self.state.get("rep_threshold_idx", 1))
+
+        self.chk_move_to_origin = win.FindName("chk_move_to_origin")
+        self.chk_move_to_origin.IsChecked = bool(self.state.get("move_to_origin", True))
+
+        self.chk_gen_bua = win.FindName("chk_gen_bua")
+        self.chk_gen_bua.IsChecked = bool(self.state.get("generate_bua", True))
+
+        # AI Settings
+        self.dd_ai_provider = win.FindName("dd_ai_provider")
         providers = ["OpenAI", "Google Gemini", "DeepSeek", "OpenRouter", "Local Ollama / LM Studio", "Custom / Other"]
         for p in providers:
-            self.dd_provider.Items.Add(p)
-
+            self.dd_ai_provider.Items.Add(p)
         curr_prov = getattr(self.ai_interpreter, "provider", "OpenAI")
-        if curr_prov in providers:
-            self.dd_provider.SelectedValue = curr_prov
-        else:
-            self.dd_provider.SelectedIndex = 0
-        self.dd_provider.SelectedIndexChanged += self._on_provider_changed
+        _set_combo_value(self.dd_ai_provider, curr_prov if curr_prov in providers else "OpenAI")
+        self.dd_ai_provider.SelectionChanged += self._on_provider_changed
 
-        row_prov = ef.DynamicLayout()
-        row_prov.Spacing = ed.Size(8, 5)
-        row_prov.BeginHorizontal()
-        row_prov.Add(lbl_provider)
-        row_prov.Add(self.dd_provider, True)
-        row_prov.EndHorizontal()
-        layout.Add(row_prov)
-
-        # Model Engine Selection
-        lbl_model = ef.Label()
-        lbl_model.Text = "Model Engine:"
-        self.dd_model = ef.DropDown()
-
-        self.txt_custom_model = ef.TextBox()
-        self.txt_custom_model.PlaceholderText = "Or type custom model name (e.g. gemini-3.8-flash, gemini-3.6-flash, gpt-4o)"
-        self.txt_custom_model.Text = getattr(self.ai_interpreter, "model", "gemini-3.8-flash")
-
+        self.dd_ai_model = win.FindName("dd_ai_model")
+        self.txt_ai_custom_model = win.FindName("txt_ai_custom_model")
+        self.txt_ai_custom_model.Text = getattr(self.ai_interpreter, "model", "gpt-4o-mini") or ""
         self._populate_model_options()
 
-        row_model = ef.DynamicLayout()
-        row_model.Spacing = ed.Size(8, 5)
-        row_model.BeginHorizontal()
-        row_model.Add(lbl_model)
-        row_model.Add(self.dd_model, True)
-        row_model.Add(self.txt_custom_model, True)
-        row_model.EndHorizontal()
-        layout.Add(row_model)
+        self.txt_ai_api_key = win.FindName("txt_ai_api_key")
+        self.txt_ai_api_key.Text = getattr(self.ai_interpreter, "api_key", "") or ""
 
-        # API Key
-        lbl_key = ef.Label()
-        lbl_key.Text = "API Key:"
-        self.txt_api_key = ef.TextBox()
-        self.txt_api_key.PlaceholderText = "Paste API Key (sk-... / AIza...)"
-        self.txt_api_key.Text = getattr(self.ai_interpreter, "api_key", "") or ""
+        self.txt_ai_endpoint = win.FindName("txt_ai_endpoint")
+        self.txt_ai_endpoint.Text = getattr(self.ai_interpreter, "api_endpoint", "https://api.openai.com/v1/chat/completions") or ""
 
-        row_key = ef.DynamicLayout()
-        row_key.Spacing = ed.Size(8, 5)
-        row_key.BeginHorizontal()
-        row_key.Add(lbl_key)
-        row_key.Add(self.txt_api_key, True)
-        row_key.EndHorizontal()
-        layout.Add(row_key)
+        self.lbl_ai_status = win.FindName("lbl_ai_status")
+        win.FindName("btn_ai_test").Click += self._on_test_connection
+        win.FindName("btn_settings_save").Click += self._on_save
+        win.FindName("btn_settings_cancel").Click += self._on_cancel
 
-        # API Endpoint URL
-        lbl_endpoint = ef.Label()
-        lbl_endpoint.Text = "API Endpoint:"
-        self.txt_endpoint = ef.TextBox()
-        self.txt_endpoint.Text = getattr(self.ai_interpreter, "api_endpoint", "https://api.openai.com/v1/chat/completions")
-
-        row_ep = ef.DynamicLayout()
-        row_ep.Spacing = ed.Size(8, 5)
-        row_ep.BeginHorizontal()
-        row_ep.Add(lbl_endpoint)
-        row_ep.Add(self.txt_endpoint, True)
-        row_ep.EndHorizontal()
-        layout.Add(row_ep)
-
-        # Status & Feedback
-        self.lbl_status = ef.Label()
-        self.lbl_status.Text = "Status: Configuration stored in AppData/pyRevit/R2R/ai_config.json"
-        try:
-            self.lbl_status.TextColor = ed.Colors.DimGray
-        except Exception:
-            pass
-        layout.Add(self.lbl_status)
-
-        # Buttons Bar
-        btn_test = ef.Button()
-        btn_test.Text = "Test Connection"
-        btn_test.Click += self._on_test_connection
-
-        btn_save = ef.Button()
-        btn_save.Text = "Save & Apply"
-        btn_save.Click += self._on_save_config
-
-        btn_cancel = ef.Button()
-        btn_cancel.Text = "Close"
-        btn_cancel.Click += self._on_cancel
-
-        btn_layout = ef.DynamicLayout()
-        btn_layout.Spacing = ed.Size(10, 5)
-        btn_layout.BeginHorizontal()
-        btn_layout.Add(btn_test)
-        btn_layout.Add(None, True)  # Spacer
-        btn_layout.Add(btn_save)
-        btn_layout.Add(btn_cancel)
-        btn_layout.EndHorizontal()
-
-        layout.Add(None, True)  # Vertical Spacer
-        layout.Add(btn_layout)
-
-        self.Content = layout
+    def ShowModal(self, parent=None):
+        if not WPF_AVAILABLE or self.window is None:
+            return False
+        _set_revit_owner(self.window, parent_window=parent or self.parent)
+        return bool(self.window.ShowDialog() == True)
 
     def _populate_model_options(self):
-        """Populates model dropdown based on selected provider presets."""
-        prov = str(self.dd_provider.SelectedValue or "OpenAI")
+        prov = _get_combo_value(self.dd_ai_provider, "OpenAI")
         preset = PROVIDER_PRESETS.get(prov, {})
         models = preset.get("models", ["gpt-4o-mini", "gpt-4o"])
-        self.dd_model.Items.Clear()
-        for m in models:
-            self.dd_model.Items.Add(m)
-        curr_model = getattr(self.ai_interpreter, "model", "")
-        if curr_model in models:
-            self.dd_model.SelectedValue = curr_model
-        else:
-            self.dd_model.SelectedIndex = 0
         try:
-            self.dd_model.SelectedIndexChanged -= self._on_model_dd_changed
+            self.dd_ai_model.SelectionChanged -= self._on_model_dd_changed
         except Exception:
             pass
-        self.dd_model.SelectedIndexChanged += self._on_model_dd_changed
+        self.dd_ai_model.Items.Clear()
+        for m in models:
+            self.dd_ai_model.Items.Add(m)
+        curr_model = getattr(self.ai_interpreter, "model", "")
+        _set_combo_value(self.dd_ai_model, curr_model if curr_model in models else models[0])
+        self.dd_ai_model.SelectionChanged += self._on_model_dd_changed
 
-    def _on_model_dd_changed(self, sender, e):
-        val = str(self.dd_model.SelectedValue or "")
+    def _on_model_dd_changed(self, s, e):
+        val = _get_combo_value(self.dd_ai_model, "")
         if val:
-            self.txt_custom_model.Text = val
+            self.txt_ai_custom_model.Text = val
 
-    def _on_provider_changed(self, sender, e):
-        prov = str(self.dd_provider.SelectedValue or "OpenAI")
+    def _on_provider_changed(self, s, e):
+        prov = _get_combo_value(self.dd_ai_provider, "OpenAI")
         preset = PROVIDER_PRESETS.get(prov, {})
         if preset:
-            self.txt_endpoint.Text = preset.get("endpoint", "")
+            self.txt_ai_endpoint.Text = preset.get("endpoint", "")
             self._populate_model_options()
-            self.txt_custom_model.Text = preset.get("default_model", "")
+            self.txt_ai_custom_model.Text = preset.get("default_model", "")
 
-    def _on_test_connection(self, sender, e):
-        self.lbl_status.Text = "Testing live connection..."
-        prov = str(self.dd_provider.SelectedValue or "")
-        model = (self.txt_custom_model.Text or str(self.dd_model.SelectedValue or "")).strip()
-        key = (self.txt_api_key.Text or "").strip()
-        endpoint = (self.txt_endpoint.Text or "").strip()
+    def _on_test_connection(self, s, e):
+        self.lbl_ai_status.Text = "Testing live connection..."
+        self.lbl_ai_status.Foreground = _make_brush("#475569")
+        _pump_wpf_events()
+        prov = _get_combo_value(self.dd_ai_provider, "")
+        model = str(self.txt_ai_custom_model.Text or _get_combo_value(self.dd_ai_model, "")).strip()
+        key = str(self.txt_ai_api_key.Text or "").strip()
+        endpoint = str(self.txt_ai_endpoint.Text or "").strip()
 
         success, msg = self.ai_interpreter.test_connection(
             api_key=key,
@@ -948,17 +1014,21 @@ class AISettingsDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             model=model,
             provider=prov
         )
-        self.lbl_status.Text = msg
-        try:
-            self.lbl_status.TextColor = ed.Colors.Green if success else ed.Colors.Red
-        except Exception:
-            pass
+        self.lbl_ai_status.Text = msg
+        self.lbl_ai_status.Foreground = _make_brush("#166534" if success else "#991B1B")
 
-    def _on_save_config(self, sender, e):
-        prov = str(self.dd_provider.SelectedValue or "OpenAI")
-        model = (self.txt_custom_model.Text or str(self.dd_model.SelectedValue or "gpt-4o-mini")).strip()
-        key = (self.txt_api_key.Text or "").strip()
-        endpoint = (self.txt_endpoint.Text or "").strip()
+    def _on_save(self, s, e):
+        self.state["global_mode"] = _get_combo_value(self.dd_global_mode, "Hybrid")
+        self.state["unit_scale_idx"] = max(0, int(self.dd_unit_scale.SelectedIndex))
+        self.state["mixed_policy"] = "StrictSkip" if self.dd_mixed_policy.SelectedIndex == 1 else "AutoFallback"
+        self.state["rep_threshold_idx"] = max(0, int(self.dd_rep_threshold.SelectedIndex))
+        self.state["move_to_origin"] = bool(self.chk_move_to_origin.IsChecked)
+        self.state["generate_bua"] = bool(self.chk_gen_bua.IsChecked)
+
+        prov = _get_combo_value(self.dd_ai_provider, "OpenAI")
+        model = str(self.txt_ai_custom_model.Text or _get_combo_value(self.dd_ai_model, "gpt-4o-mini")).strip()
+        key = str(self.txt_ai_api_key.Text or "").strip()
+        endpoint = str(self.txt_ai_endpoint.Text or "").strip()
 
         self.ai_interpreter.provider = prov
         self.ai_interpreter.model = model
@@ -966,26 +1036,28 @@ class AISettingsDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self.ai_interpreter.api_endpoint = endpoint
         self.ai_interpreter.save_config()
 
-        self.Close(True)
+        self.window.DialogResult = True
+        self.window.Close()
 
-    def _on_cancel(self, sender, e):
-        self.Close(False)
+    def _on_cancel(self, s, e):
+        self.window.DialogResult = False
+        self.window.Close()
 
 
-class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
-    """Complete 5-Stage Eto.Forms Dashboard Dialog for Rhino-to-Revit Transfer."""
+class AISettingsDialog(SettingsDialog):
+    """Backwards-compatible alias launching the unified Settings & AI modal."""
+
+    def __init__(self, ai_interpreter, parent=None):
+        super(AISettingsDialog, self).__init__(ai_interpreter, dashboard_state=None, parent=parent)
+
+
+# =============================================================================
+# MAIN 3-STEP MASTER-DETAIL TRANSFER DASHBOARD
+# =============================================================================
+class TransferDashboardDialog(object):
+    """Complete 3-Step WPF XAML Master-Detail Dashboard Dialog for Rhino-to-Revit Transfer."""
 
     def __init__(self, revit_doc=None, revit_uidoc=None):
-        if not ETO_AVAILABLE:
-            return
-
-        super(TransferDashboardDialog, self).__init__()
-        self.Title = "One-Click Rhino-to-Revit Transfer (RIR)"
-        self.ClientSize = ed.Size(1080, 720)
-        self.MinimumSize = ed.Size(950, 600)
-        self.Padding = ed.Padding(12)
-
-        # Context
         self.revit_doc = revit_doc
         self.revit_uidoc = revit_uidoc
         self.scanner = RhinoScanner()
@@ -997,19 +1069,36 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         # Pipeline Session Data
         self.scanned_objects = []
-        self.classifications = {}  # guid -> ClassificationResult
+        self.classifications = {}   # guid -> ClassificationResult
         self.sync_evaluations = {}  # guid -> SyncEvaluation
         self.missing_in_rhino = []
-        self.layer_rows = []       # list of LayerRowItem
+        self.layer_rows = []        # list of LayerRowItem
         self.filtered_layer_rows = []
-        self.validation_rows = []  # list of ValidationRowItem
+        self.validation_rows = []   # list of ValidationRowItem
         self.qa_report = TransferQAReport()
 
-        # Query Revit Materials
+        # Global Transfer Settings State
+        self.global_mode = "Hybrid"
+        self.unit_scale_idx = 0
+        self.mixed_policy = "AutoFallback"
+        self.rep_threshold_idx = 1  # >= 3 identical
+        self.move_to_origin = True
+        self.generate_bua = True
+
         self.revit_materials = self._get_project_materials()
         self.project_custom_parameters = list(getattr(self.profile_mgr, "project_custom_parameters", []) or [])
 
-        # Build UI Structure
+        # UI Guard Flags & Step State
+        self.active_step = 0
+        self._updating_inspector = False
+        self._restoring_selection = False
+        self._refreshing_grid = False
+        self._last_recommended = "DirectShape"
+        self.window = None
+
+        if not WPF_AVAILABLE:
+            return
+
         self._init_ui()
 
     def _get_project_materials(self):
@@ -1027,783 +1116,256 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 pass
         return mats
 
-    def _create_separator(self):
-        """Creates a 1px horizontal divider panel compatible with all Eto.Forms versions."""
-        sep = ef.Panel()
-        sep.Height = 1
-        sep.Size = ed.Size(-1, 1)
-        try:
-            sep.BackgroundColor = ed.Colors.LightGrey
-        except Exception:
-            pass
-        return sep
-
-    def _set_bold_font(self, ctrl, size=11):
-        """Safely assigns a bold font across IronPython 2.7 and CPython 3 / pythonnet."""
-        try:
-            ctrl.Font = ed.Font(ed.SystemFont.Bold, float(size))
-        except Exception:
-            try:
-                ctrl.Font = ed.SystemFonts.Bold()
-            except Exception:
-                pass
-
     @staticmethod
     def _make_elem_id(val):
         try:
-            import System
             return DB.ElementId(System.Int64(val))
         except Exception:
             return DB.ElementId(int(val))
 
-    def _on_close_clicked(self, sender, e):
-        try:
-            self.Close(True)
-        except Exception:
-            self.Close()
+    def ShowModal(self, parent=None):
+        """Displays the WPF dashboard modally anchored to Revit's main window."""
+        if not WPF_AVAILABLE or self.window is None:
+            return False
+        _set_revit_owner(self.window, revit_uidoc=self.revit_uidoc, parent_window=parent)
+        return bool(self.window.ShowDialog())
 
     def Show(self, parent=None):
-        """Presents dialog modally across all Rhino / Revit environments."""
-        try:
-            if parent is not None:
-                return self.ShowModal(parent)
-            import Rhino.UI as rui
-            if hasattr(rui, 'RhinoEtoApp') and hasattr(rui.RhinoEtoApp, 'MainWindow') and rui.RhinoEtoApp.MainWindow:
-                return self.ShowModal(rui.RhinoEtoApp.MainWindow)
-        except Exception:
-            pass
-        return self.ShowModal()
+        """Alias for ShowModal."""
+        return self.ShowModal(parent=parent)
 
     def show(self, parent=None):
         """Lowercase alias for Show / ShowModal compatibility."""
-        return self.Show(parent)
+        return self.ShowModal(parent=parent)
 
+    def Close(self, result=True):
+        if WPF_AVAILABLE and self.window is not None:
+            try:
+                self.window.Close()
+            except Exception:
+                pass
+
+    # =========================================================================
+    # UI INITIALIZATION & WIRING
+    # =========================================================================
     def _init_ui(self):
-        """Constructs layout, header tabs, and stage views."""
-        layout = ef.DynamicLayout()
-        layout.Spacing = ed.Size(8, 8)
+        win = _load_xaml_window("ui_dashboard.xaml")
+        self.window = win
+        _clamp_window_to_screen(win, 1180, 760)
 
-        # Top Header Bar
-        header_label = ef.Label()
-        header_label.Text = "ONE-CLICK RHINO-TO-REVIT TRANSFER"
-        self._set_bold_font(header_label, 15)
-        header_label.TextColor = ed.Color.FromArgb(20, 110, 190)
+        # Header & Step Navigation
+        self.lbl_header_settings = win.FindName("lbl_header_settings")
+        self.btn_step_scan = win.FindName("btn_step_scan")
+        self.btn_step_configure = win.FindName("btn_step_configure")
+        self.btn_step_run = win.FindName("btn_step_run")
+        self.btn_load_profile = win.FindName("btn_load_profile")
+        self.btn_save_profile = win.FindName("btn_save_profile")
+        self.btn_open_settings = win.FindName("btn_open_settings")
 
-        subtitle = ef.Label()
-        subtitle.Text = "Production-grade geometry fingerprinting, architectural semantic classification, dual-status BIM validation & revision sync"
-        subtitle.TextColor = ed.Colors.Gray
+        self.panel_step_scan = win.FindName("panel_step_scan")
+        self.panel_step_configure = win.FindName("panel_step_configure")
+        self.panel_step_run = win.FindName("panel_step_run")
 
-        layout.Add(header_label)
-        layout.Add(subtitle)
-        layout.Add(self._create_separator())
+        # Step 1 Controls
+        self.chk_include_hidden = win.FindName("chk_include_hidden")
+        self.chk_include_locked = win.FindName("chk_include_locked")
+        self.chk_auto_split_mixed = win.FindName("chk_auto_split_mixed")
+        self.btn_scan = win.FindName("btn_scan")
+        self.lbl_kpi_total = win.FindName("lbl_kpi_total")
+        self.lbl_kpi_units = win.FindName("lbl_kpi_units")
+        self.lbl_kpi_origin = win.FindName("lbl_kpi_origin")
+        self.lbl_kpi_duplicates = win.FindName("lbl_kpi_duplicates")
+        self.lbl_kpi_loops = win.FindName("lbl_kpi_loops")
+        self.txt_scan_warnings = win.FindName("txt_scan_warnings")
 
-        # Main 5-Stage Tab Control
-        self.tabs = ef.TabControl()
-        self.tab_scan = ef.TabPage()
-        self.tab_scan.Text = "1. SCAN"
-        self.tab_scan.Content = self._build_scan_tab()
+        # Step 2 Toolbar & Master Grid
+        self.txt_search = win.FindName("txt_search")
+        self.dd_status_filter = win.FindName("dd_status_filter")
+        self.dd_cat_filter = win.FindName("dd_cat_filter")
+        self.btn_select_all = win.FindName("btn_select_all")
+        self.btn_deselect_all = win.FindName("btn_deselect_all")
+        self.btn_split_mixed = win.FindName("btn_split_mixed")
+        self.btn_ai_assist = win.FindName("btn_ai_assist")
+        self.btn_project_params = win.FindName("btn_project_params")
+        self.grid_review = win.FindName("grid_review")
 
-        self.tab_review = ef.TabPage()
-        self.tab_review.Text = "2. REVIEW & CONFIGURE"
-        self.tab_review.Content = self._build_review_tab()
+        for s_opt in ("All Layers", "Compatible (OK)", "Mixed Geometry", "Blocked / Low Conf", "Modified / New"):
+            self.dd_status_filter.Items.Add(s_opt)
+        self.dd_status_filter.SelectedIndex = 0
 
-        self.tab_preview = ef.TabPage()
-        self.tab_preview.Text = "3. PREVIEW"
-        self.tab_preview.Content = self._build_preview_tab()
+        self.dd_cat_filter.Items.Add("All Categories")
+        for c_opt in ("Floors", "Walls", "Roofs", "Ceilings", "Family", "DirectShape"):
+            self.dd_cat_filter.Items.Add(c_opt)
+        self.dd_cat_filter.SelectedIndex = 0
 
-        self.tab_execute = ef.TabPage()
-        self.tab_execute.Text = "4. EXECUTE"
-        self.tab_execute.Content = self._build_execute_tab()
+        # Step 2 Inspector
+        self.panel_inspector_empty = win.FindName("panel_inspector_empty")
+        self.panel_inspector_body = win.FindName("panel_inspector_body")
+        self.lbl_insp_title = win.FindName("lbl_insp_title")
+        self.lbl_insp_subtitle = win.FindName("lbl_insp_subtitle")
+        self.border_insp_geom = win.FindName("border_insp_geom")
+        self.lbl_insp_geom = win.FindName("lbl_insp_geom")
+        self.btn_insp_split = win.FindName("btn_insp_split")
+        self.chk_insp_include = win.FindName("chk_insp_include")
+        self.cb_insp_category = win.FindName("cb_insp_category")
+        self.cb_insp_strategy = win.FindName("cb_insp_strategy")
+        self.border_insp_editability = win.FindName("border_insp_editability")
+        self.lbl_insp_editability = win.FindName("lbl_insp_editability")
+        self.border_insp_compat = win.FindName("border_insp_compat")
+        self.lbl_insp_compat = win.FindName("lbl_insp_compat")
+        self.btn_insp_use_rec = win.FindName("btn_insp_use_rec")
+        self.cb_insp_material = win.FindName("cb_insp_material")
+        self.lbl_insp_params_summary = win.FindName("lbl_insp_params_summary")
+        self.btn_insp_params = win.FindName("btn_insp_params")
+        self.panel_insp_bulk = win.FindName("panel_insp_bulk")
+        self.btn_insp_bulk_apply = win.FindName("btn_insp_bulk_apply")
 
-        self.tab_validate = ef.TabPage()
-        self.tab_validate.Text = "5. VALIDATE & QA"
-        self.tab_validate.Content = self._build_validate_tab()
+        for c in STANDARD_REVIT_CATEGORIES:
+            self.cb_insp_category.Items.Add(c)
+        for _, friendly, _ in STRATEGY_UI_CHOICES:
+            self.cb_insp_strategy.Items.Add(friendly)
+        self._populate_inspector_materials()
 
-        self.tabs.Pages.Add(self.tab_scan)
-        self.tabs.Pages.Add(self.tab_review)
-        self.tabs.Pages.Add(self.tab_preview)
-        self.tabs.Pages.Add(self.tab_execute)
-        self.tabs.Pages.Add(self.tab_validate)
-        self.tabs.SelectedIndexChanged += self._on_tab_changed
+        # Step 3 Controls
+        self.lbl_run_summary = win.FindName("lbl_run_summary")
+        self.progress_bar = win.FindName("progress_bar")
+        self.lbl_exec_status = win.FindName("lbl_exec_status")
+        self.btn_execute = win.FindName("btn_execute")
+        self.exp_exec_log = win.FindName("exp_exec_log")
+        self.txt_exec_log = win.FindName("txt_exec_log")
+        self.btn_isolate = win.FindName("btn_isolate")
+        self.btn_export_html = win.FindName("btn_export_html")
+        self.btn_export_csv = win.FindName("btn_export_csv")
+        self.grid_validate = win.FindName("grid_validate")
 
-        layout.Add(self.tabs, True, True)
+        # Footer
+        self.lbl_global_status = win.FindName("lbl_global_status")
+        self.lbl_footer_summary = win.FindName("lbl_footer_summary")
+        self.btn_back = win.FindName("btn_back")
+        self.btn_next = win.FindName("btn_next")
 
-        # Bottom Action Bar
-        bottom_layout = ef.DynamicLayout()
-        bottom_layout.Spacing = ed.Size(10, 5)
+        # Wire Events
+        self.btn_step_scan.Click += lambda s, e: self._set_active_step(0)
+        self.btn_step_configure.Click += lambda s, e: self._set_active_step(1)
+        self.btn_step_run.Click += lambda s, e: self._set_active_step(2)
+        self.btn_load_profile.Click += self._on_load_profile
+        self.btn_save_profile.Click += self._on_save_profile
+        self.btn_open_settings.Click += self._on_open_settings
 
-        self.lbl_global_status = ef.Label()
-        self.lbl_global_status.Text = "Ready to scan active Rhino document."
-        self.lbl_global_status.VerticalAlignment = ef.VerticalAlignment.Center
-
-        btn_close = ef.Button()
-        btn_close.Text = "Close"
-        btn_close.Click += self._on_close_clicked
-
-        bottom_layout.BeginHorizontal()
-        bottom_layout.Add(self.lbl_global_status, True, False)
-        bottom_layout.Add(btn_close, False, False)
-        bottom_layout.EndHorizontal()
-
-        layout.Add(bottom_layout)
-        self.Content = layout
-
-    # =========================================================================
-    # TAB 1: SCAN
-    # =========================================================================
-    def _build_scan_tab(self):
-        layout = ef.DynamicLayout()
-        layout.Padding = ed.Padding(15)
-        layout.Spacing = ed.Size(10, 10)
-
-        desc = ef.Label()
-        desc.Text = "Scan all active Rhino document objects, inspect topological features, and compute deterministic SHA-256 geometry hashes."
-
-        # Scan controls
-        self.chk_include_hidden = ef.CheckBox()
-        self.chk_include_hidden.Text = "Include Hidden Layers & Objects"
-        self.chk_include_hidden.Checked = False
-
-        self.chk_include_locked = ef.CheckBox()
-        self.chk_include_locked.Text = "Include Locked Layers"
-        self.chk_include_locked.Checked = False
-
-        self.chk_auto_split_mixed = ef.CheckBox()
-        self.chk_auto_split_mixed.Text = "Auto-split mixed-geometry layers into sub-rows"
-        self.chk_auto_split_mixed.Checked = True
-
-        self.btn_scan = ef.Button()
-        self.btn_scan.Text = "Scan Active Rhino Document"
-        self._set_bold_font(self.btn_scan, 11)
-        self.btn_scan.Size = ed.Size(260, 36)
         self.btn_scan.Click += self._on_scan_clicked
 
-        layout.Add(desc)
-        layout.BeginHorizontal()
-        layout.Add(self.chk_include_hidden)
-        layout.Add(self.chk_include_locked)
-        layout.Add(self.chk_auto_split_mixed)
-        layout.EndHorizontal()
-        layout.Add(self.btn_scan)
-        layout.Add(self._create_separator())
-
-        # Preflight KPI Cards Box
-        cards_title = ef.Label()
-        cards_title.Text = "PREFLIGHT & GEOMETRIC HEALTH SUMMARY"
-        self._set_bold_font(cards_title, 11)
-        layout.Add(cards_title)
-
-        self.lbl_kpi_units = ef.Label()
-        self.lbl_kpi_units.Text = "Rhino Units: Not Scanned"
-
-        self.lbl_kpi_origin = ef.Label()
-        self.lbl_kpi_origin.Text = "Distance to Origin: Safe"
-
-        self.lbl_kpi_duplicates = ef.Label()
-        self.lbl_kpi_duplicates.Text = "Duplicates Detected: 0"
-
-        self.lbl_kpi_loops = ef.Label()
-        self.lbl_kpi_loops.Text = "Non-Closed Boundary Loops: 0"
-
-        self.lbl_kpi_total = ef.Label()
-        self.lbl_kpi_total.Text = "Total Scanned Objects: 0"
-
-        layout.Add(self.lbl_kpi_total)
-        layout.Add(self.lbl_kpi_units)
-        layout.Add(self.lbl_kpi_origin)
-        layout.Add(self.lbl_kpi_duplicates)
-        layout.Add(self.lbl_kpi_loops)
-
-        # Warnings TextArea
-        self.txt_scan_warnings = ef.TextArea()
-        self.txt_scan_warnings.ReadOnly = True
-        self.txt_scan_warnings.Size = ed.Size(-1, 140)
-        self.txt_scan_warnings.Text = "No preflight warnings."
-        layout.Add(self.txt_scan_warnings, True, True)
-
-        return layout
-
-    # =========================================================================
-    # TAB 2: REVIEW & CONFIGURE
-    # =========================================================================
-    def _build_review_tab(self):
-        layout = ef.DynamicLayout()
-        layout.Padding = ed.Padding(10)
-        layout.Spacing = ed.Size(8, 8)
-
-        # Filter Bar
-        filter_layout = ef.DynamicLayout()
-        filter_layout.Spacing = ed.Size(8, 5)
-
-        lbl_search = ef.Label()
-        lbl_search.Text = "Search Layer:"
-        self.txt_search = ef.TextBox()
-        self.txt_search.Size = ed.Size(180, 24)
         self.txt_search.TextChanged += self._apply_review_filters
-
-        lbl_cat_filter = ef.Label()
-        lbl_cat_filter.Text = "Category:"
-        self.dd_cat_filter = ef.DropDown()
-        self.dd_cat_filter.Items.Add("All Categories")
-        for cat in ["Floors", "Walls", "Roofs", "Ceilings", "Family", "DirectShape"]:
-            self.dd_cat_filter.Items.Add(cat)
-        self.dd_cat_filter.SelectedIndex = 0
-        self.dd_cat_filter.SelectedIndexChanged += self._apply_review_filters
-
-        lbl_conf_filter = ef.Label()
-        lbl_conf_filter.Text = "Confidence:"
-        self.dd_conf_filter = ef.DropDown()
-        self.dd_conf_filter.Items.Add("All Tiers")
-        self.dd_conf_filter.Items.Add("Auto Ready (>=85%)")
-        self.dd_conf_filter.Items.Add("Needs Approval (60-84%)")
-        self.dd_conf_filter.Items.Add("Manual / Low (<60%)")
-        self.dd_conf_filter.SelectedIndex = 0
-        self.dd_conf_filter.SelectedIndexChanged += self._apply_review_filters
-
-        lbl_sync_filter = ef.Label()
-        lbl_sync_filter.Text = "Sync State:"
-        self.dd_sync_filter = ef.DropDown()
-        self.dd_sync_filter.Items.Add("All States")
-        self.dd_sync_filter.Items.Add("CREATE")
-        self.dd_sync_filter.Items.Add("UPDATE_MODIFIED")
-        self.dd_sync_filter.Items.Add("SKIP_UNCHANGED")
-        self.dd_sync_filter.SelectedIndex = 0
-        self.dd_sync_filter.SelectedIndexChanged += self._apply_review_filters
-
-        filter_layout.BeginHorizontal()
-        filter_layout.Add(lbl_search)
-        filter_layout.Add(self.txt_search)
-        filter_layout.Add(lbl_cat_filter)
-        filter_layout.Add(self.dd_cat_filter)
-        filter_layout.Add(lbl_conf_filter)
-        filter_layout.Add(self.dd_conf_filter)
-        filter_layout.Add(lbl_sync_filter)
-        filter_layout.Add(self.dd_sync_filter)
-        filter_layout.EndHorizontal()
-
-        layout.Add(filter_layout)
-
-        # Global Mode & Options Bar
-        opts_layout = ef.DynamicLayout()
-        opts_layout.Spacing = ed.Size(10, 5)
-
-        lbl_mode = ef.Label()
-        lbl_mode.Text = "Execution Mode:"
-        lbl_mode.VerticalAlignment = ef.VerticalAlignment.Center
-
-        self.dd_global_mode = ef.DropDown()
-        self.dd_global_mode.Items.Add("Hybrid")
-        self.dd_global_mode.Items.Add("Native BIM")
-        self.dd_global_mode.Items.Add("Geometry-First")
-        self.dd_global_mode.SelectedIndex = 0
-        self.dd_global_mode.SelectedIndexChanged += self._on_mode_changed
-
-        lbl_units = ef.Label()
-        lbl_units.Text = "Unit Scale:"
-        lbl_units.VerticalAlignment = ef.VerticalAlignment.Center
-
-        self.dd_unit_scale = ef.DropDown()
-        self.dd_unit_scale.Items.Add("Auto-Detect")
-        self.dd_unit_scale.Items.Add("mm -> Feet (x0.00328)")
-        self.dd_unit_scale.Items.Add("Meters -> Feet (x3.28084)")
-        self.dd_unit_scale.Items.Add("cm -> Feet (x0.0328)")
-        self.dd_unit_scale.Items.Add("Inches -> Feet (x0.0833)")
-        self.dd_unit_scale.Items.Add("Feet -> Feet (1.0)")
-        self.dd_unit_scale.SelectedIndex = 0
-
-        self.chk_gen_bua = ef.CheckBox()
-        self.chk_gen_bua.Text = "Auto-Generate BUA / GFA Area Boundary Lines"
-        self.chk_gen_bua.Checked = True
-
-        self.chk_move_to_origin = ef.CheckBox()
-        self.chk_move_to_origin.Text = "Move Model to Revit Origin (0,0,0)"
-        self.chk_move_to_origin.Checked = True
-        self.chk_move_to_origin.ToolTip = "Automatically centers model XY at Revit (0,0) and normalizes base elevation even if outside bounds in Rhino (>16km)"
-
-        btn_select_all = ef.Button()
-        btn_select_all.Text = "Select All"
-        btn_select_all.Click += self._on_select_all_layers
-
-        btn_deselect_all = ef.Button()
-        btn_deselect_all.Text = "Deselect All"
-        btn_deselect_all.Click += self._on_deselect_all_layers
-
-        btn_ai_assist = ef.Button()
-        btn_ai_assist.Text = "Run AI Semantic Assist"
-        btn_ai_assist.ToolTip = "Interpret Spanish/Catalan architectural layer naming using semantic AI heuristics"
-        btn_ai_assist.Click += self._on_run_ai_assist
-
-        btn_ai_config = ef.Button()
-        btn_ai_config.Text = "AI Config..."
-        btn_ai_config.ToolTip = "Configure AI Provider (OpenAI, Gemini, DeepSeek, Ollama), API Key, and Model Engine"
-        btn_ai_config.Click += self._on_open_ai_settings
-
-        btn_load_profile = ef.Button()
-        btn_load_profile.Text = "Load Profile"
-        btn_load_profile.Click += self._on_load_profile
-
-        btn_save_profile = ef.Button()
-        btn_save_profile.Text = "Save Profile"
-        btn_save_profile.Click += self._on_save_profile
-
-        opts_layout.BeginHorizontal()
-        opts_layout.Add(lbl_mode)
-        opts_layout.Add(self.dd_global_mode)
-        opts_layout.Add(lbl_units)
-        opts_layout.Add(self.dd_unit_scale)
-        opts_layout.Add(self.chk_move_to_origin)
-        opts_layout.Add(self.chk_gen_bua)
-        opts_layout.Add(btn_select_all)
-        opts_layout.Add(btn_deselect_all)
-        opts_layout.Add(btn_ai_assist)
-        opts_layout.Add(btn_ai_config)
-        opts_layout.Add(btn_load_profile)
-        opts_layout.Add(btn_save_profile)
-        opts_layout.EndHorizontal()
-
-        layout.Add(opts_layout)
-
-        # Strategy Override & Repetition Toolbar
-        strat_layout = ef.DynamicLayout()
-        strat_layout.Spacing = ed.Size(8, 5)
-
-        lbl_strat_override = ef.Label()
-        lbl_strat_override.Text = "Override Strategy:"
-        lbl_strat_override.VerticalAlignment = ef.VerticalAlignment.Center
-
-        self.dd_strat_override = ef.DropDown()
-        self.dd_strat_override.Items.Add("AdaptiveComponent")
-        self.dd_strat_override.Items.Add("RepetitiveFamily")
-        self.dd_strat_override.Items.Add("ParametricFamily")
-        self.dd_strat_override.Items.Add("FreeFormFamily")
-        self.dd_strat_override.Items.Add("FloorNative")
-        self.dd_strat_override.Items.Add("WallByCurve")
-        self.dd_strat_override.Items.Add("RoofNative")
-        self.dd_strat_override.Items.Add("CeilingNative")
-        self.dd_strat_override.Items.Add("Toposolid")
-        self.dd_strat_override.Items.Add("DirectShape")
-        self.dd_strat_override.SelectedIndex = 0
-
-        btn_apply_strat = ef.Button()
-        btn_apply_strat.Text = "Apply Strategy"
-        btn_apply_strat.ToolTip = "Apply the selected strategy override to all currently checked layers"
-        btn_apply_strat.Click += self._on_apply_strategy_override
-
-        lbl_cat_override = ef.Label()
-        lbl_cat_override.Text = "Override Category:"
-        lbl_cat_override.VerticalAlignment = ef.VerticalAlignment.Center
-
-        self.dd_cat_override = ef.DropDown()
-        for cat_opt in STANDARD_REVIT_CATEGORIES:
-            self.dd_cat_override.Items.Add(cat_opt)
-        self.dd_cat_override.SelectedIndex = 0
-
-        btn_apply_cat = ef.Button()
-        btn_apply_cat.Text = "Apply Category"
-        btn_apply_cat.ToolTip = "Override the Revit category for all currently checked layers"
-        btn_apply_cat.Click += self._on_apply_category_override
-
-        lbl_mat_override = ef.Label()
-        lbl_mat_override.Text = "Override Material:"
-        lbl_mat_override.VerticalAlignment = ef.VerticalAlignment.Center
-
-        self.dd_mat_override = ef.DropDown()
-        for mat_opt in (self.revit_materials or ["<Auto from Rhino>"]):
-            self.dd_mat_override.Items.Add(mat_opt)
-        self.dd_mat_override.SelectedIndex = 0
-
-        btn_apply_mat = ef.Button()
-        btn_apply_mat.Text = "Apply Material"
-        btn_apply_mat.ToolTip = "Override the Revit material for all currently checked or selected layers"
-        btn_apply_mat.Click += self._on_apply_material_override
-
-        lbl_rep_thresh = ef.Label()
-        lbl_rep_thresh.Text = "Repetition Grouping:"
-        lbl_rep_thresh.VerticalAlignment = ef.VerticalAlignment.Center
-
-        self.dd_rep_threshold = ef.DropDown()
-        self.dd_rep_threshold.Items.Add(">= 2 identical")
-        self.dd_rep_threshold.Items.Add(">= 3 identical")
-        self.dd_rep_threshold.Items.Add(">= 5 identical")
-        self.dd_rep_threshold.Items.Add(">= 10 identical")
-        self.dd_rep_threshold.SelectedIndex = 1  # default >= 3 identical
-        self.dd_rep_threshold.SelectedIndexChanged += self._on_repetition_threshold_changed
-
-        strat_layout.BeginHorizontal()
-        strat_layout.Add(lbl_strat_override)
-        strat_layout.Add(self.dd_strat_override)
-        strat_layout.Add(btn_apply_strat)
-        strat_layout.Add(lbl_cat_override)
-        strat_layout.Add(self.dd_cat_override)
-        strat_layout.Add(btn_apply_cat)
-        strat_layout.Add(lbl_mat_override)
-        strat_layout.Add(self.dd_mat_override)
-        strat_layout.Add(btn_apply_mat)
-        strat_layout.Add(lbl_rep_thresh)
-        strat_layout.Add(self.dd_rep_threshold)
-        strat_layout.EndHorizontal()
-
-        layout.Add(strat_layout)
-
-        # Mixed-Layer Control & Deterministic Custom Parameters Toolbar
-        rule_bar = ef.DynamicLayout()
-        rule_bar.Spacing = ed.Size(8, 5)
-
-        btn_split_mixed = ef.Button()
-        btn_split_mixed.Text = "Split Mixed Layers"
-        btn_split_mixed.ToolTip = "Split any heterogeneous layers into clean homogeneous sub-rows by geometry type"
-        btn_split_mixed.Click += self._on_split_mixed_layers
-
-        lbl_mixed_policy = ef.Label()
-        lbl_mixed_policy.Text = "Mixed/Incompatible Policy:"
-        lbl_mixed_policy.VerticalAlignment = ef.VerticalAlignment.Center
-
-        self.dd_mixed_policy = ef.DropDown()
-        self.dd_mixed_policy.Items.Add("Auto-Fallback")
-        self.dd_mixed_policy.Items.Add("Strict Skip")
-        self.dd_mixed_policy.SelectedIndex = 0
-
-        self.btn_project_params = ef.Button()
-        self.btn_project_params.Text = "Custom Params (Project: {})...".format(len(self.project_custom_parameters))
-        self.btn_project_params.ToolTip = "Define deterministic Data/Schedule parameters applied to all transferred elements"
+        self.dd_status_filter.SelectionChanged += self._apply_review_filters
+        self.dd_cat_filter.SelectionChanged += self._apply_review_filters
+        self.btn_select_all.Click += self._on_select_all_layers
+        self.btn_deselect_all.Click += self._on_deselect_all_layers
+        self.btn_split_mixed.Click += self._on_split_mixed_layers
+        self.btn_ai_assist.Click += self._on_run_ai_assist
         self.btn_project_params.Click += self._on_edit_project_params
 
-        rule_bar.BeginHorizontal()
-        rule_bar.Add(btn_split_mixed)
-        rule_bar.Add(lbl_mixed_policy)
-        rule_bar.Add(self.dd_mixed_policy)
-        rule_bar.Add(self.btn_project_params)
-        rule_bar.Add(None, True)
-        rule_bar.EndHorizontal()
-        layout.Add(rule_bar)
-
-        # DataGridView
-        self.grid_review = ef.GridView()
-        self.grid_review.ShowHeader = True
-        self.grid_review.AllowMultipleSelection = True
+        self.grid_review.SelectionChanged += self._on_review_selection_changed
+        self.grid_review.MouseDoubleClick += self._on_grid_cell_double_click
         try:
-            self.grid_review.CellEdited += self._on_review_cell_edited
+            chk_handler = sw.RoutedEventHandler(self._on_grid_checkbox_toggled)
+            self.grid_review.AddHandler(swcp.ToggleButton.CheckedEvent, chk_handler)
+            self.grid_review.AddHandler(swcp.ToggleButton.UncheckedEvent, chk_handler)
         except Exception:
             pass
 
-        # Checkbox column
-        col_check = ef.GridColumn()
-        col_check.HeaderText = "Select"
-        col_check.DataCell = ef.CheckBoxCell(0)
-        col_check.Editable = True
-        self.grid_review.Columns.Add(col_check)
+        # Inspector Events
+        self.btn_insp_split.Click += self._on_insp_split_clicked
+        self.chk_insp_include.Checked += self._on_insp_single_changed
+        self.chk_insp_include.Unchecked += self._on_insp_single_changed
+        self.cb_insp_category.SelectionChanged += self._on_insp_single_changed
+        self.cb_insp_category.LostFocus += self._on_insp_single_changed
+        self.cb_insp_strategy.SelectionChanged += self._on_insp_strategy_changed
+        self.btn_insp_use_rec.Click += self._on_insp_use_recommended
+        self.cb_insp_material.SelectionChanged += self._on_insp_single_changed
+        self.cb_insp_material.LostFocus += self._on_insp_single_changed
+        self.btn_insp_params.Click += self._on_insp_edit_params
+        self.btn_insp_bulk_apply.Click += self._on_insp_bulk_apply
 
-        # Layer Name
-        col_layer = ef.GridColumn()
-        col_layer.HeaderText = "Rhino Layer"
-        col_layer.DataCell = ef.TextBoxCell(1)
-        col_layer.Width = 240
-        self.grid_review.Columns.Add(col_layer)
-
-        # Count
-        col_count = ef.GridColumn()
-        col_count.HeaderText = "Count"
-        col_count.DataCell = ef.TextBoxCell(2)
-        col_count.Width = 60
-        self.grid_review.Columns.Add(col_count)
-
-        # Inferred Category
-        col_cat = ef.GridColumn()
-        col_cat.HeaderText = "Inferred Category"
-        col_cat.DataCell = ef.TextBoxCell(3)
-        col_cat.Width = 140
-        col_cat.Editable = True
-        self.grid_review.Columns.Add(col_cat)
-
-        # Proposed Strategy
-        col_strat = ef.GridColumn()
-        col_strat.HeaderText = "Proposed Strategy"
-        col_strat.DataCell = ef.TextBoxCell(4)
-        col_strat.Width = 140
-        col_strat.Editable = True
-        self.grid_review.Columns.Add(col_strat)
-
-        # Target Type
-        col_type = ef.GridColumn()
-        col_type.HeaderText = "Target Revit Type"
-        col_type.DataCell = ef.TextBoxCell(5)
-        col_type.Width = 140
-        self.grid_review.Columns.Add(col_type)
-
-        # Revit Material
-        col_mat = ef.GridColumn()
-        col_mat.HeaderText = "Revit Material"
-        col_mat.DataCell = ef.TextBoxCell(6)
-        col_mat.Width = 140
-        col_mat.Editable = True
-        self.grid_review.Columns.Add(col_mat)
-
-        # Confidence
-        col_conf = ef.GridColumn()
-        col_conf.HeaderText = "Confidence"
-        col_conf.DataCell = ef.TextBoxCell(7)
-        col_conf.Width = 90
-        self.grid_review.Columns.Add(col_conf)
-
-        # Sync State
-        col_sync = ef.GridColumn()
-        col_sync.HeaderText = "Sync State"
-        col_sync.DataCell = ef.TextBoxCell(8)
-        col_sync.Width = 110
-        self.grid_review.Columns.Add(col_sync)
-
-        # Pattern / Signature
-        col_pattern = ef.GridColumn()
-        col_pattern.HeaderText = "Pattern / Points"
-        col_pattern.DataCell = ef.TextBoxCell(9)
-        col_pattern.Width = 140
-        self.grid_review.Columns.Add(col_pattern)
-
-        # Rule Compatibility Status
-        col_compat = ef.GridColumn()
-        col_compat.HeaderText = "Rule Compatibility"
-        col_compat.DataCell = ef.TextBoxCell(10)
-        col_compat.Width = 120
-        self.grid_review.Columns.Add(col_compat)
-
-        # Wire Double-Click to open LayerConfigDialog
-        try:
-            self.grid_review.CellDoubleClick += self._on_grid_cell_double_click
-        except Exception:
-            pass
-
-        # Wire Right-Click Context Menu for quick layer category/strategy editing
-        try:
-            ctx_menu = ef.ContextMenu()
-
-            item_edit = ef.ButtonMenuItem()
-            item_edit.Text = "Edit Layer Category, Strategy & Material (Double-Click)..."
-            item_edit.Click += self._on_ctx_edit_layer
-            ctx_menu.Items.Add(item_edit)
-
-            ctx_menu.Items.Add(ef.SeparatorMenuItem())
-
-            cat_menu = ef.ButtonMenuItem()
-            cat_menu.Text = "Quick Set Category"
-            for q_cat in STANDARD_REVIT_CATEGORIES:
-                q_item = ef.ButtonMenuItem()
-                q_item.Text = q_cat
-                def _make_cat_cb(c_name):
-                    return lambda s, e: self._quick_set_category(c_name)
-                q_item.Click += _make_cat_cb(q_cat)
-                cat_menu.Items.Add(q_item)
-            ctx_menu.Items.Add(cat_menu)
-
-            strat_menu = ef.ButtonMenuItem()
-            strat_menu.Text = "Quick Set Strategy"
-            for q_strat in ["DirectShape", "FreeFormFamily", "ParametricFamily", "RepetitiveFamily", "AdaptiveComponent", "FloorNative", "WallByCurve", "RoofNative", "CeilingNative", "Toposolid"]:
-                q_item = ef.ButtonMenuItem()
-                q_item.Text = q_strat
-                def _make_strat_cb(s_name):
-                    return lambda s, e: self._quick_set_strategy(s_name)
-                q_item.Click += _make_strat_cb(q_strat)
-                strat_menu.Items.Add(q_item)
-            ctx_menu.Items.Add(strat_menu)
-
-            mat_menu = ef.ButtonMenuItem()
-            mat_menu.Text = "Quick Set Material"
-            avail_mats = self.revit_materials if self.revit_materials else ["<Auto from Rhino>"]
-            for q_mat in avail_mats[:40]:
-                q_item = ef.ButtonMenuItem()
-                q_item.Text = q_mat
-                def _make_mat_cb(m_name):
-                    return lambda s, e: self._quick_set_material(m_name)
-                q_item.Click += _make_mat_cb(q_mat)
-                mat_menu.Items.Add(q_item)
-            ctx_menu.Items.Add(mat_menu)
-
-            self.grid_review.ContextMenu = ctx_menu
-        except Exception:
-            pass
-
-        layout.Add(self.grid_review, True, True)
-        return layout
-
-    # =========================================================================
-    # TAB 3: PREVIEW
-    # =========================================================================
-    def _build_preview_tab(self):
-        layout = ef.DynamicLayout()
-        layout.Padding = ed.Padding(20)
-        layout.Spacing = ed.Size(12, 12)
-
-        title = ef.Label()
-        title.Text = "PRE-EXECUTION TRANSACTION DASHBOARD"
-        self._set_bold_font(title, 12)
-        layout.Add(title)
-
-        self.lbl_prev_create = ef.Label()
-        self.lbl_prev_create.Text = "Elements to CREATE: 0"
-        self._set_bold_font(self.lbl_prev_create, 11)
-
-        self.lbl_prev_update = ef.Label()
-        self.lbl_prev_update.Text = "Elements to UPDATE (Modified Geometry): 0"
-
-        self.lbl_prev_skip = ef.Label()
-        self.lbl_prev_skip.Text = "Elements to SKIP (Unchanged Geometry): 0"
-
-        self.lbl_prev_review = ef.Label()
-        self.lbl_prev_review.Text = "Elements in REVIEW QUEUE (<60% Confidence): 0"
-
-        self.lbl_prev_missing = ef.Label()
-        self.lbl_prev_missing.Text = "Revit Elements MISSING in Rhino (Preserved): 0"
-
-        self.lbl_prev_compat = ef.Label()
-        self.lbl_prev_compat.Text = "Rule Compatibility: 0 Compatible | 0 Mixed | 0 Blocked"
-
-        layout.Add(self.lbl_prev_create)
-        layout.Add(self.lbl_prev_update)
-        layout.Add(self.lbl_prev_skip)
-        layout.Add(self.lbl_prev_review)
-        layout.Add(self.lbl_prev_missing)
-        layout.Add(self.lbl_prev_compat)
-        layout.Add(self._create_separator())
-
-        notice = ef.Label()
-        notice.Text = "Notice: Clicking 'Proceed to Transfer' will switch to the Execute tab and initiate Revit API Transactions with automated warning suppression."
-        notice.TextColor = ed.Colors.Gray
-        layout.Add(notice)
-
-        btn_go_execute = ef.Button()
-        btn_go_execute.Text = "Proceed to Transfer ->"
-        self._set_bold_font(btn_go_execute, 11)
-        btn_go_execute.Size = ed.Size(220, 36)
-
-        def _on_nav_to_execute(s, e):
-            self.tabs.SelectedIndex = 3
-
-        btn_go_execute.Click += _on_nav_to_execute
-        layout.Add(btn_go_execute)
-
-        return layout
-
-    # =========================================================================
-    # TAB 4: EXECUTE
-    # =========================================================================
-    def _build_execute_tab(self):
-        layout = ef.DynamicLayout()
-        layout.Padding = ed.Padding(20)
-        layout.Spacing = ed.Size(12, 12)
-
-        title = ef.Label()
-        title.Text = "REVIT TRANSACTION EXECUTION PIPELINE"
-        self._set_bold_font(title, 12)
-        layout.Add(title)
-
-        self.btn_execute = ef.Button()
-        self.btn_execute.Text = "Execute R2R Transfer"
-        self._set_bold_font(self.btn_execute, 12)
-        self.btn_execute.Size = ed.Size(260, 40)
+        # Step 3 Events
         self.btn_execute.Click += self._on_execute_transfer
-        layout.Add(self.btn_execute)
+        self.btn_isolate.Click += self._on_isolate_element
+        self.btn_export_html.Click += self._on_export_html
+        self.btn_export_csv.Click += self._on_export_csv
 
-        self.progress_bar = ef.ProgressBar()
-        self.progress_bar.MinValue = 0
-        self.progress_bar.MaxValue = 100
-        self.progress_bar.Value = 0
-        layout.Add(self.progress_bar)
+        # Footer Events
+        self.btn_back.Click += self._on_wizard_back
+        self.btn_next.Click += self._on_wizard_next
 
-        self.lbl_exec_status = ef.Label()
-        self.lbl_exec_status.Text = "Status: Idle. Click 'Execute R2R Transfer' to begin."
-        layout.Add(self.lbl_exec_status)
+        self._update_header_settings_chip()
+        self._update_preview_kpis()
+        self._set_active_step(0)
 
-        lbl_log_header = ef.Label()
-        lbl_log_header.Text = "Live Execution Log:"
-        layout.Add(lbl_log_header)
+    def _populate_inspector_materials(self):
+        if not WPF_AVAILABLE or getattr(self, "cb_insp_material", None) is None:
+            return
+        self.cb_insp_material.Items.Clear()
+        for m in (self.revit_materials or ["<Auto from Rhino>"]):
+            self.cb_insp_material.Items.Add(m)
 
-        self.txt_exec_log = ef.TextArea()
-        self.txt_exec_log.ReadOnly = True
-        self.txt_exec_log.Size = ed.Size(-1, 260)
-        layout.Add(self.txt_exec_log, True, True)
+    def _update_header_settings_chip(self):
+        if not WPF_AVAILABLE or getattr(self, "lbl_header_settings", None) is None:
+            return
+        unit_short = _UNIT_SCALE_SHORT[self.unit_scale_idx] if 0 <= self.unit_scale_idx < len(_UNIT_SCALE_SHORT) else "Auto Units"
+        policy_lbl = "Strict Skip" if self.mixed_policy == "StrictSkip" else "Auto-Fallback"
+        self.lbl_header_settings.Text = "{} · {} · {}".format(self.global_mode, unit_short, policy_lbl)
+        self.btn_project_params.Content = "Project Params ({})...".format(len(self.project_custom_parameters))
 
-        return layout
+    def _set_active_step(self, step_idx):
+        self.active_step = max(0, min(2, int(step_idx)))
+        if not WPF_AVAILABLE:
+            return
 
-    # =========================================================================
-    # TAB 5: VALIDATE & QA REPORT
-    # =========================================================================
-    def _build_validate_tab(self):
-        layout = ef.DynamicLayout()
-        layout.Padding = ed.Padding(10)
-        layout.Spacing = ed.Size(8, 8)
+        panels = [self.panel_step_scan, self.panel_step_configure, self.panel_step_run]
+        pills = [self.btn_step_scan, self.btn_step_configure, self.btn_step_run]
+        active_bg = _make_brush("#0066CC")
+        active_fg = _make_brush("#FFFFFF")
+        active_bd = _make_brush("#0052A3")
+        idle_bg = _make_brush("#F1F5F9")
+        idle_fg = _make_brush("#475569")
+        idle_bd = _make_brush("#DCE2EA")
 
-        # Title & Summary
-        top_layout = ef.DynamicLayout()
-        top_layout.Spacing = ed.Size(10, 5)
+        for i, p in enumerate(panels):
+            p.Visibility = sw.Visibility.Visible if i == self.active_step else sw.Visibility.Collapsed
+        for i, b in enumerate(pills):
+            is_act = (i == self.active_step)
+            b.Background = active_bg if is_act else idle_bg
+            b.Foreground = active_fg if is_act else idle_fg
+            b.BorderBrush = active_bd if is_act else idle_bd
 
-        lbl_val_title = ef.Label()
-        lbl_val_title.Text = "DUAL-STATUS BIM & GRAPHICS VALIDATION AUDIT"
-        self._set_bold_font(lbl_val_title, 12)
+        self.btn_back.Visibility = sw.Visibility.Collapsed if self.active_step == 0 else sw.Visibility.Visible
+        if self.active_step == 0:
+            self.btn_next.Content = "Next: Configure ->"
+        elif self.active_step == 1:
+            self.btn_next.Content = "Proceed to Transfer ->"
+        else:
+            self.btn_next.Content = "Close"
 
-        btn_isolate = ef.Button()
-        btn_isolate.Text = "Select / Isolate in Revit"
-        btn_isolate.ToolTip = "Highlight and isolate selected element in the active Revit view"
-        btn_isolate.Click += self._on_isolate_element
+        self._update_preview_kpis()
 
-        btn_export_html = ef.Button()
-        btn_export_html.Text = "Export QA Report (HTML)"
-        btn_export_html.Click += self._on_export_html
+    def _on_wizard_back(self, s, e):
+        if self.active_step > 0:
+            self._set_active_step(self.active_step - 1)
 
-        btn_export_csv = ef.Button()
-        btn_export_csv.Text = "Export QA Report (CSV)"
-        btn_export_csv.Click += self._on_export_csv
-
-        top_layout.BeginHorizontal()
-        top_layout.Add(lbl_val_title, True, False)
-        top_layout.Add(btn_isolate)
-        top_layout.Add(btn_export_html)
-        top_layout.Add(btn_export_csv)
-        top_layout.EndHorizontal()
-
-        layout.Add(top_layout)
-
-        # Validation GridView
-        self.grid_validate = ef.GridView()
-        self.grid_validate.ShowHeader = True
-
-        col_defs = [
-            ("Revit ID", 75),
-            ("Rhino GUID", 110),
-            ("Layer", 140),
-            ("Category", 110),
-            ("Strategy", 100),
-            ("Area (m²)", 85),
-            ("Volume (m³)", 90),
-            ("Material Takeoff", 150),
-            ("BIM Status", 85),
-            ("Graphics Status", 105),
-            ("Overall Status", 110),
-            ("Plan", 65),
-            ("Section", 65),
-            ("Issues / Recommendations", 200)
-        ]
-
-        for idx, (header, width) in enumerate(col_defs):
-            col = ef.GridColumn()
-            col.HeaderText = header
-            col.DataCell = ef.TextBoxCell(idx)
-            col.Width = width
-            self.grid_validate.Columns.Add(col)
-
-        layout.Add(self.grid_validate, True, True)
-        return layout
+    def _on_wizard_next(self, s, e):
+        if self.active_step < 2:
+            self._set_active_step(self.active_step + 1)
+        else:
+            self.Close(True)
 
     # =========================================================================
-    # EVENT HANDLERS & LOGIC
+    # STEP 1: SCAN HANDLERS
     # =========================================================================
     def _on_scan_clicked(self, sender, e):
-        """Executes full scan of active Rhino document and updates UI with re-entrancy protection."""
-        if hasattr(self, "btn_scan") and self.btn_scan:
-            self.btn_scan.Enabled = False
-            self.btn_scan.Text = "Scanning In Progress..."
+        """Executes full scan of active Rhino document and moves cleanly to Step 2."""
+        self.btn_scan.IsEnabled = False
+        self.btn_scan.Content = "Scanning..."
+        self.lbl_global_status.Text = "Step 1/4: Scanning Rhino document objects..."
+        _pump_wpf_events()
         try:
-            self.lbl_global_status.Text = "Step 1/4: Scanning Rhino document objects..."
-
-            # Query Revit Levels if doc is available
             revit_levels = []
             if REVIT_AVAILABLE and self.revit_doc:
                 try:
@@ -1822,21 +1384,10 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                     print("[R2R Scan] Level query notice: {}".format(ex_lvl))
 
                 self.revit_materials = self._get_project_materials()
-                if hasattr(self, "dd_mat_override") and self.dd_mat_override:
-                    try:
-                        curr_sel = self.dd_mat_override.SelectedValue
-                        self.dd_mat_override.Items.Clear()
-                        for m in self.revit_materials:
-                            self.dd_mat_override.Items.Add(m)
-                        if curr_sel and curr_sel in self.revit_materials:
-                            self.dd_mat_override.SelectedValue = curr_sel
-                        else:
-                            self.dd_mat_override.SelectedIndex = 0
-                    except Exception:
-                        pass
+                self._populate_inspector_materials()
 
-            include_hidden = self.chk_include_hidden.Checked or False
-            include_locked = self.chk_include_locked.Checked or False
+            include_hidden = bool(self.chk_include_hidden.IsChecked)
+            include_locked = bool(self.chk_include_locked.IsChecked)
 
             self.scanned_objects = self.scanner.scan_all(
                 include_hidden=include_hidden,
@@ -1845,57 +1396,50 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             )
 
             pf = self.scanner.preflight
-            self.lbl_kpi_total.Text = "Total Scanned Objects: {}".format(pf.total_scanned)
-            self.lbl_kpi_units.Text = "Rhino Units: {} (Scale to m: {:.4f})".format(pf.rhino_unit_system, pf.unit_scale_to_meters)
-            self.lbl_kpi_origin.Text = "Far From Origin (>16km): {}".format(pf.total_far_from_origin)
-            self.lbl_kpi_duplicates.Text = "Duplicates Detected: {}".format(pf.total_duplicates)
-            self.lbl_kpi_loops.Text = "Non-Closed Boundary Loops: {}".format(pf.total_non_closed_loops)
+            self.lbl_kpi_total.Text = str(pf.total_scanned)
+            self.lbl_kpi_units.Text = "{} (x{:.4f}m)".format(pf.rhino_unit_system, pf.unit_scale_to_meters)
+            self.lbl_kpi_origin.Text = "Far (>16km): {}".format(pf.total_far_from_origin)
+            self.lbl_kpi_duplicates.Text = "Duplicates: {}".format(pf.total_duplicates)
+            self.lbl_kpi_loops.Text = str(pf.total_non_closed_loops)
 
-            # Warnings display
             warn_text = []
             if pf.total_duplicates > 0:
                 warn_text.append("[WARNING] Found {} duplicate objects with identical geometry hashes.".format(pf.total_duplicates))
             if pf.total_far_from_origin > 0:
                 warn_text.append(
                     "[CAUTION] Found {} object(s) beyond Revit's 16km origin limit. "
-                    "'Move Model to Revit Origin (0,0,0)' is active and will center the model at (0,0,0) in Revit.".format(pf.total_far_from_origin)
+                    "'Move Model to Revit Origin (0,0,0)' will center the model cleanly in Revit.".format(pf.total_far_from_origin)
                 )
             if pf.total_non_closed_loops > 0:
-                warn_text.append("[NOTICE] Found {} objects with non-closed boundary loops.".format(pf.total_non_closed_loops))
-            if getattr(pf, 'warnings', None):
+                warn_text.append("[NOTICE] Found {} object(s) with non-closed boundary loops.".format(pf.total_non_closed_loops))
+            if getattr(pf, "warnings", None):
                 warn_text.extend(pf.warnings)
 
             self.txt_scan_warnings.Text = "\n".join(warn_text) if warn_text else "Preflight clean. No geometric anomalies detected."
 
-            # Step 2: Run Classification & Sync Evaluation
             self.lbl_global_status.Text = "Step 2/4: Classifying elements and matching sync records..."
             self._run_classification_and_sync()
 
-            # Step 3: Populate Review Grid
-            self.lbl_global_status.Text = "Step 3/4: Populating review grid..."
+            self.lbl_global_status.Text = "Step 3/4: Populating layer list..."
             self._populate_review_grid()
-
-            # Step 4: Update Preview Tab KPIs
-            self.lbl_global_status.Text = "Step 4/4: Calculating preview KPIs..."
             self._update_preview_kpis()
 
-            self.lbl_global_status.Text = "Scan complete. {} objects ready for review.".format(len(self.scanned_objects))
-            self.tabs.SelectedIndex = 1  # Move to Review tab
-
+            self.lbl_global_status.Text = "Scan complete. {} objects across {} layer(s) ready to configure.".format(
+                len(self.scanned_objects), len(self.layer_rows)
+            )
+            self._set_active_step(1)
         except Exception as ex:
-            import traceback
             err_details = traceback.format_exc()
             print("[R2R Scan Error]:\n" + err_details)
-            self.lbl_global_status.Text = "Scan error: {}. See warnings tab for details.".format(ex)
+            self.lbl_global_status.Text = "Scan error: {}".format(ex)
             self.txt_scan_warnings.Text = "Scan Exception:\n{}\n{}".format(ex, err_details)
         finally:
-            if hasattr(self, "btn_scan") and self.btn_scan:
-                self.btn_scan.Enabled = True
-                self.btn_scan.Text = "Scan Active Rhino Document"
+            self.btn_scan.IsEnabled = True
+            self.btn_scan.Content = "Scan Active Rhino Document"
 
     def _run_classification_and_sync(self):
         """Runs classifier and sync engine on scanned objects."""
-        self.classifier.mode = str(self.dd_global_mode.SelectedValue)
+        self.classifier.mode = self.global_mode
         self.classifier.prepare_repetition_cache(self.scanned_objects)
 
         self.classifications = {}
@@ -1903,103 +1447,14 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             res = self.classifier.classify_object(obj, self.scanned_objects)
             self.classifications[obj.rhino_guid] = res
 
-        # Apply Persistent Profile
         self.profile_mgr.apply_profile(self.scanned_objects, self.classifications)
-
-        # Sync Engine Evaluation
         self.sync_evaluations, self.missing_in_rhino = self.sync_engine.evaluate_sync_states(self.scanned_objects)
 
-    def _sync_grid_check_states(self):
-        """Syncs checkbox state, category, strategy, and material changes made in Eto GridView back to LayerRowItem objects."""
-        try:
-            ds = self.grid_review.DataStore
-            if ds is not None and self.filtered_layer_rows:
-                changed = False
-                for idx, row_data in enumerate(ds):
-                    if idx < len(self.filtered_layer_rows) and len(row_data) > 0:
-                        row = self.filtered_layer_rows[idx]
-                        row.checked = bool(row_data[0])
-
-                        # If category was modified in-place (column 3)
-                        if len(row_data) > 3:
-                            new_cat = str(row_data[3] or "").strip()
-                            if new_cat and new_cat != row.inferred_category:
-                                row.update_category(new_cat)
-                                for obj in row.objects:
-                                    c = self.classifications.get(obj.rhino_guid)
-                                    if c:
-                                        c.inferred_category = row.inferred_category
-                                        c.revit_category_name = row.revit_type
-                                        c.proposed_strategy = row.proposed_strategy
-                                        c.confidence_score = row.confidence_score
-                                        c.confidence_tier = row.confidence_tier
-                                if len(row_data) > 4:
-                                    row_data[4] = row.proposed_strategy
-                                if len(row_data) > 5:
-                                    row_data[5] = row.revit_type
-                                if len(row_data) > 7:
-                                    row_data[7] = "{:.0f}%".format(row.confidence_score)
-                                if len(row_data) > 10:
-                                    row_data[10] = getattr(row, "compatibility_tag", "OK")
-                                changed = True
-
-                        # If strategy was modified in-place (column 4)
-                        if len(row_data) > 4:
-                            new_strat = str(row_data[4] or "").strip()
-                            if new_strat and new_strat != row.proposed_strategy:
-                                row.update_strategy(new_strat)
-                                for obj in row.objects:
-                                    c = self.classifications.get(obj.rhino_guid)
-                                    if c:
-                                        c.proposed_strategy = row.proposed_strategy
-                                        c.confidence_score = row.confidence_score
-                                        c.confidence_tier = row.confidence_tier
-                                if len(row_data) > 7:
-                                    row_data[7] = "{:.0f}%".format(row.confidence_score)
-                                if len(row_data) > 10:
-                                    row_data[10] = getattr(row, "compatibility_tag", "OK")
-                                changed = True
-
-                        # If material was modified in-place (column 6)
-                        if len(row_data) > 6:
-                            new_mat = str(row_data[6] or "").strip()
-                            if new_mat and new_mat != getattr(row, "selected_material", "<Auto from Rhino>"):
-                                row.update_material(new_mat)
-                                changed = True
-                if changed:
-                    self._update_preview_kpis()
-        except Exception:
-            pass
-
-    def _on_review_cell_edited(self, sender, e):
-        """Updates LayerRowItem checked state and preview KPIs when user edits a cell."""
-        self._sync_grid_check_states()
-        self._update_preview_kpis()
-
-    def _on_tab_changed(self, sender, e):
-        """Syncs grid checkbox selections whenever user switches tabs."""
-        self._sync_grid_check_states()
-        self._update_preview_kpis()
-
-    def _on_select_all_layers(self, sender, e):
-        """Checks all currently visible layers in the review grid."""
-        self._sync_grid_check_states()
-        for r in self.filtered_layer_rows:
-            r.checked = True
-        self._refresh_review_grid_datastore()
-        self._update_preview_kpis()
-
-    def _on_deselect_all_layers(self, sender, e):
-        """Unchecks all currently visible layers in the review grid."""
-        self._sync_grid_check_states()
-        for r in self.filtered_layer_rows:
-            r.checked = False
-        self._refresh_review_grid_datastore()
-        self._update_preview_kpis()
-
+    # =========================================================================
+    # STEP 2: LAYER LIST + MASTER-DETAIL INSPECTOR
+    # =========================================================================
     def _build_rows_for_layer(self, layer_name, objs, auto_split=False, inherit_material="<Auto from Rhino>", inherit_params=None):
         """Creates one LayerRowItem (if homogeneous or unsplit) or multiple virtual sub-rows if split."""
-        created_rows = []
         matched_rule = self.profile_mgr.find_matching_rule(layer_name) if getattr(self, "profile_mgr", None) else None
         base_mat = inherit_material
         if (not base_mat or base_mat == "<Auto from Rhino>") and matched_rule and getattr(matched_rule, "material", "ByLayer") not in ("ByLayer", "<Auto from Rhino>", ""):
@@ -2024,6 +1479,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             )
             return [row]
 
+        created_rows = []
         for v_name, bk, sub_objs in splits:
             rep_obj = sub_objs[0]
             c_res = self.classifications.get(rep_obj.rhino_guid)
@@ -2046,7 +1502,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         return created_rows
 
     def _populate_review_grid(self):
-        """Groups scanned objects by layer (auto-splitting mixed layers when enabled) and populates DataGridView."""
+        """Groups scanned objects by layer (auto-splitting mixed layers when enabled) and binds DataGrid."""
         layer_groups = {}
         layer_order = []
         for obj in self.scanned_objects:
@@ -2057,16 +1513,13 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             layer_groups[lp].append(obj)
 
         auto_split = bool(
-            hasattr(self, "chk_auto_split_mixed") and self.chk_auto_split_mixed and self.chk_auto_split_mixed.Checked
+            WPF_AVAILABLE and getattr(self, "chk_auto_split_mixed", None) is not None and self.chk_auto_split_mixed.IsChecked
         )
 
         self.layer_rows = []
         for lp in layer_order:
-            objs = layer_groups[lp]
-            self.layer_rows.extend(self._build_rows_for_layer(lp, objs, auto_split=auto_split))
+            self.layer_rows.extend(self._build_rows_for_layer(lp, layer_groups[lp], auto_split=auto_split))
 
-        # If no layers met the high auto-ready threshold (e.g., generic Rhino layer names
-        # like 'Default' or 'Layer 01'), pre-check all compatible non-curve layers
         if self.layer_rows and not any(r.checked for r in self.layer_rows):
             for r in self.layer_rows:
                 if getattr(r, "bucket_key", "") != "CURVE":
@@ -2074,9 +1527,364 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         self._apply_review_filters(None, None)
 
+    def _row_to_clr_dict(self, r):
+        line1, line2 = r.target_summary_lines()
+        s_key = r.status_style_key()
+        if s_key == "OK":
+            bg, fg = "#DCFCE7", "#166534"
+        elif s_key == "MIXED":
+            bg, fg = "#FEF3C7", "#92400E"
+        else:
+            bg, fg = "#FEE2E2", "#991B1B"
+
+        return _make_clr_dict({
+            "Checked": bool(r.checked),
+            "LayerName": r.layer_name,
+            "PatternSub": "{} · {}".format(getattr(r, "pattern_tag", "Standard"), r.sync_state),
+            "CountText": str(r.object_count),
+            "TargetLine1": line1,
+            "TargetLine2": line2,
+            "StatusText": getattr(r, "compatibility_tag", "OK"),
+            "StatusBg": bg,
+            "StatusFg": fg,
+            "RowObj": r
+        })
+
+    def _get_selected_review_rows(self):
+        """Returns highlighted LayerRowItem objects from the WPF DataGrid."""
+        selected = []
+        if not WPF_AVAILABLE or getattr(self, "grid_review", None) is None:
+            return selected
+        try:
+            for item in self.grid_review.SelectedItems:
+                row_obj = item["RowObj"] if (hasattr(item, "ContainsKey") and item.ContainsKey("RowObj")) else None
+                if row_obj is not None:
+                    selected.append(row_obj)
+        except Exception:
+            pass
+        return selected
+
+    def _refresh_review_grid_datastore(self):
+        """Rebinds filtered_layer_rows to WPF grid_review while preserving row selection."""
+        if not WPF_AVAILABLE or getattr(self, "grid_review", None) is None:
+            return
+
+        prev_selected = set(id(r) for r in self._get_selected_review_rows())
+        self._refreshing_grid = True
+        self._restoring_selection = True
+        try:
+            clr_rows = [self._row_to_clr_dict(r) for r in self.filtered_layer_rows]
+            self.grid_review.ItemsSource = _make_clr_list(clr_rows)
+
+            if prev_selected and self.grid_review.Items.Count > 0:
+                self.grid_review.SelectedItems.Clear()
+                for item in self.grid_review.Items:
+                    ro = item["RowObj"] if (hasattr(item, "ContainsKey") and item.ContainsKey("RowObj")) else None
+                    if ro is not None and id(ro) in prev_selected:
+                        self.grid_review.SelectedItems.Add(item)
+        finally:
+            self._restoring_selection = False
+            self._refreshing_grid = False
+
+        self._refresh_inspector()
+
+    def _on_grid_checkbox_toggled(self, sender, e):
+        """Syncs 1-click row CheckBox changes back to LayerRowItem immediately."""
+        if self._refreshing_grid:
+            return
+        try:
+            src = e.OriginalSource
+            if src is None:
+                return
+            dc = getattr(src, "DataContext", None)
+            if dc is not None and hasattr(dc, "ContainsKey") and dc.ContainsKey("RowObj"):
+                row_obj = dc["RowObj"]
+                row_obj.checked = bool(src.IsChecked)
+                self._update_preview_kpis()
+                if not self._updating_inspector:
+                    sel = self._get_selected_review_rows()
+                    if len(sel) == 1 and sel[0] is row_obj:
+                        self._updating_inspector = True
+                        try:
+                            self.chk_insp_include.IsChecked = bool(row_obj.checked)
+                        finally:
+                            self._updating_inspector = False
+        except Exception:
+            pass
+
+    def _on_review_selection_changed(self, s, e):
+        if self._restoring_selection:
+            return
+        self._refresh_inspector()
+
+    def _apply_review_filters(self, sender, e):
+        """Filters the left Layer List based on search text, status, and category."""
+        search_txt = ""
+        status_filter = "All Layers"
+        cat_filter = "All Categories"
+        if WPF_AVAILABLE and getattr(self, "txt_search", None) is not None:
+            search_txt = str(self.txt_search.Text or "").strip().lower()
+            status_filter = _get_combo_value(self.dd_status_filter, "All Layers")
+            cat_filter = _get_combo_value(self.dd_cat_filter, "All Categories")
+
+        self.filtered_layer_rows = []
+        for r in self.layer_rows:
+            if search_txt and search_txt not in r.layer_name.lower():
+                continue
+            if status_filter == "Compatible (OK)" and r.status_style_key() != "OK":
+                continue
+            if status_filter == "Mixed Geometry" and not (r.rule_eval and r.rule_eval.is_mixed_geometry):
+                continue
+            if status_filter == "Blocked / Low Conf" and (r.status_style_key() == "OK" and r.confidence_score >= 60.0):
+                continue
+            if status_filter == "Modified / New" and r.sync_state == "SKIP_UNCHANGED":
+                continue
+            if cat_filter != "All Categories":
+                if cat_filter == "Family":
+                    if r.proposed_strategy not in ("ParametricFamily", "FreeFormFamily", "FamilyInstance", "RepetitiveFamily", "AdaptiveComponent"):
+                        continue
+                elif cat_filter == "DirectShape":
+                    if r.proposed_strategy != "DirectShape":
+                        continue
+                elif cat_filter.lower() not in (r.inferred_category or "").lower():
+                    continue
+            self.filtered_layer_rows.append(r)
+
+        self._refresh_review_grid_datastore()
+
+    def _on_select_all_layers(self, s, e):
+        for r in self.filtered_layer_rows:
+            r.checked = True
+        self._refresh_review_grid_datastore()
+        self._update_preview_kpis()
+
+    def _on_deselect_all_layers(self, s, e):
+        for r in self.filtered_layer_rows:
+            r.checked = False
+        self._refresh_review_grid_datastore()
+        self._update_preview_kpis()
+
+    # =========================================================================
+    # RIGHT-SIDE LIVE INSPECTOR (SINGLE & BULK EDIT)
+    # =========================================================================
+    def _refresh_inspector(self):
+        if not WPF_AVAILABLE or getattr(self, "panel_inspector_body", None) is None:
+            return
+
+        selected = self._get_selected_review_rows()
+        if not selected:
+            self.panel_inspector_empty.Visibility = sw.Visibility.Visible
+            self.panel_inspector_body.Visibility = sw.Visibility.Collapsed
+            return
+
+        self.panel_inspector_empty.Visibility = sw.Visibility.Collapsed
+        self.panel_inspector_body.Visibility = sw.Visibility.Visible
+
+        self._updating_inspector = True
+        try:
+            if len(selected) == 1:
+                row = selected[0]
+                self.lbl_insp_title.Text = row.layer_name
+                self.lbl_insp_subtitle.Text = "{} object(s) · Sync: {} · Conf: {:.0f}%".format(
+                    row.object_count, row.sync_state, row.confidence_score
+                )
+                self.lbl_insp_geom.Text = row.geometry_breakdown_text()
+                is_mixed_geom = bool(row.rule_eval and row.rule_eval.is_mixed_geometry)
+                self.btn_insp_split.Visibility = sw.Visibility.Visible if is_mixed_geom else sw.Visibility.Collapsed
+
+                self.chk_insp_include.IsChecked = bool(row.checked)
+                _set_combo_value(self.cb_insp_category, row.inferred_category or "Generic Models")
+                _set_combo_value(self.cb_insp_strategy, strategy_to_friendly(row.proposed_strategy))
+                _set_combo_value(self.cb_insp_material, getattr(row, "selected_material", "<Auto from Rhino>"))
+
+                layer_cp = len(getattr(row, "custom_parameters", []) or [])
+                proj_cp = len(self.project_custom_parameters or [])
+                self.lbl_insp_params_summary.Text = "{} layer-specific + {} project-wide parameter(s)".format(layer_cp, proj_cp)
+                self.btn_insp_params.IsEnabled = True
+                self.panel_insp_bulk.Visibility = sw.Visibility.Collapsed
+
+                self._update_inspector_rule_banner(row.objects, row.proposed_strategy)
+            else:
+                total_objs = sum(r.object_count for r in selected)
+                self.lbl_insp_title.Text = "Bulk Edit ({} layers selected)".format(len(selected))
+                self.lbl_insp_subtitle.Text = "{} total objects · Edit fields below and click Apply".format(total_objs)
+                all_objs = []
+                for r in selected:
+                    all_objs.extend(r.objects)
+                ev_bulk = StrategyRuleEngine.evaluate_layer(all_objs, selected[0].proposed_strategy)
+                self.lbl_insp_geom.Text = "{} buckets across selection".format(len(ev_bulk.bucket_counts))
+                has_any_mixed = any(r.rule_eval and r.rule_eval.is_mixed_geometry for r in selected)
+                self.btn_insp_split.Visibility = sw.Visibility.Visible if has_any_mixed else sw.Visibility.Collapsed
+
+                self.chk_insp_include.IsChecked = all(r.checked for r in selected)
+                _set_combo_value(self.cb_insp_category, selected[0].inferred_category or "Generic Models")
+                _set_combo_value(self.cb_insp_strategy, strategy_to_friendly(selected[0].proposed_strategy))
+                _set_combo_value(self.cb_insp_material, getattr(selected[0], "selected_material", "<Auto from Rhino>"))
+
+                self.lbl_insp_params_summary.Text = "Configure per-layer parameters by selecting a single layer."
+                self.btn_insp_params.IsEnabled = False
+                self.panel_insp_bulk.Visibility = sw.Visibility.Visible
+
+                self._update_inspector_rule_banner(all_objs, selected[0].proposed_strategy)
+        finally:
+            self._updating_inspector = False
+
+    def _update_inspector_rule_banner(self, objects, strategy_key):
+        sel_strat = friendly_to_strategy(strategy_key)
+        meta = STRATEGY_METADATA.get(sel_strat, {})
+        self.lbl_insp_editability.Text = "Revit Editability: {}".format(meta.get("editability", sel_strat))
+
+        eval_res = StrategyRuleEngine.evaluate_layer(objects, sel_strat)
+        self._last_recommended = eval_res.recommended_strategy or "DirectShape"
+        self.lbl_insp_compat.Text = eval_res.summary_text()
+
+        if eval_res.status == "COMPATIBLE":
+            self.border_insp_compat.Background = _make_brush("#F0FDF4")
+            self.border_insp_compat.BorderBrush = _make_brush("#BBF7D0")
+            self.lbl_insp_compat.Foreground = _make_brush("#166534")
+            self.btn_insp_use_rec.Visibility = sw.Visibility.Collapsed
+        elif eval_res.status == "PARTIAL_MIXED":
+            self.border_insp_compat.Background = _make_brush("#FFFBEB")
+            self.border_insp_compat.BorderBrush = _make_brush("#FDE68A")
+            self.lbl_insp_compat.Foreground = _make_brush("#92400E")
+            self.btn_insp_use_rec.Content = "Switch to {}".format(strategy_to_short(self._last_recommended))
+            self.btn_insp_use_rec.Visibility = sw.Visibility.Visible
+        else:
+            self.border_insp_compat.Background = _make_brush("#FEF2F2")
+            self.border_insp_compat.BorderBrush = _make_brush("#FECACA")
+            self.lbl_insp_compat.Foreground = _make_brush("#991B1B")
+            self.btn_insp_use_rec.Content = "Switch to {}".format(strategy_to_short(self._last_recommended))
+            self.btn_insp_use_rec.Visibility = sw.Visibility.Visible
+
+    def _apply_row_changes(self, row, cat_name, strat_key, mat_name, is_checked):
+        """Applies updated Category, Strategy, Material, and Checked state to a LayerRowItem & its objects."""
+        row.checked = bool(is_checked)
+        row.update_category(cat_name)
+        row.update_strategy(strat_key)
+        row.update_material(mat_name)
+        for obj in row.objects:
+            c = getattr(obj, "classification", None) or self.classifications.get(getattr(obj, "rhino_guid", ""))
+            if c:
+                c.inferred_category = row.inferred_category
+                c.revit_category_name = row.revit_type
+                c.proposed_strategy = row.proposed_strategy
+                c.confidence_score = row.confidence_score
+                c.confidence_tier = row.confidence_tier
+
+    def _on_insp_single_changed(self, s, e):
+        """Live-applies Category, Material, or Include changes when exactly 1 layer is selected."""
+        if self._updating_inspector:
+            return
+        selected = self._get_selected_review_rows()
+        if len(selected) != 1:
+            return
+        row = selected[0]
+        cat_name = _get_combo_value(self.cb_insp_category, row.inferred_category)
+        strat_key = friendly_to_strategy(_get_combo_value(self.cb_insp_strategy, row.proposed_strategy))
+        mat_name = _get_combo_value(self.cb_insp_material, row.selected_material)
+        is_checked = bool(self.chk_insp_include.IsChecked)
+
+        if (cat_name == row.inferred_category and strat_key == row.proposed_strategy
+                and mat_name == row.selected_material and is_checked == bool(row.checked)):
+            return
+
+        self._apply_row_changes(row, cat_name, strat_key, mat_name, is_checked)
+        self._refresh_review_grid_datastore()
+        self._update_preview_kpis()
+        self.lbl_global_status.Text = "Updated '{}' -> {} ({}), Mat: {}".format(
+            row.layer_name, row.inferred_category, strategy_to_short(row.proposed_strategy), row.selected_material
+        )
+
+    def _on_insp_strategy_changed(self, s, e):
+        if self._updating_inspector:
+            return
+        selected = self._get_selected_review_rows()
+        if len(selected) == 1:
+            self._on_insp_single_changed(s, e)
+        elif len(selected) > 1:
+            all_objs = []
+            for r in selected:
+                all_objs.extend(r.objects)
+            self._update_inspector_rule_banner(all_objs, _get_combo_value(self.cb_insp_strategy, "DirectShape"))
+
+    def _on_insp_use_recommended(self, s, e):
+        rec = self._last_recommended or "DirectShape"
+        _set_combo_value(self.cb_insp_strategy, strategy_to_friendly(rec))
+        selected = self._get_selected_review_rows()
+        if len(selected) > 1:
+            self._on_insp_bulk_apply(None, None)
+
+    def _on_insp_bulk_apply(self, s, e):
+        """Applies Inspector settings across all highlighted rows in Bulk Edit mode."""
+        selected = self._get_selected_review_rows()
+        if not selected:
+            return
+        cat_name = _get_combo_value(self.cb_insp_category, "Generic Models")
+        strat_key = friendly_to_strategy(_get_combo_value(self.cb_insp_strategy, "DirectShape"))
+        mat_name = _get_combo_value(self.cb_insp_material, "<Auto from Rhino>")
+        is_checked = bool(self.chk_insp_include.IsChecked)
+
+        for r in selected:
+            self._apply_row_changes(r, cat_name, strat_key, mat_name, is_checked)
+
+        self._refresh_review_grid_datastore()
+        self._update_preview_kpis()
+        self.lbl_global_status.Text = "Bulk updated {} layer(s) -> {} ({}), Mat: {}.".format(
+            len(selected), cat_name, strategy_to_short(strat_key), mat_name
+        )
+
+    def _on_insp_edit_params(self, s, e):
+        selected = self._get_selected_review_rows()
+        if len(selected) != 1:
+            return
+        row = selected[0]
+        dlg = CustomParametersDialog(
+            custom_parameters=getattr(row, "custom_parameters", []),
+            strategy=row.proposed_strategy,
+            scope_label=row.layer_name,
+            parent=self.window
+        )
+        if dlg.ShowModal(self.window):
+            row.custom_parameters = list(dlg.result_parameters)
+            self._refresh_review_grid_datastore()
+            self.lbl_global_status.Text = "Saved {} custom parameter(s) on '{}'.".format(
+                len(row.custom_parameters), row.layer_name
+            )
+
+    def _on_insp_split_clicked(self, s, e):
+        """Splits only the currently selected mixed layer(s) into homogeneous sub-rows."""
+        selected_ids = set(id(r) for r in self._get_selected_review_rows())
+        if not selected_ids:
+            self._on_split_mixed_layers(s, e)
+            return
+
+        new_rows = []
+        split_cnt = 0
+        for r in self.layer_rows:
+            if id(r) in selected_ids and r.rule_eval and r.rule_eval.is_mixed_geometry:
+                subs = self._build_rows_for_layer(
+                    r.source_layer_path or r.layer_name,
+                    r.objects,
+                    auto_split=True,
+                    inherit_material=getattr(r, "selected_material", "<Auto from Rhino>"),
+                    inherit_params=getattr(r, "custom_parameters", [])
+                )
+                if len(subs) > 1:
+                    split_cnt += 1
+                new_rows.extend(subs)
+            else:
+                new_rows.append(r)
+
+        if split_cnt > 0:
+            self.layer_rows = new_rows
+            self._apply_review_filters(None, None)
+            self._update_preview_kpis()
+            self.lbl_global_status.Text = "Split {} selected mixed layer(s) into homogeneous sub-rows.".format(split_cnt)
+        else:
+            self.lbl_global_status.Text = "Selected layer already contains homogeneous geometry."
+
     def _on_split_mixed_layers(self, sender, e):
-        """Manually splits all mixed-geometry LayerRowItem rows into clean homogeneous virtual sub-rows."""
-        self._sync_grid_check_states()
+        """Splits all mixed-geometry LayerRowItem rows into clean homogeneous virtual sub-rows."""
         new_rows = []
         split_count = 0
         for r in self.layer_rows:
@@ -2098,11 +1906,30 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             self.layer_rows = new_rows
             self._apply_review_filters(None, None)
             self._update_preview_kpis()
-            self.lbl_global_status.Text = "Split {} mixed-geometry layer(s) into {} total homogeneous row(s).".format(
+            self.lbl_global_status.Text = "Split {} mixed-geometry layer(s) into {} homogeneous row(s).".format(
                 split_count, len(self.layer_rows)
             )
         else:
             self.lbl_global_status.Text = "All visible layers already contain homogeneous geometry."
+
+    def _on_grid_cell_double_click(self, sender, e):
+        """Optional double-click shortcut opening LayerConfigDialog (ignores CheckBox clicks)."""
+        try:
+            orig = getattr(e, "OriginalSource", None)
+            if orig is not None and isinstance(orig, swcp.ToggleButton):
+                return
+            sel = self._get_selected_review_rows()
+            if len(sel) == 1:
+                row = sel[0]
+                dlg = LayerConfigDialog(row, parent=self.window, revit_materials=self.revit_materials)
+                if dlg.ShowModal(self.window):
+                    self._refresh_review_grid_datastore()
+                    self._update_preview_kpis()
+                    self.lbl_global_status.Text = "Updated '{}' -> {}, {}, Mat: {}".format(
+                        row.layer_name, row.inferred_category, strategy_to_short(row.proposed_strategy), row.selected_material
+                    )
+        except Exception as ex:
+            self.lbl_global_status.Text = "Layer config notice: {}".format(ex)
 
     def _on_edit_project_params(self, sender, e):
         """Opens CustomParametersDialog for project-wide deterministic data parameters."""
@@ -2110,350 +1937,63 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             custom_parameters=self.project_custom_parameters,
             strategy="DirectShape",
             scope_label="All Layers (Project-Wide)",
-            parent=self
+            parent=self.window
         )
-        if dlg.ShowModal(self):
+        if dlg.ShowModal(self.window):
             self.project_custom_parameters = list(dlg.result_parameters)
-            if hasattr(self, "btn_project_params") and self.btn_project_params:
-                self.btn_project_params.Text = "Custom Params (Project: {})...".format(len(self.project_custom_parameters))
+            self._update_header_settings_chip()
+            self._refresh_inspector()
             self.lbl_global_status.Text = "Updated {} project-wide deterministic parameter(s).".format(
                 len(self.project_custom_parameters)
             )
 
-    def _refresh_review_grid_datastore(self):
-        """Rebinds filtered_layer_rows to self.grid_review.DataStore."""
-        grid_data = []
-        for r in self.filtered_layer_rows:
-            grid_data.append([
-                r.checked,
-                r.layer_name,
-                str(r.object_count),
-                r.inferred_category,
-                r.proposed_strategy,
-                r.revit_type,
-                getattr(r, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>",
-                "{:.0f}%".format(r.confidence_score),
-                r.sync_state,
-                getattr(r, "pattern_tag", "-"),
-                getattr(r, "compatibility_tag", "OK")
-            ])
+    def _on_open_settings(self, sender, e):
+        """Opens the unified Transfer Settings & AI Config modal."""
+        state = {
+            "global_mode": self.global_mode,
+            "unit_scale_idx": self.unit_scale_idx,
+            "mixed_policy": self.mixed_policy,
+            "rep_threshold_idx": self.rep_threshold_idx,
+            "move_to_origin": self.move_to_origin,
+            "generate_bua": self.generate_bua
+        }
+        dlg = SettingsDialog(self.ai_interpreter, dashboard_state=state, parent=self.window)
+        if dlg.ShowModal(self.window):
+            old_mode = self.global_mode
+            old_rep = self.rep_threshold_idx
 
-        self.grid_review.DataStore = grid_data
+            self.global_mode = dlg.state["global_mode"]
+            self.unit_scale_idx = dlg.state["unit_scale_idx"]
+            self.mixed_policy = dlg.state["mixed_policy"]
+            self.rep_threshold_idx = dlg.state["rep_threshold_idx"]
+            self.move_to_origin = dlg.state["move_to_origin"]
+            self.generate_bua = dlg.state["generate_bua"]
 
-    def _apply_review_filters(self, sender, e):
-        """Filters the review DataGridView based on search text, category, confidence and sync state."""
-        if sender is not None:
-            self._sync_grid_check_states()
+            thresh_map = [2, 3, 5, 10]
+            self.classifier.repetition_threshold = thresh_map[self.rep_threshold_idx] if 0 <= self.rep_threshold_idx < len(thresh_map) else 3
 
-        search_txt = (self.txt_search.Text or "").strip().lower()
-        cat_filter = str(self.dd_cat_filter.SelectedValue or "All Categories")
-        conf_filter = str(self.dd_conf_filter.SelectedValue or "All Tiers")
-        sync_filter = str(self.dd_sync_filter.SelectedValue or "All States")
-
-        self.filtered_layer_rows = []
-        for r in self.layer_rows:
-            if search_txt and search_txt not in r.layer_name.lower():
-                continue
-            if cat_filter != "All Categories" and r.inferred_category != cat_filter:
-                continue
-            if conf_filter.startswith("Auto") and r.confidence_tier != "AUTO_READY":
-                continue
-            if conf_filter.startswith("Needs") and r.confidence_tier != "SUGGESTED_NEEDS_APPROVAL":
-                continue
-            if conf_filter.startswith("Manual") and r.confidence_tier != "MANUAL_OR_EXCLUDED":
-                continue
-            if sync_filter != "All States" and r.sync_state != sync_filter:
-                continue
-
-            self.filtered_layer_rows.append(r)
-
-        self._refresh_review_grid_datastore()
-
-    def _update_preview_kpis(self):
-        """Calculates exact execution counts and rule compatibility gates for the Preview tab."""
-        cnt_create = 0
-        cnt_update = 0
-        cnt_skip = 0
-        cnt_review = 0
-        cnt_compat = 0
-        cnt_mixed = 0
-        cnt_blocked = 0
-
-        for r in self.layer_rows:
-            if not r.checked:
-                continue
-            if r.sync_state == "CREATE":
-                cnt_create += r.object_count
-            elif r.sync_state == "UPDATE_MODIFIED":
-                cnt_update += r.object_count
-            elif r.sync_state == "SKIP_UNCHANGED":
-                cnt_skip += r.object_count
-
-            if r.confidence_score < 60.0:
-                cnt_review += r.object_count
-
-            ev = getattr(r, "rule_eval", None)
-            if ev:
-                if ev.status == "COMPATIBLE":
-                    cnt_compat += 1
-                elif ev.status == "PARTIAL_MIXED":
-                    cnt_mixed += 1
-                else:
-                    cnt_blocked += 1
-
-        self.lbl_prev_create.Text = "Elements to CREATE: {}".format(cnt_create)
-        self.lbl_prev_update.Text = "Elements to UPDATE (Modified Geometry): {}".format(cnt_update)
-        self.lbl_prev_skip.Text = "Elements to SKIP (Unchanged Geometry): {}".format(cnt_skip)
-        self.lbl_prev_review.Text = "Elements in REVIEW QUEUE (<60% Confidence): {}".format(cnt_review)
-        self.lbl_prev_missing.Text = "Revit Elements MISSING in Rhino (Preserved): {}".format(len(self.missing_in_rhino))
-        if hasattr(self, "lbl_prev_compat") and self.lbl_prev_compat:
-            self.lbl_prev_compat.Text = "Rule Compatibility (Checked Layers): {} Compatible | {} Mixed (Auto-Fallback/Split) | {} Blocked".format(
-                cnt_compat, cnt_mixed, cnt_blocked
-            )
-
-    def _get_target_review_rows(self):
-        """Returns the list of LayerRowItem objects to target for overrides.
-        Prioritizes user-highlighted rows in GridView; falls back to checked rows.
-        """
-        self._sync_grid_check_states()
-        target_rows = []
-        is_highlighted_selection = False
-
-        try:
-            sel_rows = []
-            if hasattr(self.grid_review, "SelectedRows") and self.grid_review.SelectedRows:
-                sel_rows = [int(i) for i in self.grid_review.SelectedRows]
-            elif hasattr(self.grid_review, "SelectedRow") and self.grid_review.SelectedRow >= 0:
-                sel_rows = [int(self.grid_review.SelectedRow)]
-
-            for idx in sel_rows:
-                if 0 <= idx < len(self.filtered_layer_rows):
-                    target_rows.append(self.filtered_layer_rows[idx])
-
-            if target_rows:
-                is_highlighted_selection = True
-        except Exception:
-            pass
-
-        if not target_rows:
-            target_rows = [r for r in self.filtered_layer_rows if r.checked]
-            if not target_rows:
-                target_rows = [r for r in self.layer_rows if r.checked]
-
-        return target_rows, is_highlighted_selection
-
-    def _on_apply_strategy_override(self, sender, e):
-        """Overrides proposed strategy for highlighted row(s) or all checked layers."""
-        selected_strat = str(self.dd_strat_override.SelectedValue or "").strip()
-        if not selected_strat:
-            return
-
-        targets, is_highlighted = self._get_target_review_rows()
-        if not targets:
-            self.lbl_global_status.Text = "Please select or check at least one layer to apply strategy override."
-            return
-
-        for r in targets:
-            r.update_strategy(selected_strat)
-            for obj in r.objects:
-                c = self.classifications.get(obj.rhino_guid)
-                if c:
-                    c.proposed_strategy = r.proposed_strategy
-                    c.confidence_score = r.confidence_score
-                    c.confidence_tier = r.confidence_tier
-
-        self._refresh_review_grid_datastore()
-        self._update_preview_kpis()
-        target_desc = "highlighted layer(s)" if is_highlighted else "checked layer(s)"
-        self.lbl_global_status.Text = "Applied strategy override '{}' to {} {}. Confidence updated dynamically.".format(
-            selected_strat, len(targets), target_desc
-        )
-
-    def _on_apply_category_override(self, sender, e):
-        """Overrides Revit category for highlighted row(s) or all checked layers."""
-        selected_cat = str(self.dd_cat_override.SelectedValue or "").strip()
-        if not selected_cat:
-            return
-
-        targets, is_highlighted = self._get_target_review_rows()
-        if not targets:
-            self.lbl_global_status.Text = "Please select or check at least one layer to apply category override."
-            return
-
-        for r in targets:
-            r.update_category(selected_cat)
-            for obj in r.objects:
-                c = self.classifications.get(obj.rhino_guid)
-                if c:
-                    c.inferred_category = r.inferred_category
-                    c.revit_category_name = r.revit_type
-                    c.proposed_strategy = r.proposed_strategy
-                    c.confidence_score = r.confidence_score
-                    c.confidence_tier = r.confidence_tier
-
-        self._refresh_review_grid_datastore()
-        self._update_preview_kpis()
-        target_desc = "highlighted layer(s)" if is_highlighted else "checked layer(s)"
-        self.lbl_global_status.Text = "Applied category override '{}' to {} {}. Target Revit type: {}.".format(
-            selected_cat, len(targets), target_desc, targets[0].revit_type if targets else ""
-        )
-
-    def _on_apply_material_override(self, sender, e):
-        """Overrides Revit material for highlighted row(s) or all checked layers."""
-        selected_mat = str(self.dd_mat_override.SelectedValue or "<Auto from Rhino>").strip()
-        if not selected_mat:
-            selected_mat = "<Auto from Rhino>"
-
-        targets, is_highlighted = self._get_target_review_rows()
-        if not targets:
-            self.lbl_global_status.Text = "Please select or check at least one layer to apply material override."
-            return
-
-        for r in targets:
-            r.update_material(selected_mat)
-
-        self._refresh_review_grid_datastore()
-        target_desc = "highlighted layer(s)" if is_highlighted else "checked layer(s)"
-        self.lbl_global_status.Text = "Applied material override '{}' to {} {}.".format(
-            selected_mat, len(targets), target_desc
-        )
-
-    def _on_grid_cell_double_click(self, sender, e):
-        """Opens LayerConfigDialog modal when user double-clicks any row in the review grid."""
-        try:
-            sel_idx = -1
-            if hasattr(e, "Row") and e.Row >= 0:
-                sel_idx = int(e.Row)
-            elif hasattr(self.grid_review, "SelectedRow") and self.grid_review.SelectedRow >= 0:
-                sel_idx = int(self.grid_review.SelectedRow)
-
-            if 0 <= sel_idx < len(self.filtered_layer_rows):
-                row = self.filtered_layer_rows[sel_idx]
-                dlg = LayerConfigDialog(row, parent=self, revit_materials=self.revit_materials)
-                if dlg.ShowModal(self):
-                    self._refresh_review_grid_datastore()
-                    self._update_preview_kpis()
-                    self.lbl_global_status.Text = "Updated layer '{}' -> Category: {}, Strategy: {}, Material: {} (Confidence: {:.0f}%).".format(
-                        row.layer_name, row.inferred_category, row.proposed_strategy, getattr(row, "selected_material", "<Auto from Rhino>"), row.confidence_score
-                    )
-        except Exception as ex:
-            self.lbl_global_status.Text = "Layer config dialog notice: {}".format(ex)
-
-    def _on_ctx_edit_layer(self, sender, e):
-        """Context menu handler to edit selected layer."""
-        self._on_grid_cell_double_click(sender, e)
-
-    def _quick_set_material(self, mat_name):
-        """Quick sets Revit material for selected or checked rows via context menu."""
-        targets, is_highlighted = self._get_target_review_rows()
-        if not targets:
-            self.lbl_global_status.Text = "No layers selected to set material."
-            return
-
-        for r in targets:
-            r.update_material(mat_name)
-
-        self._refresh_review_grid_datastore()
-        desc = "highlighted" if is_highlighted else "checked"
-        self.lbl_global_status.Text = "Set material '{}' on {} {} layer(s).".format(mat_name, len(targets), desc)
-
-    def _quick_set_category(self, cat_name):
-        """Quick sets category for selected or checked rows via context menu."""
-        targets, is_highlighted = self._get_target_review_rows()
-        if not targets:
-            self.lbl_global_status.Text = "No layers selected to set category."
-            return
-
-        for r in targets:
-            r.update_category(cat_name)
-            for obj in r.objects:
-                c = self.classifications.get(obj.rhino_guid)
-                if c:
-                    c.inferred_category = r.inferred_category
-                    c.revit_category_name = r.revit_type
-                    c.proposed_strategy = r.proposed_strategy
-                    c.confidence_score = r.confidence_score
-                    c.confidence_tier = r.confidence_tier
-
-        self._refresh_review_grid_datastore()
-        self._update_preview_kpis()
-        desc = "highlighted" if is_highlighted else "checked"
-        self.lbl_global_status.Text = "Set category '{}' on {} {} layer(s).".format(cat_name, len(targets), desc)
-
-    def _quick_set_strategy(self, strat_name):
-        """Quick sets strategy for selected or checked rows via context menu."""
-        targets, is_highlighted = self._get_target_review_rows()
-        if not targets:
-            self.lbl_global_status.Text = "No layers selected to set strategy."
-            return
-
-        for r in targets:
-            r.update_strategy(strat_name)
-            for obj in r.objects:
-                c = self.classifications.get(obj.rhino_guid)
-                if c:
-                    c.proposed_strategy = r.proposed_strategy
-                    c.confidence_score = r.confidence_score
-                    c.confidence_tier = r.confidence_tier
-
-        self._refresh_review_grid_datastore()
-        self._update_preview_kpis()
-        desc = "highlighted" if is_highlighted else "checked"
-        self.lbl_global_status.Text = "Set strategy '{}' on {} {} layer(s).".format(strat_name, len(targets), desc)
-
-    def _on_repetition_threshold_changed(self, sender, e):
-        """Updates classifier repetition threshold and re-evaluates review grid."""
-        try:
-            val_str = str(self.dd_rep_threshold.SelectedValue or "3")
-            thresh = 3
-            if "2" in val_str:
-                thresh = 2
-            elif "5" in val_str:
-                thresh = 5
-            elif "10" in val_str:
-                thresh = 10
-            self.classifier.repetition_threshold = thresh
-            if self.scanned_objects:
+            self._update_header_settings_chip()
+            if self.scanned_objects and (old_mode != self.global_mode or old_rep != self.rep_threshold_idx):
                 self._run_classification_and_sync()
                 self._populate_review_grid()
                 self._update_preview_kpis()
-                self.lbl_global_status.Text = "Repetition grouping threshold set to >= {}.".format(thresh)
-        except Exception as ex:
-            self.lbl_global_status.Text = "Threshold update notice: {}".format(ex)
-
-    def _on_mode_changed(self, sender, e):
-        """Re-evaluates proposed strategies when global mode changes."""
-        self._run_classification_and_sync()
-        self._populate_review_grid()
-        self._update_preview_kpis()
-
-    def _on_open_ai_settings(self, sender, e):
-        """Opens the AI Model & API Key Configuration dialog."""
-        try:
-            dlg = AISettingsDialog(self.ai_interpreter)
-            if dlg.ShowModal(self):
-                prov = getattr(self.ai_interpreter, "provider", "OpenAI")
-                model = getattr(self.ai_interpreter, "model", "gpt-4o-mini")
-                has_key = bool(getattr(self.ai_interpreter, "api_key", ""))
-                key_tag = "Key Configured" if has_key else "Offline Heuristics"
-                self.lbl_global_status.Text = "AI configured: {} / {} [{}]".format(prov, model, key_tag)
-        except Exception as ex:
-            self.lbl_global_status.Text = "AI config dialog notice: {}".format(ex)
+            self.lbl_global_status.Text = "Settings saved ({}).".format(self.lbl_header_settings.Text)
 
     def _on_run_ai_assist(self, sender, e):
         """Uses AI semantic interpreter to resolve ambiguous architectural layers."""
-        self._sync_grid_check_states()
         prov = getattr(self.ai_interpreter, "provider", "OpenAI")
         model = getattr(self.ai_interpreter, "model", "gpt-4o-mini")
         has_key = bool(getattr(self.ai_interpreter, "api_key", ""))
         mode_str = "{} ({})".format(prov, model) if has_key else "Offline Heuristic Lexicon"
-        self.lbl_global_status.Text = "Running AI semantic interpretation [{} on layers]...".format(mode_str)
+        self.lbl_global_status.Text = "Running AI semantic interpretation [{}]...".format(mode_str)
+        _pump_wpf_events()
+
         boosted = 0
         llm_count = 0
         for r in self.layer_rows:
             interp = self.ai_interpreter.interpret(r.layer_name)
             if interp and interp.confidence_boost > 0:
-                r.inferred_category = interp.inferred_category
+                r.update_category(interp.inferred_category)
                 r.revit_type = interp.suggested_revit_type
                 r.confidence_score = min(100.0, r.confidence_score + (interp.confidence_boost * 20.0))
                 r.checked = True
@@ -2464,35 +2004,30 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
         self._refresh_review_grid_datastore()
         self._update_preview_kpis()
         if llm_count > 0:
-            self.lbl_global_status.Text = "AI Semantic Assist refined {} layer(s) ({} via live LLM, {} via lexicon).".format(
+            self.lbl_global_status.Text = "AI Assist refined {} layer(s) ({} live LLM, {} lexicon).".format(
                 boosted, llm_count, boosted - llm_count
             )
         else:
-            self.lbl_global_status.Text = "AI Semantic Assist refined {} layer classifications (Lexicon Heuristics).".format(boosted)
+            self.lbl_global_status.Text = "AI Assist refined {} layer(s) (Offline Heuristic Lexicon).".format(boosted)
 
     def _on_load_profile(self, sender, e):
         """Loads transfer profile from disk."""
         try:
             if self.profile_mgr.load():
                 self.project_custom_parameters = list(getattr(self.profile_mgr, "project_custom_parameters", []) or [])
-                if hasattr(self, "btn_project_params") and self.btn_project_params:
-                    self.btn_project_params.Text = "Custom Params (Project: {})...".format(len(self.project_custom_parameters))
+                self._update_header_settings_chip()
                 self._run_classification_and_sync()
                 self._populate_review_grid()
                 self._update_preview_kpis()
-                self.lbl_global_status.Text = "Transfer Profile loaded successfully from disk."
+                self.lbl_global_status.Text = "Transfer Profile loaded successfully."
             else:
-                self.lbl_global_status.Text = "No saved transfer profile found on disk."
+                self.lbl_global_status.Text = "No saved Transfer_Profile.json found on disk."
         except Exception as ex:
             self.lbl_global_status.Text = "Profile load notice: {}".format(ex)
 
     def _on_save_profile(self, sender, e):
         """Saves current layer table configurations as persistent profile rules."""
         try:
-            self._sync_grid_check_states()
-            mixed_policy = "StrictSkip" if (
-                hasattr(self, "dd_mixed_policy") and str(self.dd_mixed_policy.SelectedValue or "") == "Strict Skip"
-            ) else "AutoFallback"
             saved_count = 0
             for r in self.layer_rows:
                 if r.checked:
@@ -2504,78 +2039,113 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                         material=getattr(r, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>",
                         room_bounding=True,
                         custom_parameters=getattr(r, "custom_parameters", []),
-                        mixed_policy=mixed_policy
+                        mixed_policy=self.mixed_policy
                     )
                     self.profile_mgr.add_rule(rule)
                     saved_count += 1
 
             self.profile_mgr.project_custom_parameters = list(self.project_custom_parameters or [])
             self.profile_mgr.save()
-            self.lbl_global_status.Text = "Saved {} active layer mapping rule(s) to Transfer_Profile.json.".format(saved_count)
+            self.lbl_global_status.Text = "Saved {} layer mapping rule(s) to Transfer_Profile.json.".format(saved_count)
         except Exception as ex:
             self.lbl_global_status.Text = "Profile save notice: {}".format(ex)
 
-    def _get_active_unit_scale(self):
-        """Returns the chosen unit scale factor for converting Rhino units to Revit feet."""
-        try:
-            if hasattr(self, "dd_unit_scale") and self.dd_unit_scale is not None:
-                idx = self.dd_unit_scale.SelectedIndex
-                if idx == 1:
-                    return 1.0 / 304.8  # Millimeters to feet (0.003280839895013123)
-                elif idx == 2:
-                    return 3.280839895013123  # Meters to feet
-                elif idx == 3:
-                    return 1.0 / 30.48  # Centimeters to feet
-                elif idx == 4:
-                    return 1.0 / 12.0  # Inches to feet
-                elif idx == 5:
-                    return 1.0  # Feet to feet
-        except Exception:
-            pass
-        return None  # Auto-Detect from active Rhino document unit system
+    # =========================================================================
+    # KPIs & UNIT SCALE
+    # =========================================================================
+    def _update_preview_kpis(self):
+        """Updates footer summary chip & Step 3 readiness banner."""
+        cnt_create = 0
+        cnt_update = 0
+        cnt_skip = 0
+        cnt_mixed = 0
+        cnt_blocked = 0
+        checked_layers = 0
+        checked_objs = 0
 
+        for r in self.layer_rows:
+            if not r.checked:
+                continue
+            checked_layers += 1
+            checked_objs += r.object_count
+            if r.sync_state == "CREATE":
+                cnt_create += r.object_count
+            elif r.sync_state == "UPDATE_MODIFIED":
+                cnt_update += r.object_count
+            elif r.sync_state == "SKIP_UNCHANGED":
+                cnt_skip += r.object_count
+
+            ev = getattr(r, "rule_eval", None)
+            if ev:
+                if ev.status == "PARTIAL_MIXED":
+                    cnt_mixed += 1
+                elif ev.status == "INCOMPATIBLE":
+                    cnt_blocked += 1
+
+        if not WPF_AVAILABLE:
+            return
+        if getattr(self, "lbl_footer_summary", None) is not None:
+            self.lbl_footer_summary.Text = "{} layer(s) · {} obj(s) checked".format(checked_layers, checked_objs)
+        if getattr(self, "lbl_run_summary", None) is not None:
+            self.lbl_run_summary.Text = (
+                "Ready: {} Create  |  {} Update  |  {} Unchanged Skip  |  {} Mixed Layer(s)  |  {} Blocked"
+            ).format(cnt_create, cnt_update, cnt_skip, cnt_mixed, cnt_blocked)
+
+    def _get_active_unit_scale(self):
+        """Returns chosen unit scale factor for converting Rhino units to Revit feet."""
+        idx = int(getattr(self, "unit_scale_idx", 0))
+        if idx == 1:
+            return 1.0 / 304.8
+        elif idx == 2:
+            return 3.280839895013123
+        elif idx == 3:
+            return 1.0 / 30.48
+        elif idx == 4:
+            return 1.0 / 12.0
+        elif idx == 5:
+            return 1.0
+        return None
+
+    # =========================================================================
+    # STEP 3: EXECUTE TRANSFER & QA VALIDATION
+    # =========================================================================
     def _on_execute_transfer(self, sender, e):
         """Executes full transfer with Revit TransactionGroup and Failure handling."""
-        self._sync_grid_check_states()
-
         if not REVIT_AVAILABLE or not self.revit_doc:
-            self.lbl_global_status.Text = "Transfer aborted: Revit document is not available. Please run inside Rhino.Inside.Revit."
-            self.lbl_exec_status.Text = "Transfer aborted: Revit document is not available."
+            self.lbl_global_status.Text = "Transfer aborted: Revit document is not available. Run inside Rhino.Inside.Revit."
+            if WPF_AVAILABLE and getattr(self, "lbl_exec_status", None) is not None:
+                self.lbl_exec_status.Text = "Transfer aborted: Revit document is not available."
             return
 
-        self.btn_execute.Enabled = False
+        self.btn_execute.IsEnabled = False
         self.lbl_exec_status.Text = "Starting transfer transaction..."
         chosen_scale = self._get_active_unit_scale()
-        scale_label = str(self.dd_unit_scale.SelectedValue) if hasattr(self, "dd_unit_scale") else "Auto-Detect"
-        self.txt_exec_log.Text = "Beginning R2R Transfer TransactionGroup (Unit Scale: {})...\n".format(scale_label)
-
-        move_to_origin = self.chk_move_to_origin.Checked if hasattr(self, "chk_move_to_origin") else True
-        mixed_policy = "StrictSkip" if (
-            hasattr(self, "dd_mixed_policy") and str(self.dd_mixed_policy.SelectedValue or "") == "Strict Skip"
-        ) else "AutoFallback"
+        scale_label = _UNIT_SCALE_SHORT[self.unit_scale_idx] if 0 <= self.unit_scale_idx < len(_UNIT_SCALE_SHORT) else "Auto-Detect"
+        self.txt_exec_log.Text = "Beginning R2R Transfer TransactionGroup (Units: {}, Policy: {})...\n".format(
+            scale_label, self.mixed_policy
+        )
+        _pump_wpf_events()
 
         router = ConversionRouter(
             self.revit_doc,
-            global_mode=str(self.dd_global_mode.SelectedValue),
-            generate_bua=self.chk_gen_bua.Checked or False,
+            global_mode=self.global_mode,
+            generate_bua=self.generate_bua,
             unit_scale=chosen_scale,
-            move_to_origin=move_to_origin,
-            mixed_policy=mixed_policy,
+            move_to_origin=self.move_to_origin,
+            mixed_policy=self.mixed_policy,
             project_custom_parameters=self.project_custom_parameters
         )
 
-        # Collect objects to transfer
         approved_objs = []
         for r in self.layer_rows:
             if r.checked:
                 approved_objs.extend(r.objects)
 
-        # Auto-align model to Revit (0,0,0)
-        shift = router.calculate_and_set_origin_shift(approved_objs, force_center=move_to_origin)
+        shift = router.calculate_and_set_origin_shift(approved_objs, force_center=self.move_to_origin)
         if router.has_origin_shift:
             self.txt_exec_log.Text += "Origin Alignment Active: Model moved to Revit (0,0,0).\n"
-            self.txt_exec_log.Text += "  Rhino Shift: ΔX = {:.2f}, ΔY = {:.2f}, ΔZ = {:.2f}\n".format(shift[0], shift[1], shift[2])
-            self.txt_exec_log.Text += "  Revit Offset: ΔX = {:.2f}ft, ΔY = {:.2f}ft, ΔZ = {:.2f}ft\n\n".format(
+            self.txt_exec_log.Text += "  Rhino Shift: dX={:.2f}, dY={:.2f}, dZ={:.2f}\n".format(shift[0], shift[1], shift[2])
+            self.txt_exec_log.Text += "  Revit Offset: dX={:.2f}ft, dY={:.2f}ft, dZ={:.2f}ft\n\n".format(
                 router.origin_shift_feet[0], router.origin_shift_feet[1], router.origin_shift_feet[2]
             )
 
@@ -2589,7 +2159,6 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 layer_to_row[getattr(o, "layer_name", "")] = r
                 layer_to_row[getattr(o, "layer_full_path", "")] = r
 
-        # Collect all custom parameters (Project-Wide + Active Layer Rules)
         all_custom_params = list(self.project_custom_parameters or [])
         seen_cp = set(cp.name.lower() for cp in all_custom_params if getattr(cp, "name", ""))
         for r in self.layer_rows:
@@ -2600,7 +2169,6 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                         seen_cp.add(cname.lower())
                         all_custom_params.append(cp)
 
-        # Pre-generate UTF-16 LE BOM shared parameters file so Phase 1 .rfa families receive ExternalDefinitions
         try:
             router.prepare_shared_parameter_file(custom_parameters=all_custom_params)
         except Exception as ex_sp_prep:
@@ -2608,8 +2176,8 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         total = len(approved_objs)
         if total == 0:
-            self.txt_exec_log.Text += "No objects approved for transfer. Please scan and check layers in Review tab.\n"
-            self.btn_execute.Enabled = True
+            self.txt_exec_log.Text += "No objects approved for transfer. Check layers in Step 2 first.\n"
+            self.btn_execute.IsEnabled = True
             return
 
         created_cnt = 0
@@ -2619,15 +2187,14 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
         self.validation_rows = []
         self.qa_report = TransferQAReport()
-        self.qa_report.execution_mode = str(self.dd_global_mode.SelectedValue)
+        self.qa_report.execution_mode = self.global_mode
 
-        # =========================================================================
-        # PHASE 1: Pre-Transaction Native .rfa Family Generation & Loading
-        # Runs BEFORE the main project TransactionGroup / Transaction to avoid
-        # Revit API transaction nesting deadlocks with LoadFamily()
-        # =========================================================================
+        def _append_log(msg):
+            self.txt_exec_log.Text += str(msg) + "\n"
+
+        # Phase 1: Pre-Transaction Native .rfa Family Generation
         try:
-            self.txt_exec_log.Text += "Phase 1: Pre-generating and loading parametric/freeform/repetitive .rfa families...\n"
+            _append_log("Phase 1: Pre-generating and loading .rfa families...")
             profile_rules_map = {}
             for r in self.layer_rows:
                 if r.checked:
@@ -2640,7 +2207,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                         material=getattr(r, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>",
                         room_bounding=True,
                         custom_parameters=getattr(r, "custom_parameters", []),
-                        mixed_policy=mixed_policy
+                        mixed_policy=self.mixed_policy
                     )
                     profile_rules_map[r.layer_name] = rule_item
                     for o in getattr(r, "objects", []):
@@ -2653,7 +2220,7 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 approved_objs,
                 self.classifications,
                 profile_rules=profile_rules_map,
-                log_fn=lambda msg: setattr(self.txt_exec_log, "Text", self.txt_exec_log.Text + msg + "\n")
+                log_fn=_append_log
             )
             pregen_cnt = len(pregen_symbols) if pregen_symbols else 0
             fam_req_objs = [
@@ -2665,32 +2232,32 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 or (self.classifications.get(o.rhino_guid) and self.classifications.get(o.rhino_guid).proposed_strategy in ("ParametricFamily", "FreeFormFamily", "FamilyInstance", "RepetitiveFamily"))
             ]
             if pregen_cnt > 0:
-                self.txt_exec_log.Text += "Phase 1 Complete: {} native .rfa family definition(s) loaded into project.\n".format(pregen_cnt)
+                _append_log("Phase 1 Complete: {} native .rfa family definition(s) loaded.".format(pregen_cnt))
             elif len(fam_req_objs) > 0:
-                self.txt_exec_log.Text += "Phase 1 Notice: {} object(s) requested family instances, but could not form closed solids in .rfa templates. DirectShape fallback with volume/area parameters will be used in Phase 2.\n".format(len(fam_req_objs))
+                _append_log("Phase 1 Notice: {} object(s) could not form closed solids in .rfa; using fallback in Phase 2.".format(len(fam_req_objs)))
             else:
-                self.txt_exec_log.Text += "Phase 1 Complete: No family pre-generation required.\n"
+                _append_log("Phase 1 Complete: No family pre-generation required.")
         except Exception as ex:
-            self.txt_exec_log.Text += "Phase 1 Warning: Family pre-generation encountered: {}. Continuing with fallback pipelines.\n".format(ex)
+            _append_log("Phase 1 Warning: {}. Continuing with fallback pipelines.".format(ex))
 
         tg = DB.TransactionGroup(self.revit_doc, "R2R One-Click Transfer")
         tg.Start()
 
-        # Phase 2A: Ensure R2R Shared Parameters (Built-In + User Custom) are bound for Scheduling
+        # Phase 2A: Bind Shared Parameters
         try:
             with DB.Transaction(self.revit_doc, "Bind R2R Shared Parameters") as trans_sp:
                 trans_sp.Start()
                 sp_bound = router.ensure_shared_parameters_bound(
                     custom_parameters=all_custom_params,
-                    log_fn=lambda msg: setattr(self.txt_exec_log, "Text", self.txt_exec_log.Text + msg + "\n")
+                    log_fn=_append_log
                 )
                 trans_sp.Commit()
                 if sp_bound:
-                    self.txt_exec_log.Text += "Phase 2A: R2R Schedulable Shared Parameters successfully bound to model categories.\n"
+                    _append_log("Phase 2A: R2R Schedulable Shared Parameters bound to model categories.")
                 else:
-                    self.txt_exec_log.Text += "Phase 2A Notice: Shared Parameters could not be bound to all categories; falling back to direct shape properties and Built-In Comments.\n"
+                    _append_log("Phase 2A Notice: Some categories use Built-In parameters.")
         except Exception as ex_sp:
-            self.txt_exec_log.Text += "Phase 2A Notice: Shared Parameter registration notice: {}. Continuing...\n".format(ex_sp)
+            _append_log("Phase 2A Notice: {}. Continuing...".format(ex_sp))
 
         try:
             for idx, obj in enumerate(approved_objs):
@@ -2698,13 +2265,11 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                 c_res = self.classifications.get(guid)
                 s_ev = self.sync_evaluations.get(guid)
 
-                # Skip unchanged geometry
                 if s_ev and s_ev.sync_state == "SKIP_UNCHANGED":
                     skipped_cnt += 1
-                    self.txt_exec_log.Text += "[SKIP] Object {} (Hash match: {})\n".format(guid[:8], obj.geo_hash[:8])
+                    _append_log("[SKIP] Object {} (Hash match: {})".format(guid[:8], obj.geo_hash[:8]))
                     continue
 
-                # Run transaction per element for robust isolation
                 with DB.Transaction(self.revit_doc, "Transfer R2R Object") as trans:
                     if router.failures_preprocessor:
                         opts = trans.GetFailureHandlingOptions()
@@ -2713,7 +2278,6 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
 
                     trans.Start()
 
-                    # If updating modified geometry, delete previous Revit element before recreating
                     if s_ev and s_ev.sync_state == "UPDATE_MODIFIED" and s_ev.revit_element_id > 0:
                         try:
                             old_eid = self._make_elem_id(s_ev.revit_element_id)
@@ -2722,7 +2286,6 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                         except Exception:
                             pass
 
-                    # Resolve row rule GUID-first so virtual split sub-layers never overwrite each other
                     row = guid_to_row.get(guid) or layer_to_row.get(obj.layer_full_path) or layer_to_row.get(getattr(obj, "layer_name", ""))
                     layer_rule = None
                     if row:
@@ -2735,16 +2298,14 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                             material=getattr(row, "selected_material", "<Auto from Rhino>") or "<Auto from Rhino>",
                             room_bounding=True,
                             custom_parameters=getattr(row, "custom_parameters", []),
-                            mixed_policy=mixed_policy
+                            mixed_policy=self.mixed_policy
                         )
 
                     conv_res = router.convert_object(obj, c_res, profile_rule=layer_rule)
 
                     if conv_res.status == "SUCCESS" and conv_res.revit_element_id != -1:
-                        # Write ExtensibleStorage sync tracking
                         created_elem = self.revit_doc.GetElement(self._make_elem_id(conv_res.revit_element_id))
                         self.sync_engine.write_sync_record(created_elem, obj, conv_res.strategy_used)
-
                         trans.Commit()
 
                         if s_ev and s_ev.sync_state == "UPDATE_MODIFIED":
@@ -2759,21 +2320,21 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                             log_msg += " | Area: {:.2f} m², Vol: {:.2f} m³, Mat: {} ({:.2f} m³)".format(
                                 conv_res.area_sqm, conv_res.volume_cum, conv_res.primary_material, conv_res.material_volume_cum
                             )
-                        self.txt_exec_log.Text += log_msg + "\n"
+                        _append_log(log_msg)
                         if conv_res.warnings:
                             for w in conv_res.warnings:
-                                self.txt_exec_log.Text += "  [NOTICE] {}\n".format(w)
+                                _append_log("  [NOTICE] {}".format(w))
 
-                        # Dual-Status Validation
                         val_rep = self.validator.validate_element(conv_res.revit_element_id, guid)
-                        val_row = ValidationRowItem(val_rep, obj.layer_name, conv_res.strategy_used,
-                                                    area_sqm=conv_res.area_sqm,
-                                                    volume_cum=conv_res.volume_cum,
-                                                    material_name=conv_res.primary_material,
-                                                    material_vol=conv_res.material_volume_cum)
+                        val_row = ValidationRowItem(
+                            val_rep, obj.layer_name, conv_res.strategy_used,
+                            area_sqm=conv_res.area_sqm,
+                            volume_cum=conv_res.volume_cum,
+                            material_name=conv_res.primary_material,
+                            material_vol=conv_res.material_volume_cum
+                        )
                         self.validation_rows.append(val_row)
 
-                        # Log to QA report
                         self.qa_report.element_records.append({
                             "rhino_guid": guid,
                             "revit_element_id": conv_res.revit_element_id,
@@ -2800,82 +2361,83 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
                     elif conv_res.status == "SKIPPED":
                         trans.RollBack()
                         skipped_cnt += 1
-                        self.txt_exec_log.Text += "[SKIPPED BY RULE] {} ({}) -> {}\n".format(
+                        _append_log("[SKIPPED BY RULE] {} ({}) -> {}".format(
                             obj.layer_name, conv_res.strategy_used, conv_res.error_message
-                        )
-
+                        ))
                     else:
                         trans.RollBack()
                         failed_cnt += 1
-                        self.txt_exec_log.Text += "[ERROR] {} -> Failed: {}\n".format(obj.layer_name, conv_res.error_message)
+                        _append_log("[ERROR] {} -> Failed: {}".format(obj.layer_name, conv_res.error_message))
 
-                # Update progress
                 pct = int(((idx + 1) / float(total)) * 100)
                 self.progress_bar.Value = pct
+                self.lbl_exec_status.Text = "Processing {}/{} ({}%)...".format(idx + 1, total, pct)
+                _pump_wpf_events()
 
-            # Phase 2B: Generate / Update R2R Cave & Geometry Takeoff Schedule in Revit
+            # Phase 2B: Generate / Update Takeoff Schedule
             try:
                 with DB.Transaction(self.revit_doc, "Create R2R Takeoff Schedule") as trans_sc:
                     trans_sc.Start()
                     sched_view = router.create_r2r_takeoff_schedule()
                     trans_sc.Commit()
                     if sched_view:
-                        self.txt_exec_log.Text += "Phase 2B: Created/Updated Revit Schedule: '{}' in Project Browser.\n".format(getattr(sched_view, "Name", "Takeoff Schedule"))
+                        _append_log("Phase 2B: Updated Revit Schedule '{}'.".format(getattr(sched_view, "Name", "Takeoff Schedule")))
             except Exception as ex_sc:
-                self.txt_exec_log.Text += "Phase 2B Notice: Schedule creation notice: {}. Continuing...\n".format(ex_sc)
+                _append_log("Phase 2B Notice: {}. Continuing...".format(ex_sc))
 
             tg.Assimilate()
             self.lbl_exec_status.Text = "Transfer complete! Created: {}, Updated: {}, Skipped: {}, Errors: {}".format(
                 created_cnt, updated_cnt, skipped_cnt, failed_cnt
             )
+            self.lbl_global_status.Text = self.lbl_exec_status.Text
 
         except Exception as ex:
             tg.RollBack()
             self.lbl_exec_status.Text = "Transfer failed with error: {}".format(ex)
-            self.txt_exec_log.Text += "\nFATAL EXCEPTION: {}\n{}".format(ex, traceback.format_exc())
-
+            _append_log("\nFATAL EXCEPTION: {}\n{}".format(ex, traceback.format_exc()))
         finally:
-            self.btn_execute.Enabled = True
+            self.btn_execute.IsEnabled = True
 
-        # Populate Validation Tab
         self._populate_validation_grid()
-
-        # Update report stats
         self.qa_report.transfer_stats["created"] = created_cnt
         self.qa_report.transfer_stats["updated"] = updated_cnt
         self.qa_report.transfer_stats["skipped"] = skipped_cnt
         self.qa_report.transfer_stats["failed"] = failed_cnt
         self.qa_report.transfer_stats["missing_in_rhino"] = len(self.missing_in_rhino)
 
-        self.tabs.SelectedIndex = 4  # Move to Validation tab
-
     def _populate_validation_grid(self):
-        """Populates the Validate & QA Report GridView."""
-        grid_data = []
+        """Populates the Dual-Status Validation & QA Audit DataGrid."""
+        if not WPF_AVAILABLE or getattr(self, "grid_validate", None) is None:
+            return
+        rows = []
         for r in self.validation_rows:
-            grid_data.append([
-                r.revit_id,
-                r.rhino_guid[:8] + "...",
-                r.layer_name,
-                r.category,
-                r.strategy,
-                r.area,
-                r.volume,
-                r.material,
-                r.bim_status,
-                r.graphics_status,
-                r.overall_status,
-                r.plan,
-                r.section,
-                r.issues
-            ])
-        self.grid_validate.DataStore = grid_data
+            st = str(r.overall_status or "")
+            if st in ("COMPLETE", "PASS", "OK"):
+                bg, fg = "#DCFCE7", "#166534"
+            elif st in ("FAILED", "ERROR"):
+                bg, fg = "#FEE2E2", "#991B1B"
+            else:
+                bg, fg = "#FEF3C7", "#92400E"
+
+            rows.append(_make_clr_dict({
+                "RevitId": r.revit_id,
+                "Layer": r.layer_name,
+                "CategoryMode": "{} · {}".format(r.category, strategy_to_short(r.strategy)),
+                "Area": r.area,
+                "Volume": r.volume,
+                "Material": r.material,
+                "Status": st,
+                "StatusBg": bg,
+                "StatusFg": fg,
+                "ViewsIssues": "Plan:{} Sec:{} | {}".format(r.plan, r.section, r.issues)
+            }))
+        self.grid_validate.ItemsSource = _make_clr_list(rows)
 
     def _on_isolate_element(self, sender, e):
         """Isolates highlighted row's element in active Revit view."""
-        sel_idx = self.grid_validate.SelectedRow
+        sel_idx = int(self.grid_validate.SelectedIndex) if WPF_AVAILABLE else -1
         if sel_idx < 0 or sel_idx >= len(self.validation_rows):
-            self.lbl_global_status.Text = "Please select an element row in the table first."
+            self.lbl_global_status.Text = "Select an element row in the Validation table first."
             return
 
         row = self.validation_rows[sel_idx]
@@ -2884,40 +2446,28 @@ class TransferDashboardDialog(ef.Dialog[bool] if ETO_AVAILABLE else object):
             GraphicsValidator.isolate_element_in_view(self.revit_uidoc, elem_id)
             self.lbl_global_status.Text = "Element ID {} isolated in Revit view.".format(elem_id)
 
-    @staticmethod
-    def _add_file_filter(dlg, name, ext):
-        """Safely adds a FileFilter across IronPython 2.7 and CPython 3 (pythonnet)."""
-        try:
-            import System
-            arr = System.Array[System.String]([ext])
-            dlg.Filters.Add(ef.FileFilter(name, arr))
-        except Exception:
-            try:
-                dlg.Filters.Add(ef.FileFilter(name, ext))
-            except Exception:
-                pass
-
     def _on_export_html(self, sender, e):
         """Exports QA report as interactive HTML."""
-        dlg = ef.SaveFileDialog()
+        if not WPF_AVAILABLE:
+            return
+        dlg = mw32.SaveFileDialog()
         dlg.Title = "Save QA Report (HTML)"
-        self._add_file_filter(dlg, "HTML File (*.html)", ".html")
+        dlg.Filter = "HTML File (*.html)|*.html|All Files (*.*)|*.*"
         dlg.FileName = "R2R_QA_Report.html"
-
-        if dlg.ShowDialog(self) == ef.DialogResult.Ok:
+        if dlg.ShowDialog(self.window) == True:
             dest = dlg.FileName
             ReportExporter.export_html(self.qa_report, dest)
-            self.lbl_global_status.Text = "HTML QA Report generated at: {}".format(dest)
+            self.lbl_global_status.Text = "HTML QA Report saved: {}".format(dest)
 
     def _on_export_csv(self, sender, e):
         """Exports QA report as CSV."""
-        dlg = ef.SaveFileDialog()
+        if not WPF_AVAILABLE:
+            return
+        dlg = mw32.SaveFileDialog()
         dlg.Title = "Save QA Report (CSV)"
-        self._add_file_filter(dlg, "CSV File (*.csv)", ".csv")
+        dlg.Filter = "CSV File (*.csv)|*.csv|All Files (*.*)|*.*"
         dlg.FileName = "R2R_QA_Report.csv"
-
-        if dlg.ShowDialog(self) == ef.DialogResult.Ok:
+        if dlg.ShowDialog(self.window) == True:
             dest = dlg.FileName
             ReportExporter.export_csv(self.qa_report, dest)
-            self.lbl_global_status.Text = "CSV QA Report generated at: {}".format(dest)
-
+            self.lbl_global_status.Text = "CSV QA Report saved: {}".format(dest)
