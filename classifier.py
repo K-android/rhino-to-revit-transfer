@@ -466,8 +466,21 @@ class AecClassifier(object):
             return "CeilingNative"
 
         elif category == "Family":
+            prim = getattr(obj, "geometry_primitive_type", "Unknown") or "Unknown"
+            if prim == "FreeFormSolid":
+                return "RepetitiveFamily" if rep_count >= 2 else "FreeFormFamily"
+            if prim in ("OpenMesh", "OpenSurface"):
+                return "DirectShape"
             ref_cat = self._refine_family_category(obj)
-            if ref_cat in ("OST_Columns", "OST_StructuralColumns", "OST_Windows", "OST_Doors", "OST_Furniture"):
+            is_true_prismatic = prim in ("Box", "Cylinder", "ProfileExtrusion")
+            is_headless_mock_col = (
+                prim == "Unknown"
+                and getattr(obj, "is_closed", False)
+                and not getattr(obj, "raw_geometry", None)
+            )
+            if ref_cat in ("OST_Columns", "OST_StructuralColumns", "OST_Windows", "OST_Doors", "OST_Furniture") and (
+                is_true_prismatic or is_headless_mock_col
+            ):
                 return "ParametricFamily"
             return "RepetitiveFamily" if rep_count >= 2 else "FamilyInstance"
 

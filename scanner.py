@@ -721,6 +721,144 @@ class RhinoScanner(object):
         scanned.area_sqm = round(scanned.area * (scale_to_m ** 2), 3)
         scanned.volume_cum = round(scanned.volume * (scale_to_m ** 3), 3)
 
+    def _is_strict_axis_box(self, brep):
+        """Returns True only if brep has 6 planar faces strictly aligned to World X/Y/Z axes."""
+        try:
+            if not brep or brep.Faces.Count != 6:
+                return False
+            cx, cy, cz = 0, 0, 0
+            for face in brep.Faces:
+                ok_pl, plane = face.TryGetPlane(0.005) if hasattr(face, "TryGetPlane") else (False, None)
+                if not ok_pl or not plane:
+                    return False
+                n = plane.Normal
+                if n.Length < 1e-6:
+                    return False
+                n.Unitize()
+                if abs(n.X) > 0.999 and abs(n.Y) < 0.005 and abs(n.Z) < 0.005:
+                    cx += 1
+                elif abs(n.Y) > 0.999 and abs(n.X) < 0.005 and abs(n.Z) < 0.005:
+                    cy += 1
+                elif abs(n.Z) > 0.999 and abs(n.X) < 0.005 and abs(n.Y) < 0.005:
+                    cz += 1
+                else:
+                    return False
+            return (cx == 2 and cy == 2 and cz == 2)
+        except Exception:
+            return False
+
+    def _verify_strict_cylinder(self, brep):
+        """Returns (True, radius) only for vertical right circular cylinders."""
+        try:
+            if not brep or brep.Faces.Count not in (3, 4):
+                return (False, 0.0)
+            caps = 0
+            cyl_faces = 0
+            ref_radius = None
+            for face in brep.Faces:
+                ok_pl, plane = face.TryGetPlane(0.005) if hasattr(face, "TryGetPlane") else (False, None)
+                if ok_pl and plane:
+                    n = plane.Normal
+                    if n.Length > 1e-6:
+                        n.Unitize()
+                        if abs(n.Z) > 0.999:
+                            caps += 1
+                            continue
+                ok_cyl, cyl = face.TryGetCylinder(0.01) if hasattr(face, "TryGetCylinder") else (False, None)
+                if not ok_cyl or not cyl:
+                    return (False, 0.0)
+                ax = cyl.Axis
+                if ax.Length < 1e-6:
+                    return (False, 0.0)
+                ax.Unitize()
+                if abs(ax.Z) <= 0.999:
+                    return (False, 0.0)
+                r = float(getattr(cyl, "Radius", 0.0) or 0.0)
+                if r <= 1e-6:
+                    return (False, 0.0)
+                if ref_radius is None:
+                    ref_radius = r
+                elif abs(r - ref_radius) > max(0.005, 0.02 * ref_radius):
+                    return (False, 0.0)
+                cyl_faces += 1
+            if caps == 2 and cyl_faces >= 1 and ref_radius:
+                return (True, ref_radius)
+            return (False, 0.0)
+        except Exception:
+            return (False, 0.0)
+
+    def _is_strict_profile_extrusion(self, brep, scanned):
+        """Returns True only for strictly vertical flat-capped constant-section extrusions."""
+        try:
+            if not brep or not getattr(brep, "IsSolid", False):
+                return False
+            fc = brep.Faces.Count
+            if fc < 3 or fc > 200:
+                return False
+            dz = max(1e-6, float(getattr(scanned, "dz", 0.0) or 0.0))
+            bmin_z = float(scanned.bbox_min[2])
+            bmax_z = float(scanned.bbox_max[2])
+            z_tol = max(0.005, 0.01 * dz)
+
+            bot_caps = []
+            top_caps = []
+            side_faces = []
+            for face in brep.Faces:
+                ok_pl, plane = face.TryGetPlane(0.005) if hasattr(face, "TryGetPlane") else (False, None)
+                if ok_pl and plane and plane.Normal.Length > 1e-6:
+                    n = rg.Vector3d(plane.Normal)
+                    n.Unitize()
+                    if abs(n.Z) > 0.999:
+                        fb = face.GetBoundingBox(True)
+                        f_cz = 0.5 * (fb.Min.Z + fb.Max.Z)
+                        if abs(f_cz - bmin_z) <= z_tol:
+                            bot_caps.append(face)
+                            continue
+                        if abs(f_cz - bmax_z) <= z_tol:
+                            top_caps.append(face)
+                            continue
+                        return False
+                side_faces.append(face)
+
+            if len(bot_caps) != 1 or len(top_caps) != 1 or len(side_faces) == 0:
+                return False
+
+            # Cap areas must match closely (rules out tapers, chamfers, stepped geometry)
+            def _face_area(f):
+                try:
+                    sub = f.DuplicateFace(False)
+                    amp = rg.AreaMassProperties.Compute(sub)
+                    return float(amp.Area) if amp else 0.0
+                except Exception:
+                    return 0.0
+
+            a_bot = _face_area(bot_caps[0])
+            a_top = _face_area(top_caps[0])
+            if a_bot <= 1e-9 or a_top <= 1e-9:
+                return False
+            if abs(a_top - a_bot) > 0.02 * max(a_top, a_bot):
+                return False
+
+            # Every side face must be strictly vertical across all UV samples
+            for sf in side_faces:
+                d0 = sf.Domain(0)
+                d1 = sf.Domain(1)
+                if d0.Length <= 0 or d1.Length <= 0:
+                    return False
+                for fu in (0.2, 0.5, 0.8):
+                    u = d0.Min + fu * d0.Length
+                    for fv in (0.2, 0.5, 0.8):
+                        v = d1.Min + fv * d1.Length
+                        nrm = sf.NormalAt(u, v)
+                        if nrm.Length < 1e-6:
+                            return False
+                        nrm.Unitize()
+                        if abs(nrm.Z) >= 0.005:
+                            return False
+            return True
+        except Exception:
+            return False
+
     def _classify_geometry_primitive(self, scanned, geom, working_brep,
                                      horiz_face_count=0, vert_face_count=0,
                                      sample_count=0, face_count=0):
@@ -748,18 +886,31 @@ class RhinoScanner(object):
             max_plan = max(1e-6, max(float(scanned.dx), float(scanned.dy)))
             plan_diff_ratio = abs(float(scanned.dx) - float(scanned.dy)) / max_plan
 
-            if ((working_brep is not None and face_count == 6 and fill_ratio >= 0.94) or
-                    (is_extrusion_geom and fill_ratio >= 0.94)):
+            is_strict_extrusion_vert = False
+            if is_extrusion_geom:
+                try:
+                    p_vec = geom.PathEnd - geom.PathStart
+                    if p_vec.Length > 1e-4:
+                        p_vec.Unitize()
+                        if abs(p_vec.Z) > 0.999 and bool(getattr(geom, "IsSolid", scanned.is_closed)):
+                            is_strict_extrusion_vert = True
+                except Exception:
+                    is_strict_extrusion_vert = False
+
+            is_cyl_ok, cyl_r = (False, 0.0)
+            if working_brep is not None and face_count in (3, 4) and plan_diff_ratio < 0.03 and 0.76 <= fill_ratio <= 0.81:
+                is_cyl_ok, cyl_r = self._verify_strict_cylinder(working_brep)
+
+            if working_brep is not None and face_count == 6 and 0.985 <= fill_ratio <= 1.015 and self._is_strict_axis_box(working_brep):
                 scanned.geometry_primitive_type = "Box"
                 scanned.is_prismatic = True
-            elif (working_brep is not None and face_count in (3, 4) and
-                    plan_diff_ratio < 0.05 and 0.72 <= fill_ratio <= 0.84):
+            elif is_cyl_ok:
                 scanned.geometry_primitive_type = "Cylinder"
                 scanned.is_prismatic = True
-                scanned.cylinder_radius = round((float(scanned.dx) + float(scanned.dy)) / 4.0, 4)
-            elif (is_extrusion_geom or
-                    (working_brep is not None and sample_count > 0 and horiz_face_count >= 2 and
-                     (horiz_face_count + vert_face_count) == sample_count)):
+                scanned.cylinder_radius = round(float(cyl_r or ((float(scanned.dx) + float(scanned.dy)) / 4.0)), 4)
+            elif is_strict_extrusion_vert or (
+                working_brep is not None and 3 <= face_count <= 200 and self._is_strict_profile_extrusion(working_brep, scanned)
+            ):
                 scanned.geometry_primitive_type = "ProfileExtrusion"
                 scanned.is_prismatic = True
             else:

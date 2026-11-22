@@ -233,6 +233,7 @@ class ConversionRouter(object):
         self.level_cache = {}
         self.type_cache = {}
         self.family_symbol_cache = {}
+        self.family_anchor_mode = {}  # guid / fam_name -> "bottom_center" | "centroid"
         self.app = revit_doc.Application if revit_doc and hasattr(revit_doc, "Application") else None
         if REVIT_AVAILABLE and self.doc:
             self._cache_revit_data()
@@ -448,22 +449,18 @@ class ConversionRouter(object):
                 short_guid = clean_guid[-8:] if len(clean_guid) >= 8 else clean_guid
 
                 if clean_name:
-                    fam_name = "R2R_Fam_{}_{}".format(clean_layer[:20], clean_name[:20])
+                    fam_name = "R2R_Fam_{}_{}_{}".format(clean_layer[:16], clean_name[:16], short_guid)
                 else:
                     fam_name = "R2R_Fam_{}_{}".format(clean_layer[:20], short_guid)
 
-                fam_key_layer = "R2R_Family_{}".format(clean_layer)
-                fam_key_param = "R2R_Parametric_{}".format(clean_layer)
-
-                # Skip if already pre-generated for this specific object
+                # Skip if already pre-generated for this exact object
                 if obj.rhino_guid in self.family_symbol_cache:
-                    continue
-                if fam_name in self.family_symbol_cache:
-                    self.family_symbol_cache[obj.rhino_guid] = self.family_symbol_cache[fam_name]
                     continue
 
                 target_bic = self._category_str_to_bic(inferred_cat)
+                prim = getattr(obj, "geometry_primitive_type", "Unknown") or "Unknown"
                 sym = None
+                built_mode = None
 
                 def _try_freeform():
                     if obj.raw_geometry and hasattr(FamilyFactory, "create_native_freeform_family"):
@@ -504,30 +501,37 @@ class ConversionRouter(object):
                     if StrategyRuleEngine:
                         ok_param, fails_param, _, fb_param = StrategyRuleEngine.evaluate_object(obj, "ParametricFamily")
 
-                    if ok_param and hasattr(FamilyFactory, "create_parametric_box_or_profile_family"):
+                    if ok_param and prim in ("Box", "Cylinder", "ProfileExtrusion") and hasattr(FamilyFactory, "create_parametric_box_or_profile_family"):
                         try:
-                            w = max(0.2, (obj.dx or 1.0) * self.unit_scale)
-                            d = max(0.2, (obj.dy or 1.0) * self.unit_scale)
-                            h = max(0.2, (obj.dz or 1.0) * self.unit_scale)
-                            prim = getattr(obj, "geometry_primitive_type", "Box") or "Box"
-                            if prim not in ("Box", "Cylinder", "ProfileExtrusion"):
-                                prim = "Box"
-                            rad_ft = (float(getattr(obj, "cylinder_radius", 0.0) or 0.0) * self.unit_scale) or None
-                            sym = FamilyFactory.create_parametric_box_or_profile_family(
-                                self.app,
-                                self.doc,
-                                family_name=fam_name,
-                                width=w,
-                                depth=d,
-                                height=h,
-                                category_hint=inferred_cat,
-                                target_bic=target_bic,
-                                primitive_type=prim,
-                                radius=rad_ft,
-                                base_offset=0.0,
-                                custom_parameters=merged_params,
-                                shared_param_defs=self.shared_param_defs
-                            )
+                            profile_loops = None
+                            if prim == "ProfileExtrusion":
+                                profile_loops = self._extract_canonical_profile_loops_feet(obj)
+                                if not profile_loops:
+                                    _log("  [Rule Check] Could not extract 2D profile for '{}'; falling back to exact FreeFormFamily.".format(obj_name or short_guid))
+
+                            if prim != "ProfileExtrusion" or profile_loops:
+                                w = max(0.2, (obj.dx or 1.0) * self.unit_scale)
+                                d = max(0.2, (obj.dy or 1.0) * self.unit_scale)
+                                h = max(0.2, (obj.dz or 1.0) * self.unit_scale)
+                                rad_ft = (float(getattr(obj, "cylinder_radius", 0.0) or 0.0) * self.unit_scale) or None
+                                sym = FamilyFactory.create_parametric_box_or_profile_family(
+                                    self.app,
+                                    self.doc,
+                                    family_name=fam_name,
+                                    width=w,
+                                    depth=d,
+                                    height=h,
+                                    profile_curve_loops=profile_loops,
+                                    category_hint=inferred_cat,
+                                    target_bic=target_bic,
+                                    primitive_type=prim,
+                                    radius=rad_ft,
+                                    base_offset=0.0,
+                                    custom_parameters=merged_params,
+                                    shared_param_defs=self.shared_param_defs
+                                )
+                                if sym:
+                                    built_mode = "bottom_center"
                         except Exception as ex_param:
                             _log("  [Pre-generate Editable Parametric Family Exception]: {}".format(ex_param))
                     elif not ok_param:
@@ -537,28 +541,31 @@ class ConversionRouter(object):
                         ))
                         if policy == "StrictSkip":
                             continue
-                        if fb_param == "FreeFormFamily":
-                            sym = _try_freeform()
 
-                    # Fallback to FreeForm only under AutoFallback when Mode A could not build
-                    if not sym and ok_param:
+                    # Fallback to exact Non-Editable FreeFormFamily when Mode A not built
+                    if not sym:
                         policy = (getattr(rule, "mixed_policy", None) or self.mixed_policy)
-                        if policy != "StrictSkip":
+                        if policy != "StrictSkip" and fb_param != "Exclude":
                             sym = _try_freeform()
+                            if sym:
+                                built_mode = "centroid"
                 else:
-                    # Non-Editable FreeForm Solid Family (FreeFormFamily / FamilyInstance)
+                    # Non-Editable Exact-Geometry Family (FreeFormFamily / FamilyInstance)
                     sym = _try_freeform()
+                    if sym:
+                        built_mode = "centroid"
 
                 if sym:
                     self.family_symbol_cache[obj.rhino_guid] = sym
                     self.family_symbol_cache[fam_name] = sym
-                    if fam_key_layer not in self.family_symbol_cache:
-                        self.family_symbol_cache[fam_key_layer] = sym
-                    if fam_key_param not in self.family_symbol_cache:
-                        self.family_symbol_cache[fam_key_param] = sym
-                    _log("  [Phase 1] Loaded native .rfa Family: '{}' ({}) [{}]".format(fam_name, inferred_cat, strat))
+                    if built_mode:
+                        self.family_anchor_mode[obj.rhino_guid] = built_mode
+                        self.family_anchor_mode[fam_name] = built_mode
+                    _log("  [Phase 1] Loaded native .rfa Family: '{}' ({}) [{} / {}]".format(
+                        fam_name, inferred_cat, strat, built_mode or "custom"
+                    ))
                 else:
-                    _log("  [Phase 1 Notice] Object '{}' ({}) could not form a closed solid in .rfa; DirectShape fallback will be used in Phase 2.".format(obj_name or short_guid, obj.layer_name))
+                    _log("  [Phase 1 Notice] Object '{}' ({}) could not build .rfa family; DirectShape fallback will be used in Phase 2.".format(obj_name or short_guid, obj.layer_name))
 
             elif strat == "RepetitiveFamily":
                 is_block = (obj.object_type == "InstanceReference")
@@ -880,6 +887,78 @@ class ConversionRouter(object):
         pt3 = rg.Point3d(bbox.Min.X, bbox.Max.Y, max_z)
         poly = rg.Polyline([pt0, pt1, pt2, pt3, pt0])
         return rg.PolylineCurve(poly), [], max_z
+
+    def _extract_canonical_profile_loops_feet(self, scanned_obj):
+        """Extracts canonical 2D outer+inner CurveLoops centered at XY=(0,0), Z=0 in Revit feet.
+
+        Returns an empty list if true planar loops cannot be extracted cleanly from Rhino geometry
+        so callers never substitute a fallback bounding-box rectangle.
+        """
+        if not REVIT_AVAILABLE or not RHINO_AVAILABLE or not scanned_obj or not getattr(scanned_obj, "raw_geometry", None):
+            return []
+        try:
+            bmin = getattr(scanned_obj, "bbox_min", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)
+            bmax = getattr(scanned_obj, "bbox_max", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)
+            geom = scanned_obj.raw_geometry.Duplicate() if hasattr(scanned_obj.raw_geometry, "Duplicate") else scanned_obj.raw_geometry
+
+            if bmin == bmax and hasattr(geom, "GetBoundingBox"):
+                gb = geom.GetBoundingBox(True)
+                bmin = (gb.Min.X, gb.Min.Y, gb.Min.Z)
+                bmax = (gb.Max.X, gb.Max.Y, gb.Max.Z)
+
+            mid_x = 0.5 * (float(bmin[0]) + float(bmax[0]))
+            mid_y = 0.5 * (float(bmin[1]) + float(bmax[1]))
+            min_z = float(bmin[2])
+
+            work = geom
+            if isinstance(work, (rg.Extrusion, rg.Surface)) or (not isinstance(work, rg.Brep) and hasattr(work, "ToBrep")):
+                try:
+                    b_conv = work.ToBrep()
+                    if b_conv:
+                        work = b_conv
+                except Exception:
+                    pass
+            if not isinstance(work, rg.Brep):
+                return []
+
+            if hasattr(work, "Translate"):
+                work.Translate(-mid_x, -mid_y, -min_z)
+            if hasattr(work, "Scale"):
+                work.Scale(self.unit_scale)
+
+            bottom_faces = []
+            for face in work.Faces:
+                ok_pl, pl = face.TryGetPlane(0.01) if hasattr(face, "TryGetPlane") else (False, None)
+                if ok_pl and pl and pl.Normal.Length > 1e-6:
+                    n = rg.Vector3d(pl.Normal)
+                    n.Unitize()
+                    if abs(n.Z) > 0.99:
+                        cz = face.GetBoundingBox(True).Center.Z
+                        bottom_faces.append((cz, face))
+
+            if not bottom_faces:
+                return []
+            bottom_faces.sort(key=lambda item: item[0])
+            bot_face = bottom_faces[0][1]
+
+            outer_crv = bot_face.OuterLoop.To3dCurve() if getattr(bot_face, "OuterLoop", None) else None
+            if not outer_crv:
+                return []
+            outer_loop = self._build_curveloop_from_rhino_curve(outer_crv, target_z=0.0, is_outer=True)
+            if not outer_loop:
+                return []
+
+            loops = [outer_loop]
+            for lp in getattr(bot_face, "Loops", []):
+                if lp.LoopType == rg.BrepLoopType.Inner:
+                    ic = lp.To3dCurve()
+                    if ic:
+                        in_loop = self._build_curveloop_from_rhino_curve(ic, target_z=0.0, is_outer=False)
+                        if in_loop:
+                            loops.append(in_loop)
+            return loops
+        except Exception:
+            return []
 
     def _build_curveloop_from_rhino_curve(self, rh_curve, target_z=None, is_outer=True):
         """Builds a contiguous, strictly horizontal, closed Revit CurveLoop from a Rhino curve."""
@@ -1649,15 +1728,13 @@ class ConversionRouter(object):
 
         target_sym = None
 
-        # 1. Check Phase 1 Pre-Generated Native .rfa FamilySymbol cache
+        # 1. Check Phase 1 Pre-Generated Native .rfa FamilySymbol cache (per-object only; never hijack another object's symbol)
         clean_layer = re.sub(r'[^a-zA-Z0-9_]', '_', scanned_obj.layer_name or "Default")
         obj_name = getattr(scanned_obj, "object_name", "") or getattr(scanned_obj, "name", "") or ""
         clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', obj_name.strip()) if obj_name else ""
         clean_guid = re.sub(r'[^a-zA-Z0-9_]', '', str(scanned_obj.rhino_guid or "").replace('-', '_'))
         short_guid = clean_guid[-8:] if len(clean_guid) >= 8 else clean_guid
-        fam_name = "R2R_Fam_{}_{}".format(clean_layer[:20], clean_name[:20]) if clean_name else "R2R_Fam_{}_{}".format(clean_layer[:20], short_guid)
-        fam_key_param = "R2R_Parametric_{}".format(clean_layer)
-        fam_key_gen = "R2R_Family_{}".format(clean_layer)
+        fam_name = "R2R_Fam_{}_{}_{}".format(clean_layer[:16], clean_name[:16], short_guid) if clean_name else "R2R_Fam_{}_{}".format(clean_layer[:20], short_guid)
 
         # Priority A: Exact object GUID match
         if scanned_obj.rhino_guid and scanned_obj.rhino_guid in self.family_symbol_cache:
@@ -1667,34 +1744,33 @@ class ConversionRouter(object):
         if not target_sym and fam_name in self.family_symbol_cache:
             target_sym = self.family_symbol_cache[fam_name]
 
-        # Priority C: Layer-level fallback keys
-        if not target_sym:
-            if fam_key_gen in self.family_symbol_cache:
-                target_sym = self.family_symbol_cache[fam_key_gen]
-            elif fam_key_param in self.family_symbol_cache:
-                target_sym = self.family_symbol_cache[fam_key_param]
-
-        # 2. Check project symbols if not found in pre-generated cache
-        if not target_sym:
+        # 2. Explicit user-requested project symbol only (never grab arbitrary category symbol)
+        if not target_sym and requested_type and requested_type != "Default" and not requested_type.startswith("OST_"):
             collector = DB.FilteredElementCollector(self.doc).OfClass(DB.FamilySymbol)
             for s in collector:
                 try:
-                    if requested_type and (s.Name == requested_type or s.FamilyName == requested_type):
-                        target_sym = s
-                        break
-                    if not requested_type and s.Category and s.Category.Id == target_cat_id:
+                    if s.Name == requested_type or s.FamilyName == requested_type:
                         target_sym = s
                         break
                 except Exception:
                     continue
 
+        anchor_mode = self.family_anchor_mode.get(scanned_obj.rhino_guid) or self.family_anchor_mode.get(fam_name)
+
         if target_sym:
             try:
                 if hasattr(target_sym, "IsActive") and not target_sym.IsActive:
                     target_sym.Activate()
-                cx = (scanned_obj.centroid[0] + self.origin_shift_rhino[0]) * self.unit_scale
-                cy = (scanned_obj.centroid[1] + self.origin_shift_rhino[1]) * self.unit_scale
-                cz = (scanned_obj.centroid[2] + self.origin_shift_rhino[2]) * self.unit_scale
+                bmin = getattr(scanned_obj, "bbox_min", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)
+                bmax = getattr(scanned_obj, "bbox_max", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)
+                if anchor_mode == "bottom_center" and bmin != bmax:
+                    cx = (0.5 * (bmin[0] + bmax[0]) + self.origin_shift_rhino[0]) * self.unit_scale
+                    cy = (0.5 * (bmin[1] + bmax[1]) + self.origin_shift_rhino[1]) * self.unit_scale
+                    cz = (bmin[2] + self.origin_shift_rhino[2]) * self.unit_scale
+                else:
+                    cx = (scanned_obj.centroid[0] + self.origin_shift_rhino[0]) * self.unit_scale
+                    cy = (scanned_obj.centroid[1] + self.origin_shift_rhino[1]) * self.unit_scale
+                    cz = (scanned_obj.centroid[2] + self.origin_shift_rhino[2]) * self.unit_scale
                 pt = DB.XYZ(cx, cy, cz)
 
                 level_elem = self.doc.GetElement(level_id) if level_id and level_id != DB.ElementId.InvalidElementId else None
@@ -1719,8 +1795,8 @@ class ConversionRouter(object):
                     axis = DB.Line.CreateBound(pt, DB.XYZ(pt.X, pt.Y, pt.Z + 1.0))
                     DB.ElementTransformUtils.RotateElement(self.doc, inst.Id, axis, scanned_obj.rotation_angle)
 
-                # Drive instance/type dimensional parameters with multilingual aliases
-                if inst:
+                # Drive dimensional parameters ONLY when Editable Parametric (or legacy external mock)
+                if inst and anchor_mode != "centroid":
                     dims = dict(getattr(scanned_obj, "parametric_dims", {}) or {})
                     if "Width" not in dims and scanned_obj.dx: dims["Width"] = scanned_obj.dx
                     if "Depth" not in dims and scanned_obj.dy: dims["Depth"] = scanned_obj.dy
@@ -1749,6 +1825,8 @@ class ConversionRouter(object):
                                     break
                                 except Exception:
                                     pass
+
+                if inst:
                     # Set material parameter on FamilyInstance if applicable
                     mat_to_set = None
                     override_mat = getattr(profile_rule, "material", None)
@@ -1771,8 +1849,13 @@ class ConversionRouter(object):
                                     except Exception:
                                         pass
 
-                    rule_strat = getattr(profile_rule, "strategy", "") if profile_rule else ""
-                    res.strategy_used = rule_strat if rule_strat in ("ParametricFamily", "FreeFormFamily") else "FamilyInstance"
+                    if anchor_mode == "centroid":
+                        res.strategy_used = "FreeFormFamily"
+                    elif anchor_mode == "bottom_center":
+                        res.strategy_used = "ParametricFamily"
+                    else:
+                        rule_strat = getattr(profile_rule, "strategy", "") if profile_rule else ""
+                        res.strategy_used = rule_strat if rule_strat in ("ParametricFamily", "FreeFormFamily") else "FamilyInstance"
                     return inst
             except Exception as ex:
                 res.warnings.append("ParametricFamily placement notice: {}. Falling back to DirectShape.".format(ex))
@@ -1786,7 +1869,12 @@ class ConversionRouter(object):
     # PIPELINE 8: Generic Family Delegator
     # =========================================================================
     def _pipeline_8_family_placement(self, scanned_obj, geom_feet, level_id, profile_rule, res):
-        """Routes family placement to Adaptive, Repetitive, or Parametric pipeline."""
+        """Routes family placement cleanly while respecting pre-generated exact FreeFormFamily symbols."""
+        if (profile_rule and getattr(profile_rule, "strategy", "") == "FreeFormFamily") or (
+            scanned_obj.rhino_guid in self.family_symbol_cache
+            and self.family_anchor_mode.get(scanned_obj.rhino_guid) == "centroid"
+        ):
+            return self._pipeline_8c_parametric_family(scanned_obj, geom_feet, level_id, profile_rule, res)
         if getattr(scanned_obj, "adaptive_point_count", 0) in (2, 3, 4):
             return self._pipeline_8a_adaptive_component(scanned_obj, geom_feet, level_id, profile_rule, res)
         if scanned_obj.object_type == "InstanceReference" or getattr(scanned_obj, "repetition_count", 1) >= 2:

@@ -3044,5 +3044,333 @@ class TestWpfXamlUiIntegrity(unittest.TestCase):
         self.assertEqual(row_blk.status_style_key(), "BLOCKED")
 
 
+class TestAccurateFamilyGeometry(unittest.TestCase):
+    """Regression tests preventing silent boxification and enforcing exact geometry in .rfa families."""
+
+    def test_profile_extrusion_never_silently_boxifies(self):
+        """Mode A must refuse ProfileExtrusion without curve loops and refuse FreeFormSolid/Unknown."""
+        import family_factory as ff
+
+        orig_revit = ff.REVIT_AVAILABLE
+        try:
+            ff.REVIT_AVAILABLE = True
+            new_fam_calls = []
+
+            class SpyApp(object):
+                def NewFamilyDocument(self, tmpl):
+                    new_fam_calls.append(tmpl)
+                    return None
+
+            res_no_loops = ff.FamilyFactory.create_parametric_box_or_profile_family(
+                SpyApp(), object(), "NoLoopsProfile",
+                width=2.0, depth=2.0, height=3.0,
+                profile_curve_loops=None, primitive_type="ProfileExtrusion"
+            )
+            self.assertIsNone(res_no_loops)
+            self.assertEqual(len(new_fam_calls), 0)
+
+            res_freeform = ff.FamilyFactory.create_parametric_box_or_profile_family(
+                SpyApp(), object(), "FreeformReject",
+                width=2.0, depth=2.0, height=3.0,
+                primitive_type="FreeFormSolid"
+            )
+            self.assertIsNone(res_freeform)
+            self.assertEqual(len(new_fam_calls), 0)
+
+            res_unknown = ff.FamilyFactory.create_parametric_box_or_profile_family(
+                SpyApp(), object(), "UnknownReject",
+                width=2.0, depth=2.0, height=3.0,
+                primitive_type="Unknown"
+            )
+            self.assertIsNone(res_unknown)
+            self.assertEqual(len(new_fam_calls), 0)
+        finally:
+            ff.REVIT_AVAILABLE = orig_revit
+
+    def test_unknown_and_freeform_never_coerce_to_box_in_pregen(self):
+        """pre_generate_families never coerces ProfileExtrusion (missing loops) or Unknown into a Box."""
+        import conversion_router as cr
+        from conversion_router import ConversionRouter
+        from profile_manager import MappingRule
+
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        orig_ff = getattr(cr, "FamilyFactory", None)
+        try:
+            MockDB, MockDoc = TestStrategyRulesAndCustomParams()._make_mock_db_env()
+            cr.REVIT_AVAILABLE = True
+            cr.DB = MockDB
+
+            mode_a_calls = []
+            mode_b_calls = []
+
+            class MockSym(object):
+                def __init__(self, name):
+                    self.Name = name
+                    self.FamilyName = name
+                    self.IsActive = True
+
+            class SpyFF(object):
+                @staticmethod
+                def create_parametric_box_or_profile_family(app, doc, **kwargs):
+                    mode_a_calls.append(kwargs)
+                    return MockSym(kwargs.get("family_name", "Param"))
+
+                @staticmethod
+                def create_native_freeform_family(app, doc, **kwargs):
+                    mode_b_calls.append(kwargs)
+                    return MockSym(kwargs.get("family_name", "FreeForm"))
+
+            cr.FamilyFactory = SpyFF
+            router = ConversionRouter(MockDoc(), mixed_policy="AutoFallback")
+
+            # 1. ProfileExtrusion where loop extraction fails -> routes to Mode B, NOT Mode A box
+            obj_prof_fail = ScannedObject("prof-fail-1")
+            obj_prof_fail.layer_name = "Stair_Cores"
+            obj_prof_fail.object_type = "Brep"
+            obj_prof_fail.geometry_primitive_type = "ProfileExtrusion"
+            obj_prof_fail.is_prismatic = True
+            obj_prof_fail.is_closed = True
+            obj_prof_fail.parametric_dims = {"Width": 2.0, "Depth": 2.0, "Height": 4.0}
+            obj_prof_fail.raw_geometry = MockDB.RhinoGeom()
+
+            # 2. Unknown primitive with positive dims under AutoFallback -> routes to Mode B, NOT Mode A box
+            obj_unk = ScannedObject("unk-1")
+            obj_unk.layer_name = "Sculpt_Columns"
+            obj_unk.object_type = "Brep"
+            obj_unk.geometry_primitive_type = "Unknown"
+            obj_unk.is_closed = True
+            obj_unk.parametric_dims = {"Width": 1.0, "Depth": 1.0, "Height": 3.0}
+            obj_unk.raw_geometry = MockDB.RhinoGeom()
+
+            # 3. ProfileExtrusion with real extracted loops -> routes to Mode A with true profile_curve_loops
+            obj_prof_ok = ScannedObject("prof-ok-1")
+            obj_prof_ok.layer_name = "L_Columns"
+            obj_prof_ok.object_type = "Brep"
+            obj_prof_ok.geometry_primitive_type = "ProfileExtrusion"
+            obj_prof_ok.is_prismatic = True
+            obj_prof_ok.is_closed = True
+            obj_prof_ok.parametric_dims = {"Width": 1.2, "Depth": 1.2, "Height": 3.5}
+            obj_prof_ok.raw_geometry = MockDB.RhinoGeom()
+
+            mock_loop = ["loop_segment"]
+            router._extract_canonical_profile_loops_feet = (
+                lambda o: [mock_loop] if o.rhino_guid == "prof-ok-1" else []
+            )
+
+            rules = {
+                "prof-fail-1": MappingRule("Stair_Cores", strategy="ParametricFamily"),
+                "unk-1": MappingRule("Sculpt_Columns", strategy="ParametricFamily"),
+                "prof-ok-1": MappingRule("L_Columns", strategy="ParametricFamily"),
+            }
+            cdict = {
+                "prof-fail-1": ClassificationResult("prof-fail-1"),
+                "unk-1": ClassificationResult("unk-1"),
+                "prof-ok-1": ClassificationResult("prof-ok-1"),
+            }
+
+            router.pre_generate_families([obj_prof_fail, obj_unk, obj_prof_ok], cdict, profile_rules=rules)
+
+            self.assertEqual(len(mode_a_calls), 1)
+            self.assertEqual(mode_a_calls[0].get("primitive_type"), "ProfileExtrusion")
+            self.assertEqual(mode_a_calls[0].get("profile_curve_loops"), [mock_loop])
+            self.assertEqual(router.family_anchor_mode.get("prof-ok-1"), "bottom_center")
+
+            self.assertEqual(len(mode_b_calls), 2)
+            self.assertEqual(router.family_anchor_mode.get("prof-fail-1"), "centroid")
+            self.assertEqual(router.family_anchor_mode.get("unk-1"), "centroid")
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            cr.DB = orig_db
+            cr.FamilyFactory = orig_ff
+
+    def test_classifier_does_not_force_box_parametric_on_freeform_furniture_or_doors(self):
+        """AecClassifier must route FreeFormSolid furniture/doors to FreeFormFamily, not ParametricFamily."""
+        clf = AecClassifier(mode="Hybrid")
+
+        sofa = ScannedObject("sofa-1")
+        sofa.layer_full_path = "INTERIORS::FURNITURE"
+        sofa.layer_name = "FURNITURE"
+        sofa.object_type = "Brep"
+        sofa.geometry_primitive_type = "FreeFormSolid"
+        sofa.is_closed = True
+        sofa.dx, sofa.dy, sofa.dz = 1.2, 0.9, 0.85
+        sofa.volume = 0.5
+
+        res_sofa = clf.classify_object(sofa)
+        self.assertEqual(res_sofa.inferred_category, "Family")
+        self.assertEqual(res_sofa.proposed_strategy, "FreeFormFamily")
+        self.assertEqual(clf._select_strategy(sofa, "Family"), "FreeFormFamily")
+
+        door = ScannedObject("door-1")
+        door.layer_full_path = "ARCH::DOORS"
+        door.layer_name = "DOORS"
+        door.object_type = "Brep"
+        door.geometry_primitive_type = "FreeFormSolid"
+        door.is_closed = True
+        door.dx, door.dy, door.dz = 0.9, 0.9, 2.1
+
+        res_door = clf.classify_object(door)
+        self.assertEqual(res_door.inferred_category, "Family")
+        self.assertEqual(res_door.proposed_strategy, "FreeFormFamily")
+        self.assertEqual(clf._select_strategy(door, "Family"), "FreeFormFamily")
+
+        rep_chair = ScannedObject("chair-1")
+        rep_chair.layer_full_path = "INTERIORS::FURNITURE"
+        rep_chair.layer_name = "FURNITURE"
+        rep_chair.object_type = "Brep"
+        rep_chair.geometry_primitive_type = "FreeFormSolid"
+        rep_chair.is_closed = True
+        rep_chair.repetition_count = 4
+        rep_chair.dx, rep_chair.dy, rep_chair.dz = 0.6, 0.6, 0.8
+
+        res_chair = clf.classify_object(rep_chair)
+        self.assertEqual(res_chair.proposed_strategy, "RepetitiveFamily")
+
+        true_box_col = ScannedObject("box-col-1")
+        true_box_col.layer_full_path = "STRUCTURE::COLUMNS"
+        true_box_col.layer_name = "COLUMNS"
+        true_box_col.object_type = "Brep"
+        true_box_col.geometry_primitive_type = "Box"
+        true_box_col.is_prismatic = True
+        true_box_col.is_closed = True
+        true_box_col.dx, true_box_col.dy, true_box_col.dz = 0.5, 0.5, 3.5
+
+        res_col = clf.classify_object(true_box_col)
+        self.assertEqual(res_col.proposed_strategy, "ParametricFamily")
+
+        open_sculpt = ScannedObject("open-1")
+        open_sculpt.layer_full_path = "INTERIORS::FURNITURE"
+        open_sculpt.layer_name = "FURNITURE"
+        open_sculpt.object_type = "Mesh"
+        open_sculpt.geometry_primitive_type = "OpenMesh"
+        open_sculpt.is_closed = False
+
+        res_open = clf.classify_object(open_sculpt)
+        self.assertEqual(res_open.proposed_strategy, "DirectShape")
+
+    def test_no_cross_object_symbol_hijack_and_bottom_anchor_z(self):
+        """Objects sharing layer/name never steal symbols; Parametric uses bottom-center Z, FreeForm uses centroid Z without overriding dims."""
+        import conversion_router as cr
+        from conversion_router import ConversionRouter, ConversionResult
+        from profile_manager import MappingRule
+
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        orig_ff = getattr(cr, "FamilyFactory", None)
+        try:
+            MockDB, MockDoc = TestStrategyRulesAndCustomParams()._make_mock_db_env()
+            cr.REVIT_AVAILABLE = True
+            cr.DB = MockDB
+
+            class MockParam(object):
+                def __init__(self, init_val=None):
+                    self.StorageType = MockDB.StorageType.Double
+                    self.val = init_val
+                    self.IsReadOnly = False
+
+                def Set(self, v):
+                    self.val = v
+
+            class MockSym(object):
+                def __init__(self, name):
+                    self.Name = name
+                    self.FamilyName = name
+                    self.IsActive = True
+
+                def LookupParameter(self, n):
+                    return None
+
+            placed_records = []
+
+            class MockInst(object):
+                def __init__(self, sym):
+                    self.Symbol = sym
+                    self.Id = MockDB.ElementId(701)
+                    self.UniqueId = "inst-701"
+                    self.params = {"Width": MockParam(0.0), "Height": MockParam(0.0)}
+
+                def LookupParameter(self, k):
+                    return self.params.get(k)
+
+            doc = MockDoc()
+            doc.Create = type("Create", (), {
+                "NewFamilyInstance": lambda *a: placed_records.append((a[1], a[2])) or MockInst(a[2])
+            })()
+
+            class SpyFF(object):
+                @staticmethod
+                def create_parametric_box_or_profile_family(app, d, **kwargs):
+                    return MockSym(kwargs.get("family_name"))
+
+                @staticmethod
+                def create_native_freeform_family(app, d, **kwargs):
+                    return MockSym(kwargs.get("family_name"))
+
+            cr.FamilyFactory = SpyFF
+            router = ConversionRouter(doc, unit_scale=1.0)
+
+            obj1 = ScannedObject("joinery-aaaa1111")
+            obj1.layer_name = "Custom_Joinery"
+            obj1.object_name = "Panel"
+            obj1.object_type = "Brep"
+            obj1.geometry_primitive_type = "FreeFormSolid"
+            obj1.is_closed = True
+            obj1.centroid = (1.0, 2.0, 5.0)
+            obj1.raw_geometry = MockDB.RhinoGeom()
+
+            obj2 = ScannedObject("joinery-bbbb2222")
+            obj2.layer_name = "Custom_Joinery"
+            obj2.object_name = "Panel"
+            obj2.object_type = "Brep"
+            obj2.geometry_primitive_type = "Box"
+            obj2.is_prismatic = True
+            obj2.is_closed = True
+            obj2.bbox_min = (4.0, 4.0, 10.0)
+            obj2.bbox_max = (6.0, 6.0, 14.0)
+            obj2.centroid = (5.0, 5.0, 12.0)
+            obj2.dx, obj2.dy, obj2.dz = 2.0, 2.0, 4.0
+            obj2.parametric_dims = {"Width": 2.0, "Depth": 2.0, "Height": 4.0}
+            obj2.raw_geometry = MockDB.RhinoGeom()
+
+            rules = {
+                "joinery-aaaa1111": MappingRule("Custom_Joinery", strategy="FreeFormFamily"),
+                "joinery-bbbb2222": MappingRule("Custom_Joinery", strategy="ParametricFamily"),
+            }
+            cdict = {
+                "joinery-aaaa1111": ClassificationResult("joinery-aaaa1111"),
+                "joinery-bbbb2222": ClassificationResult("joinery-bbbb2222"),
+            }
+            router.pre_generate_families([obj1, obj2], cdict, profile_rules=rules)
+
+            # Separate per-object symbols; zero layer-wide cache hijack keys
+            s1 = router.family_symbol_cache["joinery-aaaa1111"]
+            s2 = router.family_symbol_cache["joinery-bbbb2222"]
+            self.assertIsNot(s1, s2)
+            self.assertNotIn("R2R_Family_Custom_Joinery", router.family_symbol_cache)
+            self.assertNotIn("R2R_Parametric_Custom_Joinery", router.family_symbol_cache)
+
+            # Place FreeFormFamily -> uses centroid Z (5.0), leaves Width untouched, marks strategy_used = FreeFormFamily
+            res1 = ConversionResult("joinery-aaaa1111")
+            inst1 = router._pipeline_8c_parametric_family(obj1, None, None, profile_rule=rules["joinery-aaaa1111"], res=res1)
+            self.assertIsNotNone(inst1)
+            self.assertEqual(placed_records[-1][0], (1.0, 2.0, 5.0))
+            self.assertEqual(res1.strategy_used, "FreeFormFamily")
+            self.assertEqual(inst1.params["Width"].val, 0.0)
+
+            # Place ParametricFamily Box -> uses bottom-center Z (10.0), sets Width/Height, marks strategy_used = ParametricFamily
+            res2 = ConversionResult("joinery-bbbb2222")
+            inst2 = router._pipeline_8c_parametric_family(obj2, None, None, profile_rule=rules["joinery-bbbb2222"], res=res2)
+            self.assertIsNotNone(inst2)
+            self.assertEqual(placed_records[-1][0], (5.0, 5.0, 10.0))
+            self.assertEqual(res2.strategy_used, "ParametricFamily")
+            self.assertEqual(inst2.params["Width"].val, 2.0)
+            self.assertEqual(inst2.params["Height"].val, 4.0)
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            cr.DB = orig_db
+            cr.FamilyFactory = orig_ff
+
+
 if __name__ == "__main__":
     unittest.main()

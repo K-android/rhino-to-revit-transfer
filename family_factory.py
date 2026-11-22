@@ -489,11 +489,23 @@ class FamilyFactory(object):
     ):
         """Mode A: Creates a true dimension-driven, reference-plane locked editable .rfa family.
 
-        Supports orthogonal Box (Width/Depth/Height flexed on Reference Planes), Cylinder (Radius/Height),
-        and 2D Profile Extrusion (Height/Base_Offset), plus custom parameters, formulas, and visibility.
+        Strictly supports verified Axis-Aligned Box (Width/Depth/Height on Reference Planes),
+        Vertical Cylinder (Radius/Height), and Vertical ProfileExtrusion (explicit profile_curve_loops
+        + Height/Base_Offset). Refuses to synthesize fallback bounding boxes for non-matching geometry.
         """
         if not REVIT_AVAILABLE or not app or not project_doc:
             return None
+
+        has_profile_loops = bool(profile_curve_loops and len(profile_curve_loops) > 0)
+        prim_lower = str(primitive_type or "").strip().lower()
+        if prim_lower not in ("box", "cylinder", "profileextrusion"):
+            return None
+        if prim_lower == "profileextrusion" and not has_profile_loops:
+            return None
+
+        is_profile = has_profile_loops or (prim_lower == "profileextrusion")
+        is_cyl = (not is_profile) and (prim_lower == "cylinder")
+        is_box = (not is_profile) and (not is_cyl) and (prim_lower == "box")
 
         tmpl_path = FamilyTemplateLocator.find_template(app, category_hint=category_hint)
         if not tmpl_path:
@@ -523,7 +535,6 @@ class FamilyFactory(object):
 
             sp_defs = shared_param_defs or {}
             def_inst = not bool(is_type_driven)
-            is_cyl = (str(primitive_type or "Box").strip().lower() == "cylinder")
 
             # Resolve optional user overrides for driver parameter names/scopes
             w_name, w_inst = cls._resolve_custom_target_spec(custom_parameters, "Width", "Width", def_inst)
@@ -536,11 +547,11 @@ class FamilyFactory(object):
             p_width = None
             p_depth = None
             p_radius = None
-            if is_cyl:
-                p_radius = cls._add_or_get_parameter(fam_mgr, r_name, "Length", is_instance=r_inst, external_def=sp_defs.get(r_name), param_kind="Constraint")
-            else:
+            if is_box:
                 p_width = cls._add_or_get_parameter(fam_mgr, w_name, "Length", is_instance=w_inst, external_def=sp_defs.get(w_name), param_kind="Constraint")
                 p_depth = cls._add_or_get_parameter(fam_mgr, d_name, "Length", is_instance=d_inst, external_def=sp_defs.get(d_name), param_kind="Constraint")
+            elif is_cyl:
+                p_radius = cls._add_or_get_parameter(fam_mgr, r_name, "Length", is_instance=r_inst, external_def=sp_defs.get(r_name), param_kind="Constraint")
 
             p_height = cls._add_or_get_parameter(fam_mgr, h_name, "Length", is_instance=h_inst, external_def=sp_defs.get(h_name), param_kind="Constraint")
             p_base_off = cls._add_or_get_parameter(fam_mgr, bo_name, "Length", is_instance=bo_inst, external_def=sp_defs.get(bo_name), param_kind="Constraint")
@@ -550,11 +561,11 @@ class FamilyFactory(object):
 
             # Set initial parameter values
             try:
-                if p_width and width > 0.001:
+                if is_box and p_width and width > 0.001:
                     fam_mgr.Set(p_width, float(width))
-                if p_depth and depth > 0.001:
+                if is_box and p_depth and depth > 0.001:
                     fam_mgr.Set(p_depth, float(depth))
-                if p_radius and rad_val > 0.001:
+                if is_cyl and p_radius and rad_val > 0.001:
                     fam_mgr.Set(p_radius, float(rad_val))
                 if p_height and height > 0.001:
                     fam_mgr.Set(p_height, float(height))
@@ -571,8 +582,7 @@ class FamilyFactory(object):
             hw = max(0.05, float(width) / 2.0)
             hd = max(0.05, float(depth) / 2.0)
 
-            if profile_curve_loops and len(profile_curve_loops) > 0:
-                # Custom 2D profile loop provided
+            if is_profile:
                 for cl in profile_curve_loops:
                     ca = DB.CurveArray()
                     for c in cl:
@@ -584,7 +594,7 @@ class FamilyFactory(object):
                 ca.Append(DB.Arc.Create(DB.XYZ(-rad_val, 0.0, 0.0), DB.XYZ(rad_val, 0.0, 0.0), DB.XYZ(0.0, rad_val, 0.0)))
                 ca.Append(DB.Arc.Create(DB.XYZ(rad_val, 0.0, 0.0), DB.XYZ(-rad_val, 0.0, 0.0), DB.XYZ(0.0, -rad_val, 0.0)))
                 curve_arr_array.Append(ca)
-            else:
+            elif is_box:
                 # Rectangular box profile centered at (0,0)
                 pt0 = DB.XYZ(-hw, -hd, 0.0)
                 pt1 = DB.XYZ(hw, -hd, 0.0)
@@ -602,8 +612,8 @@ class FamilyFactory(object):
             ext_height = max(0.1, float(height))
             extrusion = fam_doc.FamilyCreate.NewExtrusion(True, curve_arr_array, sketch_plane, ext_height)
 
-            # 4. True Reference-Plane Locking for Box primitives (Width / Depth flex!)
-            if extrusion and not profile_curve_loops and not is_cyl:
+            # 4. True Reference-Plane Locking for Axis-Aligned Box primitives (Width / Depth flex)
+            if extrusion and is_box:
                 try:
                     cls._lock_box_to_reference_planes(fam_doc, fam_mgr, extrusion, p_width, p_depth, hw, hd)
                 except Exception:
@@ -727,10 +737,12 @@ class FamilyFactory(object):
         *args,
         **kwargs
     ):
-        """Mode B: Creates a non-editable 3D solid native .rfa family using DB.FreeFormElement.Create.
+        """Mode B: Creates an exact-geometry non-editable 3D native .rfa family.
 
-        Metadata, Type/Instance custom data parameters, and Material remain editable in Revit,
-        while the complex 3D sculpted/mesh solid geometry stays fixed without geometric flexing.
+        Uses multi-solid DB.FreeFormElement.Create for closed Breps/Solids/Extrusions/Meshes,
+        or an in-family exact DirectShape container when geometry is open/non-watertight.
+        Never runs SubD edge-melting or bounding-box approximation; preserves Edit Type, Material,
+        and Instance/Type custom Data parameters.
         """
         if not REVIT_AVAILABLE or not app or not project_doc or not rh_brep_or_solid:
             return None
@@ -741,10 +753,12 @@ class FamilyFactory(object):
 
         clean_fam_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(family_name).strip()) or "R2R_Bespoke_Solid"
 
-        # Convert input geometry to DB.Solid
-        revit_solid = None
+        revit_solids = []
+        revit_fallback_geoms = []
+
         if isinstance(rh_brep_or_solid, DB.Solid):
-            revit_solid = rh_brep_or_solid
+            if getattr(rh_brep_or_solid, "Volume", 0.0) > 0.000001:
+                revit_solids.append(rh_brep_or_solid)
         elif RHINO_AVAILABLE:
             try:
                 working = rh_brep_or_solid
@@ -753,37 +767,50 @@ class FamilyFactory(object):
                     if b:
                         working = b
 
-                # Priority 1: If Mesh, attempt smooth SubD -> Brep conversion for continuous NURBS solid (NO wire lines)
-                if isinstance(working, rg.Mesh) and hasattr(rg, "SubD") and hasattr(rg.SubD, "CreateFromMesh"):
+                # Priority 1: Multi-solid Brep -> DB.Solid (exact NURBS geometry, no SubD smoothing!)
+                if hasattr(GeometryEncoder, "ToSolid") and isinstance(working, rg.Brep):
+                    comps = []
                     try:
-                        subd = rg.SubD.CreateFromMesh(working)
-                        if subd and getattr(subd, "IsValid", False):
-                            b_subd = subd.ToBrep()
-                            if b_subd and getattr(b_subd, "IsValid", False) and hasattr(GeometryEncoder, "ToSolid"):
-                                s_subd = GeometryEncoder.ToSolid(b_subd)
-                                if s_subd and getattr(s_subd, "Volume", 0.0) > 0.00001:
-                                    revit_solid = s_subd
+                        if hasattr(working, "GetConnectedComponents"):
+                            comps = list(working.GetConnectedComponents() or [])
                     except Exception:
-                        pass
+                        comps = []
 
-                # Priority 2: Brep ToSolid conversion
-                if not revit_solid and hasattr(GeometryEncoder, "ToSolid") and isinstance(working, rg.Brep):
-                    try:
-                        revit_solid = GeometryEncoder.ToSolid(working)
-                    except Exception:
-                        revit_solid = None
+                    if comps and len(comps) > 1:
+                        for comp in comps:
+                            try:
+                                s_c = GeometryEncoder.ToSolid(comp)
+                                if s_c and getattr(s_c, "Volume", 0.0) > 0.000001:
+                                    revit_solids.append(s_c)
+                            except Exception:
+                                pass
+
+                    if not revit_solids:
+                        try:
+                            s_all = GeometryEncoder.ToSolid(working)
+                            if s_all and getattr(s_all, "Volume", 0.0) > 0.000001:
+                                revit_solids.append(s_all)
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
-            # Fallback to TessellatedShapeBuilder Solid construction (handles Meshes & complex Breps)
-            if (not revit_solid or getattr(revit_solid, "Volume", 0.0) <= 0.00001) and hasattr(DB, "TessellatedShapeBuilder"):
+            # Priority 2: TessellatedShapeBuilder directly on exact meshes / Brep faces (in Revit feet)
+            if not revit_solids and hasattr(DB, "TessellatedShapeBuilder"):
                 try:
-                    # TessellatedShapeBuilder requires coordinates in Revit internal feet
                     working_tsb = geom_feet
                     if not working_tsb:
-                        working_tsb = working.Duplicate() if hasattr(working, "Duplicate") else working
+                        working_tsb = rh_brep_or_solid.Duplicate() if hasattr(rh_brep_or_solid, "Duplicate") else rh_brep_or_solid
                         if hasattr(working_tsb, "Scale") and abs(float(unit_scale or 1.0) - 1.0) > 0.00001:
                             working_tsb.Scale(float(unit_scale))
+
+                    if not isinstance(working_tsb, (rg.Brep, rg.Mesh)) and hasattr(working_tsb, "ToBrep"):
+                        try:
+                            b_tsb = working_tsb.ToBrep()
+                            if b_tsb:
+                                working_tsb = b_tsb
+                        except Exception:
+                            pass
 
                     meshes = []
                     if isinstance(working_tsb, rg.Mesh):
@@ -794,10 +821,10 @@ class FamilyFactory(object):
                         if b_meshes:
                             meshes = list(b_meshes)
 
-                    if meshes:
+                    def _run_tsb(target_mode, fallback_mode, is_closed_set):
                         tsb = DB.TessellatedShapeBuilder()
-                        tsb.OpenConnectedFaceSet(True)
-                        face_added = False
+                        tsb.OpenConnectedFaceSet(bool(is_closed_set))
+                        added = False
                         for m in meshes:
                             m_copy = m.Duplicate()
                             if hasattr(m_copy.Faces, "ConvertQuadsToTriangles"):
@@ -817,7 +844,7 @@ class FamilyFactory(object):
                                     loop_pts.Add(v1)
                                     loop_pts.Add(v2)
                                     tsb.AddFace(DB.TessellatedFace(loop_pts, DB.ElementId.InvalidElementId))
-                                    face_added = True
+                                    added = True
                                 if hasattr(f, "IsQuad") and f.IsQuad:
                                     p3 = verts[f.D]
                                     v3 = DB.XYZ(float(p3.X), float(p3.Y), float(p3.Z))
@@ -827,24 +854,39 @@ class FamilyFactory(object):
                                         loop_pts2.Add(v2)
                                         loop_pts2.Add(v3)
                                         tsb.AddFace(DB.TessellatedFace(loop_pts2, DB.ElementId.InvalidElementId))
-                                        face_added = True
+                                        added = True
                         tsb.CloseConnectedFaceSet()
-                        if face_added:
-                            tsb.Target = DB.TessellatedShapeBuilderTarget.Solid
-                            tsb.Fallback = DB.TessellatedShapeBuilderFallback.Abort
-                            tsb.Build()
-                            b_res = tsb.GetBuildResult()
-                            if b_res:
-                                res_objs = b_res.GetGeometricalObjects()
-                                if res_objs:
-                                    for go in res_objs:
-                                        if isinstance(go, DB.Solid) and getattr(go, "Volume", 0.0) > 0.00001:
-                                            revit_solid = go
-                                            break
-                except Exception as ex_tsb:
-                    print("[FamilyFactory TSB Solid Notice]: {}".format(ex_tsb))
+                        if not added:
+                            return []
+                        tsb.Target = target_mode
+                        tsb.Fallback = fallback_mode
+                        tsb.Build()
+                        b_res = tsb.GetBuildResult()
+                        if b_res:
+                            res_objs = b_res.GetGeometricalObjects()
+                            if res_objs:
+                                return list(res_objs)
+                        return []
 
-        if not revit_solid or getattr(revit_solid, "Volume", 0.0) <= 0.00001:
+                    if meshes:
+                        salvage_fb = getattr(DB.TessellatedShapeBuilderFallback, "Salvage", DB.TessellatedShapeBuilderFallback.Abort)
+                        solid_objs = _run_tsb(DB.TessellatedShapeBuilderTarget.Solid, salvage_fb, True)
+                        for go in solid_objs:
+                            if isinstance(go, DB.Solid) and getattr(go, "Volume", 0.0) > 0.000001:
+                                revit_solids.append(go)
+
+                        # Pass 2: Open / non-watertight exact mesh container inside .rfa family
+                        if not revit_solids:
+                            any_tgt = getattr(DB.TessellatedShapeBuilderTarget, "AnyGeometry", DB.TessellatedShapeBuilderTarget.Mesh)
+                            mesh_fb = getattr(DB.TessellatedShapeBuilderFallback, "Mesh", DB.TessellatedShapeBuilderFallback.Salvage)
+                            mesh_objs = _run_tsb(any_tgt, mesh_fb, False)
+                            for go in mesh_objs:
+                                if go is not None:
+                                    revit_fallback_geoms.append(go)
+                except Exception as ex_tsb:
+                    print("[FamilyFactory TSB Exact Geometry Notice]: {}".format(ex_tsb))
+
+        if not revit_solids and not revit_fallback_geoms:
             return None
 
         fam_doc = None
@@ -856,7 +898,7 @@ class FamilyFactory(object):
             fam_mgr = fam_doc.FamilyManager
 
             # 1. Start Transaction inside Family Document
-            t = DB.Transaction(fam_doc, "Create Native FreeForm Solid")
+            t = DB.Transaction(fam_doc, "Create Native Exact-Geometry Family")
             t.Start()
 
             # Set Family Category if target_bic provided
@@ -869,43 +911,73 @@ class FamilyFactory(object):
                         fam_cat = target_cat
                 except Exception:
                     pass
+            fam_cat_id = fam_cat.Id if fam_cat else DB.ElementId(DB.BuiltInCategory.OST_GenericModel)
 
             # Add Material Parameter
             sp_defs = shared_param_defs or {}
             m_name, m_inst = cls._resolve_custom_target_spec(custom_parameters, "Material", "Element_Material", True)
             p_mat = cls._add_or_get_parameter(fam_mgr, m_name, "Material", is_instance=m_inst, external_def=sp_defs.get(m_name))
 
-            # 2. Create Native Revit FreeFormElement
-            free_form = DB.FreeFormElement.Create(fam_doc, revit_solid)
+            primary_elem = None
+            if revit_solids:
+                clean_subcat = re.sub(r'[^a-zA-Z0-9_\- ]', '_', str(subcategory_name).strip()) or "R2R_Geometry"
+                subcat_elem = None
+                if fam_cat and subcategory_name:
+                    try:
+                        subcats = fam_cat.SubCategories
+                        if subcats.Contains(clean_subcat):
+                            subcat_elem = subcats.get_Item(clean_subcat)
+                        else:
+                            subcat_elem = fam_doc.Settings.Categories.NewSubcategory(fam_cat, clean_subcat)
+                    except Exception:
+                        subcat_elem = None
 
-            # 3. Create and assign Subcategory
-            if free_form and fam_cat and subcategory_name:
+                for s_item in revit_solids:
+                    ff_elem = DB.FreeFormElement.Create(fam_doc, s_item)
+                    if not primary_elem:
+                        primary_elem = ff_elem
+                    if ff_elem and subcat_elem:
+                        try:
+                            ff_elem.Subcategory = subcat_elem
+                        except Exception:
+                            pass
+                    if ff_elem and p_mat:
+                        try:
+                            mat_param = ff_elem.get_Parameter(DB.BuiltInParameter.MATERIAL_ID_PARAM)
+                            if mat_param:
+                                fam_mgr.AssociateElementParameterToFamilyParameter(mat_param, p_mat)
+                        except Exception:
+                            pass
+            elif revit_fallback_geoms and hasattr(DB, "DirectShape"):
                 try:
-                    subcats = fam_cat.SubCategories
-                    clean_subcat = re.sub(r'[^a-zA-Z0-9_\- ]', '_', str(subcategory_name).strip()) or "R2R_Geometry"
-                    subcat_elem = None
-                    if subcats.Contains(clean_subcat):
-                        subcat_elem = subcats.get_Item(clean_subcat)
-                    else:
-                        subcat_elem = fam_doc.Settings.Categories.NewSubcategory(fam_cat, clean_subcat)
-                    if subcat_elem:
-                        free_form.Subcategory = subcat_elem
+                    ds_fam = DB.DirectShape.CreateElement(fam_doc, fam_cat_id)
+                    ds_fam.SetShape(revit_fallback_geoms)
+                    primary_elem = ds_fam
+                    if ds_fam and p_mat:
+                        try:
+                            mat_param = ds_fam.get_Parameter(DB.BuiltInParameter.MATERIAL_ID_PARAM)
+                            if mat_param and fam_mgr.CanElementParameterBeAssociated(mat_param):
+                                fam_mgr.AssociateElementParameterToFamilyParameter(mat_param, p_mat)
+                        except Exception:
+                            pass
+                except Exception:
+                    primary_elem = None
+
+            if not primary_elem:
+                try:
+                    t.RollBack()
                 except Exception:
                     pass
-
-            # 4. Associate Material Parameter
-            if free_form and p_mat:
                 try:
-                    mat_param = free_form.get_Parameter(DB.BuiltInParameter.MATERIAL_ID_PARAM)
-                    if mat_param:
-                        fam_mgr.AssociateElementParameterToFamilyParameter(mat_param, p_mat)
+                    fam_doc.Close(False)
                 except Exception:
                     pass
+                return None
 
-            # 5. Apply User-Defined Deterministic Data Parameters (Instance & Type)
+            # Apply User-Defined Deterministic Data Parameters (Instance & Type)
             if custom_parameters:
                 cls._apply_custom_family_parameters(
-                    fam_mgr, free_form, custom_parameters,
+                    fam_mgr, primary_elem, custom_parameters,
                     shared_param_defs=sp_defs, allow_constraints=False
                 )
 
