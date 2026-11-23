@@ -47,8 +47,13 @@ if not exist "%LIB_DIR%" mkdir "%LIB_DIR%" >nul 2>&1
 if not exist "%BUTTON_DIR%" mkdir "%BUTTON_DIR%" >nul 2>&1
 
 echo.
-echo Copying R2R Python modules into extension library...
+echo Copying R2R Python modules, XAML UI layouts, and family templates into extension library...
 copy /Y "%PKG_DIR%\*.py" "%LIB_DIR%\" >nul
+copy /Y "%PKG_DIR%\*.xaml" "%LIB_DIR%\" >nul
+if exist "%PKG_DIR%\templates" (
+    if not exist "%LIB_DIR%\templates" mkdir "%LIB_DIR%\templates" >nul 2>&1
+    copy /Y "%PKG_DIR%\templates\*.*" "%LIB_DIR%\templates\" >nul
+)
 if exist "%LIB_DIR%\test_pipeline.py" del /f /q "%LIB_DIR%\test_pipeline.py" >nul 2>&1
 if exist "%LIB_DIR%\Transfer_Profile.json" del /f /q "%LIB_DIR%\Transfer_Profile.json" >nul 2>&1
 
@@ -62,7 +67,7 @@ if exist "%PKG_DIR%\Transfer_Profile.json" (
 
 echo.
 echo Verifying installed files in %LIB_DIR%:
-dir /b "%LIB_DIR%\*.py"
+dir /b "%LIB_DIR%\*.py" "%LIB_DIR%\*.xaml"
 echo.
 
 echo Deploying pyRevit button launcher and metadata...

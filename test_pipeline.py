@@ -3043,6 +3043,20 @@ class TestWpfXamlUiIntegrity(unittest.TestCase):
         row_blk.update_strategy("DirectShape")
         self.assertEqual(row_blk.status_style_key(), "BLOCKED")
 
+    def test_pyrevit_installer_copies_xaml_and_templates(self):
+        """Ensures installer/install_pyrevit.bat copies .py, .xaml, and templates and installer/script.py reloads strategy_rules."""
+        bat_path = os.path.join(pkg_dir, "installer", "install_pyrevit.bat")
+        with open(bat_path, "r", encoding="utf-8") as f:
+            bat_src = f.read()
+        self.assertIn("*.py", bat_src)
+        self.assertIn("*.xaml", bat_src)
+        self.assertIn("templates", bat_src)
+
+        scr_path = os.path.join(pkg_dir, "installer", "script.py")
+        with open(scr_path, "r", encoding="utf-8") as f:
+            scr_src = f.read()
+        self.assertIn("'strategy_rules'", scr_src)
+
 
 class TestAccurateFamilyGeometry(unittest.TestCase):
     """Regression tests preventing silent boxification and enforcing exact geometry in .rfa families."""
