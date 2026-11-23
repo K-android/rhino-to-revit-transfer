@@ -18,29 +18,47 @@ import traceback
 
 ETO_AVAILABLE = False
 WPF_AVAILABLE = False
+WPF_IMPORT_ERROR = ""
+swcp = None
+swi = None
 
 try:
     import clr
-    clr.AddReference("System")
-    clr.AddReference("System.Xml")
-    clr.AddReference("PresentationFramework")
-    clr.AddReference("PresentationCore")
-    clr.AddReference("WindowsBase")
+    for _asm in (
+        "System",
+        "System.Runtime",
+        "System.Diagnostics.Process",
+        "PresentationFramework",
+        "PresentationCore",
+        "WindowsBase",
+        "System.Xaml",
+    ):
+        try:
+            clr.AddReference(_asm)
+        except Exception:
+            pass
 
     import System
-    import System.IO
-    import System.Xml
     import System.Windows as sw
     import System.Windows.Media as swm
     import System.Windows.Markup as swma
     import System.Windows.Controls as swc
-    import System.Windows.Controls.Primitives as swcp
-    import System.Windows.Interop as swi
-    import Microsoft.Win32 as mw32
     from System.Collections.Generic import Dictionary, List
+
+    try:
+        import System.Windows.Controls.Primitives as swcp
+    except Exception:
+        swcp = None
+
+    try:
+        import System.Windows.Interop as swi
+    except Exception:
+        swi = None
+
     WPF_AVAILABLE = True
 except Exception:
     WPF_AVAILABLE = False
+    WPF_IMPORT_ERROR = traceback.format_exc()
 
 try:
     clr.AddReference("RevitAPI")
@@ -153,19 +171,24 @@ def _ui_dir():
 
 
 def _load_xaml_window(xaml_filename):
-    """Loads a pure WPF XAML window from the package directory using XamlReader."""
+    """Loads a pure WPF XAML window cleanly on both .NET 4.8 and .NET 8 (Revit 2025/2026)."""
     if not WPF_AVAILABLE:
         return None
     xaml_path = os.path.join(_ui_dir(), xaml_filename)
     with codecs.open(xaml_path, "r", "utf-8-sig") as f:
         xaml_text = f.read()
-    sr = System.IO.StringReader(xaml_text)
-    xr = System.Xml.XmlReader.Create(sr)
     try:
-        return swma.XamlReader.Load(xr)
-    finally:
-        xr.Close()
-        sr.Dispose()
+        return swma.XamlReader.Parse(xaml_text)
+    except Exception:
+        import System.IO
+        import System.Xml
+        sr = System.IO.StringReader(xaml_text)
+        xr = System.Xml.XmlReader.Create(sr)
+        try:
+            return swma.XamlReader.Load(xr)
+        finally:
+            xr.Close()
+            sr.Dispose()
 
 
 def _make_brush(hex_str):
@@ -244,7 +267,7 @@ def _set_revit_owner(window, revit_uidoc=None, parent_window=None):
             except Exception:
                 hwnd = None
 
-        if hwnd is not None and hwnd != System.IntPtr.Zero:
+        if hwnd is not None and hwnd != System.IntPtr.Zero and swi is not None:
             helper = swi.WindowInteropHelper(window)
             helper.Owner = hwnd
             window.WindowStartupLocation = sw.WindowStartupLocation.CenterOwner
@@ -1265,12 +1288,13 @@ class TransferDashboardDialog(object):
 
         self.grid_review.SelectionChanged += self._on_review_selection_changed
         self.grid_review.MouseDoubleClick += self._on_grid_cell_double_click
-        try:
-            chk_handler = sw.RoutedEventHandler(self._on_grid_checkbox_toggled)
-            self.grid_review.AddHandler(swcp.ToggleButton.CheckedEvent, chk_handler)
-            self.grid_review.AddHandler(swcp.ToggleButton.UncheckedEvent, chk_handler)
-        except Exception:
-            pass
+        if swcp is not None:
+            try:
+                chk_handler = sw.RoutedEventHandler(self._on_grid_checkbox_toggled)
+                self.grid_review.AddHandler(swcp.ToggleButton.CheckedEvent, chk_handler)
+                self.grid_review.AddHandler(swcp.ToggleButton.UncheckedEvent, chk_handler)
+            except Exception:
+                pass
 
         # Inspector Events
         self.btn_insp_split.Click += self._on_insp_split_clicked
@@ -1916,7 +1940,7 @@ class TransferDashboardDialog(object):
         """Optional double-click shortcut opening LayerConfigDialog (ignores CheckBox clicks)."""
         try:
             orig = getattr(e, "OriginalSource", None)
-            if orig is not None and isinstance(orig, swcp.ToggleButton):
+            if orig is not None and swcp is not None and isinstance(orig, swcp.ToggleButton):
                 return
             sel = self._get_selected_review_rows()
             if len(sel) == 1:
@@ -2446,15 +2470,36 @@ class TransferDashboardDialog(object):
             GraphicsValidator.isolate_element_in_view(self.revit_uidoc, elem_id)
             self.lbl_global_status.Text = "Element ID {} isolated in Revit view.".format(elem_id)
 
+    @staticmethod
+    def _create_save_file_dialog(title, filter_str, default_name):
+        """Lazily instantiates Microsoft.Win32.SaveFileDialog (with WinForms fallback)."""
+        try:
+            import Microsoft.Win32 as mw32
+            dlg = mw32.SaveFileDialog()
+            dlg.Title = title
+            dlg.Filter = filter_str
+            dlg.FileName = default_name
+            return (dlg, True)
+        except Exception:
+            clr.AddReference("System.Windows.Forms")
+            import System.Windows.Forms as swf
+            dlg = swf.SaveFileDialog()
+            dlg.Title = title
+            dlg.Filter = filter_str
+            dlg.FileName = default_name
+            return (dlg, False)
+
     def _on_export_html(self, sender, e):
         """Exports QA report as interactive HTML."""
         if not WPF_AVAILABLE:
             return
-        dlg = mw32.SaveFileDialog()
-        dlg.Title = "Save QA Report (HTML)"
-        dlg.Filter = "HTML File (*.html)|*.html|All Files (*.*)|*.*"
-        dlg.FileName = "R2R_QA_Report.html"
-        if dlg.ShowDialog(self.window) == True:
+        dlg, is_wpf = self._create_save_file_dialog(
+            "Save QA Report (HTML)",
+            "HTML File (*.html)|*.html|All Files (*.*)|*.*",
+            "R2R_QA_Report.html"
+        )
+        ok = (dlg.ShowDialog(self.window) == True) if is_wpf else (str(dlg.ShowDialog()) == "OK")
+        if ok:
             dest = dlg.FileName
             ReportExporter.export_html(self.qa_report, dest)
             self.lbl_global_status.Text = "HTML QA Report saved: {}".format(dest)
@@ -2463,11 +2508,13 @@ class TransferDashboardDialog(object):
         """Exports QA report as CSV."""
         if not WPF_AVAILABLE:
             return
-        dlg = mw32.SaveFileDialog()
-        dlg.Title = "Save QA Report (CSV)"
-        dlg.Filter = "CSV File (*.csv)|*.csv|All Files (*.*)|*.*"
-        dlg.FileName = "R2R_QA_Report.csv"
-        if dlg.ShowDialog(self.window) == True:
+        dlg, is_wpf = self._create_save_file_dialog(
+            "Save QA Report (CSV)",
+            "CSV File (*.csv)|*.csv|All Files (*.*)|*.*",
+            "R2R_QA_Report.csv"
+        )
+        ok = (dlg.ShowDialog(self.window) == True) if is_wpf else (str(dlg.ShowDialog()) == "OK")
+        if ok:
             dest = dlg.FileName
             ReportExporter.export_csv(self.qa_report, dest)
             self.lbl_global_status.Text = "CSV QA Report saved: {}".format(dest)

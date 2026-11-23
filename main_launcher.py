@@ -156,7 +156,18 @@ def launch_transfer(revit_doc=None, revit_uidoc=None):
             pass
         return None
 
-    if not dialog or not getattr(dialog, 'IsValid', True):
+    if not dialog or not getattr(dialog, 'IsValid', True) or getattr(dialog, 'window', None) is None:
+        wpf_err = ""
+        try:
+            import ui_dialog as _uid
+            wpf_err = getattr(_uid, "WPF_IMPORT_ERROR", "") or "WPF engine reported WPF_AVAILABLE = False."
+        except Exception:
+            wpf_err = "WPF Window failed to initialize."
+        try:
+            import Autodesk.Revit.UI as UI
+            UI.TaskDialog.Show("R2R Transfer - UI Load Error", wpf_err)
+        except Exception:
+            print("[R2R Transfer UI Load Error]:\n" + wpf_err)
         return None
 
     # 4. Show modal anchored to Revit Main Window handle
@@ -164,7 +175,13 @@ def launch_transfer(revit_doc=None, revit_uidoc=None):
         dialog.ShowModal()
     except Exception:
         import traceback
-        print("[R2R Transfer] Dialog presentation notice:\n{}".format(traceback.format_exc()))
+        err_show = traceback.format_exc()
+        print("[R2R Transfer] Dialog presentation notice:\n{}".format(err_show))
+        try:
+            import Autodesk.Revit.UI as UI
+            UI.TaskDialog.Show("R2R Transfer - Window Error", err_show)
+        except Exception:
+            pass
 
     return dialog
 
