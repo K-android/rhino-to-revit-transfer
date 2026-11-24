@@ -812,14 +812,29 @@ class FamilyFactory(object):
                         except Exception:
                             pass
 
+                    input_closed = bool(getattr(working_tsb, "IsSolid", getattr(working_tsb, "IsClosed", True)))
                     meshes = []
                     if isinstance(working_tsb, rg.Mesh):
                         meshes = [working_tsb]
                     elif isinstance(working_tsb, rg.Brep):
-                        mp = rg.MeshingParameters.Default
+                        mp = getattr(rg.MeshingParameters, "QualityRenderMesh", None) or rg.MeshingParameters.Default
                         b_meshes = rg.Mesh.CreateFromBrep(working_tsb, mp)
+                        if not b_meshes and mp != rg.MeshingParameters.Default:
+                            b_meshes = rg.Mesh.CreateFromBrep(working_tsb, rg.MeshingParameters.Default)
                         if b_meshes:
                             meshes = list(b_meshes)
+
+                    def _non_degen_tri(v0, v1, v2):
+                        if v0.DistanceTo(v1) <= 0.0001 or v1.DistanceTo(v2) <= 0.0001 or v2.DistanceTo(v0) <= 0.0001:
+                            return False
+                        try:
+                            d1 = v1 - v0
+                            d2 = v2 - v0
+                            if hasattr(d1, "CrossProduct") and d1.CrossProduct(d2).GetLength() <= 1e-8:
+                                return False
+                        except Exception:
+                            pass
+                        return True
 
                     def _run_tsb(target_mode, fallback_mode, is_closed_set):
                         tsb = DB.TessellatedShapeBuilder()
@@ -838,7 +853,7 @@ class FamilyFactory(object):
                                 v0 = DB.XYZ(float(p0.X), float(p0.Y), float(p0.Z))
                                 v1 = DB.XYZ(float(p1.X), float(p1.Y), float(p1.Z))
                                 v2 = DB.XYZ(float(p2.X), float(p2.Y), float(p2.Z))
-                                if v0.DistanceTo(v1) > 0.0001 and v1.DistanceTo(v2) > 0.0001 and v2.DistanceTo(v0) > 0.0001:
+                                if _non_degen_tri(v0, v1, v2):
                                     loop_pts = List[DB.XYZ]()
                                     loop_pts.Add(v0)
                                     loop_pts.Add(v1)
@@ -848,7 +863,7 @@ class FamilyFactory(object):
                                 if hasattr(f, "IsQuad") and f.IsQuad:
                                     p3 = verts[f.D]
                                     v3 = DB.XYZ(float(p3.X), float(p3.Y), float(p3.Z))
-                                    if v0.DistanceTo(v2) > 0.0001 and v2.DistanceTo(v3) > 0.0001 and v3.DistanceTo(v0) > 0.0001:
+                                    if _non_degen_tri(v0, v2, v3):
                                         loop_pts2 = List[DB.XYZ]()
                                         loop_pts2.Add(v0)
                                         loop_pts2.Add(v2)
@@ -869,11 +884,19 @@ class FamilyFactory(object):
                         return []
 
                     if meshes:
-                        salvage_fb = getattr(DB.TessellatedShapeBuilderFallback, "Salvage", DB.TessellatedShapeBuilderFallback.Abort)
-                        solid_objs = _run_tsb(DB.TessellatedShapeBuilderTarget.Solid, salvage_fb, True)
-                        for go in solid_objs:
-                            if isinstance(go, DB.Solid) and getattr(go, "Volume", 0.0) > 0.000001:
-                                revit_solids.append(go)
+                        # Pass 1: Watertight Solid with Abort (never Salvage) ONLY when closed
+                        if input_closed:
+                            try:
+                                solid_objs = _run_tsb(
+                                    DB.TessellatedShapeBuilderTarget.Solid,
+                                    DB.TessellatedShapeBuilderFallback.Abort,
+                                    True
+                                )
+                                for go in solid_objs:
+                                    if isinstance(go, DB.Solid) and getattr(go, "Volume", 0.0) > 0.000001:
+                                        revit_solids.append(go)
+                            except Exception:
+                                pass
 
                         # Pass 2: Open / non-watertight exact mesh container inside .rfa family
                         if not revit_solids:

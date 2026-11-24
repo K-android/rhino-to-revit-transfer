@@ -65,6 +65,10 @@ class ScannedObject(object):
         self.is_planar = False
         self.is_horizontal = False
         self.is_vertical = False
+        self.is_planar_sloped = False
+        self.is_curved_extrusion = False
+        self.dominant_normal = (0.0, 0.0, 1.0)
+        self.slope_ratio = 0.0
         self.thickness = 0.0
         self.loop_count = 0
         self.repetition_signature = ""
@@ -133,6 +137,9 @@ class ScannedObject(object):
             "is_planar": self.is_planar,
             "is_horizontal": self.is_horizontal,
             "is_vertical": self.is_vertical,
+            "is_planar_sloped": self.is_planar_sloped,
+            "is_curved_extrusion": self.is_curved_extrusion,
+            "slope_ratio": self.slope_ratio,
             "thickness": self.thickness,
             "loop_count": self.loop_count,
             "geometry_primitive_type": self.geometry_primitive_type,
@@ -567,6 +574,9 @@ class RhinoScanner(object):
             # Orientation analysis: inspect face normals safely (sample at most 50 faces)
             horiz_face_count = 0
             vert_face_count = 0
+            sloped_planar_count = 0
+            best_sloped_normal = None
+            best_sloped_span = -1.0
             sample_count = 0
             try:
                 if face_count > 0:
@@ -577,7 +587,7 @@ class RhinoScanner(object):
                         # Fast planar normal check first
                         plane_success, plane = face.TryGetPlane(0.01) if hasattr(face, "TryGetPlane") else (False, None)
                         if plane_success and plane:
-                            normal = plane.Normal
+                            normal = rg.Vector3d(plane.Normal)
                         else:
                             d0 = face.Domain(0)
                             d1 = face.Domain(1)
@@ -595,12 +605,67 @@ class RhinoScanner(object):
                             # Perpendicular to World Z (Vertical wall)
                             elif abs(normal.Z) < 0.05:
                                 vert_face_count += 1
+                            elif plane_success and 0.20 <= abs(normal.Z) <= 0.95:
+                                sloped_planar_count += 1
+                                try:
+                                    fb = face.GetBoundingBox(True)
+                                    span = ((fb.Max.X - fb.Min.X) ** 2 +
+                                            (fb.Max.Y - fb.Min.Y) ** 2 +
+                                            (fb.Max.Z - fb.Min.Z) ** 2)
+                                except Exception:
+                                    span = 1.0
+                                if span > best_sloped_span:
+                                    best_sloped_span = span
+                                    nx, ny, nz = float(normal.X), float(normal.Y), float(normal.Z)
+                                    if nz < 0.0:
+                                        nx, ny, nz = -nx, -ny, -nz
+                                    best_sloped_normal = (nx, ny, nz)
             except Exception:
                 pass
 
             if sample_count > 0:
                 scanned.is_horizontal = (horiz_face_count / float(sample_count)) > 0.3 or (scanned.dz < min(scanned.dx, scanned.dy) * 0.4 and horiz_face_count >= 1)
                 scanned.is_vertical = (vert_face_count / float(sample_count)) > 0.3 or (scanned.dz >= 1.5 and vert_face_count >= 1)
+                scanned.is_planar_sloped = bool(
+                    (sloped_planar_count >= 1 and (sloped_planar_count / float(sample_count)) >= 0.25)
+                    or (face_count == 1 and sloped_planar_count == 1)
+                )
+                if scanned.is_planar_sloped and best_sloped_normal is not None:
+                    nx, ny, nz = best_sloped_normal
+                    scanned.dominant_normal = (nx, ny, nz)
+                    scanned.slope_ratio = round(math.sqrt(nx * nx + ny * ny) / max(abs(nz), 1e-6), 6)
+
+            # Horizontal curved extrusion detection (vault / barrel roof candidates)
+            try:
+                if isinstance(geom, rg.Extrusion):
+                    p_vec = geom.PathEnd - geom.PathStart
+                    if p_vec.Length > 1e-4:
+                        p_vec.Unitize()
+                        if abs(p_vec.Z) < 0.15 and not scanned.is_vertical and sloped_planar_count == 0 and horiz_face_count == 0:
+                            scanned.is_curved_extrusion = True
+                elif (1 <= face_count <= 6 and not scanned.is_horizontal
+                      and not scanned.is_planar_sloped and not scanned.is_vertical):
+                    for face in working_brep.Faces:
+                        ok_pl, _ = face.TryGetPlane(0.01) if hasattr(face, "TryGetPlane") else (False, None)
+                        if ok_pl:
+                            continue
+                        d0 = face.Domain(0)
+                        d1 = face.Domain(1)
+                        if d0.Length <= 0 or d1.Length <= 0:
+                            continue
+                        iso_u = face.IsoCurve(1, 0.5 * (d0.Min + d0.Max)) if hasattr(face, "IsoCurve") else None
+                        iso_v = face.IsoCurve(0, 0.5 * (d1.Min + d1.Max)) if hasattr(face, "IsoCurve") else None
+                        if iso_u and iso_v:
+                            u_lin = bool(iso_u.IsLinear(0.01))
+                            v_lin = bool(iso_v.IsLinear(0.01))
+                            if u_lin != v_lin:
+                                lin_c = iso_u if u_lin else iso_v
+                                vec = lin_c.PointAtEnd - lin_c.PointAtStart
+                                if vec.Length > 1e-4 and abs(vec.Z) < 0.15 * vec.Length:
+                                    scanned.is_curved_extrusion = True
+                                    break
+            except Exception:
+                pass
 
             # Architectural surface area adjustment for solid slabs/walls:
             # Half of the total 3D Brep surface area is the standard architectural single-face area!

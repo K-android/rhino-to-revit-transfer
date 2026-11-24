@@ -631,9 +631,17 @@ class ConversionRouter(object):
         if self.global_mode == "Geometry-First" and strategy not in ("FloorNative", "AdaptiveComponent"):
             strategy = "DirectShape"
 
+        target_cat_hint = (
+            getattr(profile_rule, "revit_category", None)
+            or (getattr(classification_result, "revit_category_name", None) if classification_result else None)
+            or (getattr(classification_result, "inferred_category", None) if classification_result else None)
+        )
+
         # Deterministic Per-Object Strategy Rule Guard
         if StrategyRuleEngine:
-            ok_rule, failures_rule, _, fallback_rule = StrategyRuleEngine.evaluate_object(scanned_obj, strategy)
+            ok_rule, failures_rule, _, fallback_rule = StrategyRuleEngine.evaluate_object(
+                scanned_obj, strategy, current_category=target_cat_hint
+            )
             if not ok_rule:
                 policy = (getattr(profile_rule, "mixed_policy", None) or self.mixed_policy)
                 reason_str = "; ".join(failures_rule)
@@ -960,28 +968,135 @@ class ConversionRouter(object):
         except Exception:
             return []
 
-    def _build_curveloop_from_rhino_curve(self, rh_curve, target_z=None, is_outer=True):
-        """Builds a contiguous, strictly horizontal, closed Revit CurveLoop from a Rhino curve."""
+    def _try_extract_rhino_arc(self, seg, tol=0.005):
+        """Extracts (ok, rg.Arc_or_None) from a Rhino curve segment across CPython/IronPython signatures."""
+        if not RHINO_AVAILABLE or not seg:
+            return (False, None)
+        try:
+            arc_crv_cls = getattr(rg, "ArcCurve", None)
+            if arc_crv_cls and isinstance(seg, arc_crv_cls):
+                return (True, seg.Arc)
+            if hasattr(seg, "TryGetArc"):
+                res = seg.TryGetArc(tol)
+                if isinstance(res, tuple):
+                    return (bool(res[0]), res[1])
+                elif res is True:
+                    return (True, None)
+                elif System is not None:
+                    try:
+                        arc_cls = getattr(rg, "Arc", None)
+                        if arc_cls is not None:
+                            ref_arc = clr.Reference[arc_cls]()
+                            if seg.TryGetArc(ref_arc, tol):
+                                return (True, ref_arc.Value)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return (False, None)
+
+    def _tessellate_segment_to_revit_curves(self, seg, p0, p1, flat_z=None):
+        """Converts one Rhino curve segment between p0 and p1 into contiguous Revit DB.Curve objects.
+
+        - Linear segments -> DB.Line.CreateBound(p0, p1)
+        - Circular arcs -> DB.Arc.Create(p0, p1, pm) (splitting full circles into 2 half-arcs)
+        - NURBS / Splines / Ellipses -> adaptive chord DB.Line segments (>= 0.004 ft) instead of
+          3-point DB.Arc (which distorts S-curves and complex splines).
+        """
+        def _mk_pt(pt_rh):
+            z_v = float(flat_z) if flat_z is not None else float(pt_rh.Z)
+            return DB.XYZ(float(pt_rh.X), float(pt_rh.Y), z_v)
+
+        out_curves = []
+        is_closed_single = (p0.DistanceTo(p1) < 0.003) and bool(getattr(seg, "IsClosed", False))
+        if p0.DistanceTo(p1) < 0.003 and not is_closed_single:
+            return out_curves
+
+        if (not is_closed_single) and hasattr(seg, "IsLinear") and seg.IsLinear(0.003):
+            out_curves.append(DB.Line.CreateBound(p0, p1))
+            return out_curves
+
+        ok_arc, rh_arc = self._try_extract_rhino_arc(seg, 0.005)
+        if ok_arc:
+            try:
+                is_full = is_closed_single or (rh_arc and abs(getattr(rh_arc, "AngleRadians", 0.0)) > math.pi * 1.9)
+                if is_full:
+                    t0 = seg.Domain.Min
+                    t1 = seg.Domain.Max
+                    t_mid = 0.5 * (t0 + t1)
+                    pm = _mk_pt(seg.PointAt(t_mid))
+                    pm1 = _mk_pt(seg.PointAt(0.5 * (t0 + t_mid)))
+                    pm2 = _mk_pt(seg.PointAt(0.5 * (t_mid + t1)))
+                    if p0.DistanceTo(pm) >= 0.004:
+                        out_curves.append(DB.Arc.Create(p0, pm, pm1))
+                        out_curves.append(DB.Arc.Create(pm, p0 if is_closed_single else p1, pm2))
+                        return out_curves
+                else:
+                    t_m = 0.5 * (seg.Domain.Min + seg.Domain.Max)
+                    pm = _mk_pt(seg.PointAt(t_m))
+                    if p0.DistanceTo(pm) >= 0.003 and p1.DistanceTo(pm) >= 0.003:
+                        out_curves.append(DB.Arc.Create(p0, p1, pm))
+                        return out_curves
+            except Exception:
+                pass
+
+        # Non-arc NURBS / Spline / Ellipse: clean chordal polyline tessellation
+        pts = [p0]
+        raw_pts = []
+        try:
+            if hasattr(seg, "ToPolyline"):
+                poly_crv = seg.ToPolyline(0.01, 0.05, 0.02, 0.0)
+                if poly_crv and hasattr(poly_crv, "ToPolyline"):
+                    pl = poly_crv.ToPolyline()
+                    if pl and pl.Count >= 3:
+                        for idx in range(1, pl.Count - 1):
+                            raw_pts.append(_mk_pt(pl[idx]))
+        except Exception:
+            raw_pts = []
+
+        if not raw_pts:
+            try:
+                seg_len = seg.GetLength() if hasattr(seg, "GetLength") else max(1.0, p0.DistanceTo(p1))
+                n_div = max(6 if is_closed_single else 4, min(48, int(seg_len / 0.5) + 4))
+                t0 = seg.Domain.Min
+                t1 = seg.Domain.Max
+                for k in range(1, n_div):
+                    t_val = t0 + (float(k) / float(n_div)) * (t1 - t0)
+                    raw_pts.append(_mk_pt(seg.PointAt(t_val)))
+            except Exception:
+                raw_pts = []
+
+        end_pt = p0 if is_closed_single else p1
+        last_pt = p0
+        for pt in raw_pts:
+            if pt.DistanceTo(last_pt) >= 0.004 and pt.DistanceTo(end_pt) >= 0.004:
+                pts.append(pt)
+                last_pt = pt
+        pts.append(end_pt)
+
+        for k in range(len(pts) - 1):
+            if pts[k].DistanceTo(pts[k + 1]) >= 0.003:
+                out_curves.append(DB.Line.CreateBound(pts[k], pts[k + 1]))
+        return out_curves
+
+    def _chain_and_build_curveloop(self, rh_curve, flat_z=None, plane_normal=None, is_outer=True):
+        """Chains curve segments head-to-tail and builds a closed Revit DB.CurveLoop."""
         if not REVIT_AVAILABLE or not hasattr(DB, "CurveLoop") or not rh_curve:
             return None
 
-        tz = float(target_z) if target_z is not None else rh_curve.PointAtStart.Z
-
-        # 1. Curve preparation: explode or split single closed curve
         segments = rh_curve.DuplicateSegments()
         if not segments or len(segments) <= 1:
-            if rh_curve.IsClosed:
+            if getattr(rh_curve, "IsClosed", False):
                 t0 = rh_curve.Domain.Min
                 t1 = rh_curve.Domain.Max
                 t_mid = 0.5 * (t0 + t1)
-                splits = rh_curve.Split(t_mid)
+                splits = rh_curve.Split(t_mid) if hasattr(rh_curve, "Split") else None
                 segments = list(splits) if (splits and len(splits) >= 2) else [rh_curve]
             else:
                 segments = [rh_curve]
         else:
             segments = list(segments)
 
-        # 2. Chain head-to-tail to guarantee curve direction and connectivity
         ordered = []
         pool = [s.DuplicateCurve() if hasattr(s, "DuplicateCurve") else s.Duplicate() for s in segments if s]
         if not pool:
@@ -989,7 +1104,6 @@ class ConversionRouter(object):
 
         curr = pool.pop(0)
         ordered.append(curr)
-
         while pool:
             curr_end = curr.PointAtEnd
             best_idx = 0
@@ -1012,37 +1126,21 @@ class ConversionRouter(object):
             ordered.append(nxt)
             curr = nxt
 
-        # 3. Create Revit Curve objects with exact vertex snapping at uniform tz
         n = len(ordered)
         revit_curves = []
         for i in range(n):
             seg = ordered[i]
-            p0 = DB.XYZ(seg.PointAtStart.X, seg.PointAtStart.Y, tz)
-            if i < n - 1:
-                p1 = DB.XYZ(ordered[i+1].PointAtStart.X, ordered[i+1].PointAtStart.Y, tz)
-            else:
-                p1 = DB.XYZ(ordered[0].PointAtStart.X, ordered[0].PointAtStart.Y, tz)
-
-            dist = p0.DistanceTo(p1)
-            if dist < 0.003:  # Skip micro-segments under short curve tolerance
-                continue
-
-            if seg.IsLinear(0.003):
-                revit_curves.append(DB.Line.CreateBound(p0, p1))
-            else:
-                t_m = 0.5 * (seg.Domain.Min + seg.Domain.Max)
-                pt_m = seg.PointAt(t_m)
-                pm = DB.XYZ(pt_m.X, pt_m.Y, tz)
-                try:
-                    arc = DB.Arc.Create(p0, p1, pm)
-                    revit_curves.append(arc)
-                except Exception:
-                    revit_curves.append(DB.Line.CreateBound(p0, p1))
+            nxt_seg = ordered[i + 1] if i < n - 1 else ordered[0]
+            z0 = float(flat_z) if flat_z is not None else float(seg.PointAtStart.Z)
+            z1 = float(flat_z) if flat_z is not None else float(nxt_seg.PointAtStart.Z)
+            p0 = DB.XYZ(float(seg.PointAtStart.X), float(seg.PointAtStart.Y), z0)
+            p1 = DB.XYZ(float(nxt_seg.PointAtStart.X), float(nxt_seg.PointAtStart.Y), z1)
+            seg_curves = self._tessellate_segment_to_revit_curves(seg, p0, p1, flat_z=flat_z)
+            revit_curves.extend(seg_curves)
 
         if len(revit_curves) < 2:
             return None
 
-        # Build CurveLoop and append
         cl = DB.CurveLoop()
         for c in revit_curves:
             try:
@@ -1050,12 +1148,11 @@ class ConversionRouter(object):
             except Exception:
                 pass
 
-        # If loop is slightly open, heal by connecting last endpoint to first startpoint
         if cl.IsOpen() and len(revit_curves) > 0:
             try:
                 first_p = revit_curves[0].GetEndPoint(0)
                 last_p = revit_curves[-1].GetEndPoint(1)
-                if first_p.DistanceTo(last_p) > 0.001:
+                if first_p.DistanceTo(last_p) > 0.003:
                     cl.Append(DB.Line.CreateBound(last_p, first_p))
             except Exception:
                 pass
@@ -1063,36 +1160,239 @@ class ConversionRouter(object):
         if cl.IsOpen():
             return None
 
-        # 4. Enforce strict CCW for outer loop and CW for inner loops
-        try:
-            if is_outer:
-                if not cl.IsCounterClockwise(DB.XYZ.BasisZ):
-                    cl.Reverse()
-            else:
-                if cl.IsCounterClockwise(DB.XYZ.BasisZ):
-                    cl.Reverse()
-        except Exception:
-            pass
+        orient_norm = plane_normal
+        if orient_norm is None and flat_z is not None:
+            orient_norm = DB.XYZ.BasisZ
+        if orient_norm is not None:
+            try:
+                if is_outer:
+                    if not cl.IsCounterClockwise(orient_norm):
+                        cl.Reverse()
+                else:
+                    if cl.IsCounterClockwise(orient_norm):
+                        cl.Reverse()
+            except Exception:
+                pass
 
         return cl
 
+    def _build_curveloop_from_rhino_curve(self, rh_curve, target_z=None, is_outer=True):
+        """Builds a contiguous, strictly horizontal, closed Revit CurveLoop from a Rhino curve."""
+        if not REVIT_AVAILABLE or not hasattr(DB, "CurveLoop") or not rh_curve:
+            return None
+        tz = float(target_z) if target_z is not None else float(rh_curve.PointAtStart.Z)
+        return self._chain_and_build_curveloop(rh_curve, flat_z=tz, plane_normal=DB.XYZ.BasisZ, is_outer=is_outer)
+
+    def _build_3d_curveloop_from_rhino_curve(self, rh_curve, plane_normal=None, is_outer=True):
+        """Builds a contiguous closed Revit CurveLoop preserving 3D (X, Y, Z) coordinates (e.g. WallByProfile)."""
+        if not REVIT_AVAILABLE or not hasattr(DB, "CurveLoop") or not rh_curve:
+            return None
+        return self._chain_and_build_curveloop(rh_curve, flat_z=None, plane_normal=plane_normal, is_outer=is_outer)
+
+    def _resolve_effective_material_name(self, scanned_obj, profile_rule=None):
+        """Resolves UI/profile material override before Rhino object material or layer name."""
+        override_mat = getattr(profile_rule, "material", None) if profile_rule else None
+        if override_mat and str(override_mat).strip() not in ("", "<Auto from Rhino>", "ByLayer", "Default", "None"):
+            return str(override_mat).strip()
+        return getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
+
+    def _extract_roof_or_slab_footprint_and_slope(self, geom_feet, scanned_obj=None):
+        """Extracts planar top boundary, true perpendicular thickness, bottom soffit Z, and slope vector.
+
+        Supports both flat horizontal slabs and planar sloped roofs/ramps (0.20 <= |normal.Z| <= 0.999).
+        Returns None if geometry is a double-curved shell with no planar top/bottom faces.
+        """
+        if not RHINO_AVAILABLE or not geom_feet or isinstance(geom_feet, str):
+            return None
+
+        if isinstance(geom_feet, rg.Curve):
+            crv, inner_crvs, z_val = self._extract_floor_boundary_loops(geom_feet, scanned_obj)
+            if not crv:
+                return None
+            default_thk = max(0.2, float(getattr(scanned_obj, "thickness", 0.3) or 0.3) * self.unit_scale)
+            return {
+                "outer_crv": crv,
+                "inner_crvs": inner_crvs,
+                "top_z": float(z_val),
+                "bottom_z": float(z_val) - default_thk,
+                "thickness_feet": default_thk,
+                "is_sloped": False,
+                "rise_over_run": 0.0,
+                "slope_dir_xy": (0.0, 0.0),
+                "uphill_dir_xy": (0.0, 0.0),
+                "tail_pt_xy": (0.0, 0.0),
+                "head_pt_xy": (0.0, 0.0),
+            }
+
+        working_brep = None
+        if isinstance(geom_feet, rg.Brep):
+            working_brep = geom_feet
+        elif hasattr(geom_feet, "ToBrep"):
+            try:
+                working_brep = geom_feet.ToBrep()
+            except Exception:
+                working_brep = None
+
+        if not working_brep:
+            return None
+
+        bbox = working_brep.GetBoundingBox(True)
+        planar_candidates = []
+        for face in working_brep.Faces:
+            ok_pl, plane = face.TryGetPlane(0.05) if hasattr(face, "TryGetPlane") else (False, None)
+            if not ok_pl or not plane or plane.Normal.Length <= 1e-6:
+                continue
+            n = rg.Vector3d(plane.Normal)
+            n.Unitize()
+            if abs(n.Z) < 0.20:
+                continue
+            if n.Z < 0.0:
+                n = -n
+            try:
+                amp = rg.AreaMassProperties.Compute(face)
+                area = float(amp.Area) if amp else 0.0
+            except Exception:
+                area = 0.0
+            if area <= 1e-6:
+                fb = face.GetBoundingBox(True)
+                area = max(1e-4, (fb.Max.X - fb.Min.X) * (fb.Max.Y - fb.Min.Y))
+            fb = face.GetBoundingBox(True)
+            planar_candidates.append((area * abs(n.Z), fb.Center.Z, face, plane, n, fb))
+
+        if not planar_candidates:
+            return None
+
+        # Pick largest projected area face, preferring top face when areas match closely
+        planar_candidates.sort(key=lambda item: (round(item[0], 2), item[1]), reverse=True)
+        _, top_center_z, top_face, _, top_norm, top_fb = planar_candidates[0]
+
+        outer_crv = top_face.OuterLoop.To3dCurve() if getattr(top_face, "OuterLoop", None) else None
+        if not outer_crv:
+            return None
+        inner_crvs = []
+        for lp in getattr(top_face, "Loops", []):
+            if lp.LoopType == rg.BrepLoopType.Inner:
+                ic = lp.To3dCurve()
+                if ic:
+                    inner_crvs.append(ic)
+
+        # Find parallel bottom face to get true perpendicular slab thickness (crucial for sloped roofs!)
+        top_c = top_fb.Center
+        best_bot_fb = None
+        perp_thickness = None
+        for _, _, cand_face, _, cand_n, cand_fb in planar_candidates[1:]:
+            if cand_face == top_face:
+                continue
+            dot_n = abs(top_norm.X * cand_n.X + top_norm.Y * cand_n.Y + top_norm.Z * cand_n.Z)
+            if dot_n > 0.985:
+                diff = top_c - cand_fb.Center
+                d_perp = abs(diff.X * top_norm.X + diff.Y * top_norm.Y + diff.Z * top_norm.Z)
+                signed_z = top_c.Z - cand_fb.Center.Z
+                if d_perp > 0.02 and signed_z >= 0.0:
+                    perp_thickness = d_perp
+                    best_bot_fb = cand_fb
+                    break
+
+        nx, ny, nz = float(top_norm.X), float(top_norm.Y), float(top_norm.Z)
+        horiz_len = math.sqrt(nx * nx + ny * ny)
+        rise_over_run = (horiz_len / nz) if (nz > 1e-6 and abs(nz) < 0.995) else 0.0
+        is_sloped = (rise_over_run >= 0.01)
+
+        if perp_thickness is not None and perp_thickness >= 0.02:
+            thickness_feet = float(perp_thickness)
+        elif not is_sloped and (bbox.Max.Z - bbox.Min.Z) >= 0.02:
+            thickness_feet = float(bbox.Max.Z - bbox.Min.Z)
+        else:
+            sc_thk = float(getattr(scanned_obj, "thickness", 0.0) or 0.0) * self.unit_scale if scanned_obj else 0.0
+            thickness_feet = sc_thk if (0.05 <= sc_thk <= 3.0) else 0.5
+
+        if best_bot_fb is not None:
+            bottom_z = float(best_bot_fb.Min.Z) if is_sloped else float(best_bot_fb.Center.Z)
+        elif not is_sloped and (bbox.Max.Z - bbox.Min.Z) >= 0.02:
+            bottom_z = float(bbox.Min.Z)
+        else:
+            bottom_z = float(top_fb.Min.Z) - (thickness_feet / max(nz, 0.2))
+
+        slope_dir_xy = (0.0, 0.0)
+        uphill_dir_xy = (0.0, 0.0)
+        tail_pt_xy = (float(top_c.X), float(top_c.Y))
+        head_pt_xy = (float(top_c.X), float(top_c.Y))
+
+        if is_sloped and horiz_len > 1e-6:
+            dx = nx / horiz_len
+            dy = ny / horiz_len
+            slope_dir_xy = (dx, dy)       # downhill (normal XY direction)
+            uphill_dir_xy = (-dx, -dy)    # uphill (-normal XY direction)
+            # Find extreme downhill/uphill points along slope_dir_xy using outer boundary vertices
+            sample_pts = []
+            segs = outer_crv.DuplicateSegments()
+            if segs:
+                for s in segs:
+                    sample_pts.append(s.PointAtStart)
+                    sample_pts.append(s.PointAtEnd)
+            else:
+                sample_pts.append(outer_crv.PointAtStart)
+            if sample_pts:
+                best_low = None
+                best_low_proj = float("-inf")
+                best_high = None
+                best_high_proj = float("inf")
+                for pt in sample_pts:
+                    proj_down = pt.X * dx + pt.Y * dy
+                    if proj_down > best_low_proj:
+                        best_low_proj = proj_down
+                        best_low = pt
+                    if proj_down < best_high_proj:
+                        best_high_proj = proj_down
+                        best_high = pt
+                if best_low and best_high:
+                    # Place tail and head cleanly on a straight chord parallel to uphill_dir_xy
+                    span_dist = max(0.5, best_low_proj - best_high_proj)
+                    mid_x = 0.5 * (float(best_low.X) + float(best_high.X))
+                    mid_y = 0.5 * (float(best_low.Y) + float(best_high.Y))
+                    tail_pt_xy = (mid_x + 0.5 * span_dist * dx, mid_y + 0.5 * span_dist * dy)
+                    head_pt_xy = (mid_x - 0.5 * span_dist * dx, mid_y - 0.5 * span_dist * dy)
+
+        return {
+            "outer_crv": outer_crv,
+            "inner_crvs": inner_crvs,
+            "top_z": float(top_fb.Min.Z) if is_sloped else float(top_center_z),
+            "bottom_z": float(bottom_z),
+            "thickness_feet": float(thickness_feet),
+            "is_sloped": bool(is_sloped),
+            "rise_over_run": float(rise_over_run),
+            "slope_dir_xy": slope_dir_xy,
+            "uphill_dir_xy": uphill_dir_xy,
+            "tail_pt_xy": tail_pt_xy,
+            "head_pt_xy": head_pt_xy,
+        }
+
     # =========================================================================
-    # PIPELINE 1: Native Floor
+    # PIPELINE 1: Native Floor (Flat & Planar Sloped)
     # =========================================================================
     def _pipeline_1_native_floor(self, scanned_obj, geom_feet, level_id, profile_rule, res):
-        """Creates native Revit Floor using top horizontal boundary and void loops."""
+        """Creates native Revit Floor using top horizontal/sloped boundary and void loops."""
         if not level_id or level_id == DB.ElementId.InvalidElementId:
             level_id = self._resolve_level_id(scanned_obj)
         level_elem = self.doc.GetElement(level_id) if level_id and level_id != DB.ElementId.InvalidElementId else None
-        level_elev = level_elem.Elevation if level_elem else 0.0
+        level_elev = float(level_elem.Elevation) if level_elem else 0.0
 
-        # Determine slab thickness from bounding box dz or scanned object dz to match FloorType
+        mat_name = self._resolve_effective_material_name(scanned_obj, profile_rule)
+
+        # Sloped planar slab / ramp path (Revit 2022+ 7-arg Floor.Create with slope arrow)
+        is_sloped_obj = bool(getattr(scanned_obj, "is_planar_sloped", False))
+        slope_info = None
+        if is_sloped_obj and RHINO_AVAILABLE and not isinstance(geom_feet, str):
+            slope_info = self._extract_roof_or_slab_footprint_and_slope(geom_feet, scanned_obj)
+
         bbox = geom_feet.GetBoundingBox(True) if hasattr(geom_feet, "GetBoundingBox") else None
-        slab_thickness_feet = (bbox.Max.Z - bbox.Min.Z) if bbox else 0.0
-        if slab_thickness_feet < 0.05:
-            slab_thickness_feet = max(0.2, (float(getattr(scanned_obj, "dz", 0.3) or 0.3) * self.unit_scale))
+        if slope_info:
+            slab_thickness_feet = slope_info["thickness_feet"]
+        else:
+            slab_thickness_feet = (bbox.Max.Z - bbox.Min.Z) if bbox else 0.0
+            if slab_thickness_feet < 0.05:
+                slab_thickness_feet = max(0.2, (float(getattr(scanned_obj, "dz", 0.3) or 0.3) * self.unit_scale))
 
-        mat_name = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
         floor_type_id = self._get_or_create_matching_floor_type(slab_thickness_feet, mat_name)
         if not floor_type_id or floor_type_id == DB.ElementId.InvalidElementId:
             floor_type_id = self.default_floor_type
@@ -1101,6 +1401,44 @@ class ConversionRouter(object):
             ft = col_ft.FirstElement()
             if ft:
                 floor_type_id = ft.Id
+
+        if slope_info and slope_info.get("is_sloped") and slope_info.get("outer_crv"):
+            outer_cl_s = self._build_curveloop_from_rhino_curve(slope_info["outer_crv"], target_z=level_elev, is_outer=True)
+            if outer_cl_s:
+                loops_s = List[DB.CurveLoop]()
+                loops_s.Add(outer_cl_s)
+                for ic in (slope_info.get("inner_crvs") or []):
+                    icl_s = self._build_curveloop_from_rhino_curve(ic, target_z=level_elev, is_outer=False)
+                    if icl_s:
+                        loops_s.Add(icl_s)
+                tail_xy = slope_info["tail_pt_xy"]
+                head_xy = slope_info["head_pt_xy"]
+                p_tail = DB.XYZ(tail_xy[0], tail_xy[1], level_elev)
+                p_head = DB.XYZ(head_xy[0], head_xy[1], level_elev)
+                if p_tail.DistanceTo(p_head) > 0.05 and hasattr(DB, "Floor") and hasattr(DB.Floor, "Create"):
+                    try:
+                        slope_arrow = DB.Line.CreateBound(p_tail, p_head)
+                        sloped_floor = DB.Floor.Create(
+                            self.doc, loops_s, floor_type_id, level_id, False, slope_arrow, float(slope_info["rise_over_run"])
+                        )
+                        if sloped_floor:
+                            res.strategy_used = "FloorNative"
+                            p_offset = sloped_floor.get_Parameter(DB.BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM)
+                            if p_offset and not p_offset.IsReadOnly:
+                                try:
+                                    p_offset.Set(float(slope_info["top_z"]) - level_elev)
+                                except Exception:
+                                    pass
+                            p_rb = sloped_floor.get_Parameter(DB.BuiltInParameter.WALL_ATTR_ROOM_BOUNDING)
+                            if p_rb and not p_rb.IsReadOnly:
+                                try:
+                                    p_rb.Set(1)
+                                except Exception:
+                                    pass
+                            res.bua_area = getattr(scanned_obj, "area", 0.0)
+                            return sloped_floor
+                    except Exception as ex_sl:
+                        res.warnings.append("Sloped Floor.Create notice: {}. Retrying standard planar path.".format(ex_sl))
 
         outer_crv, inner_crvs, slab_top_z = self._extract_floor_boundary_loops(geom_feet, scanned_obj)
         if not outer_crv:
@@ -1112,6 +1450,7 @@ class ConversionRouter(object):
 
         # Attempt A: Floor.Create with curve loops at slab_top_z
         curve_loops_slab = List[DB.CurveLoop]()
+        curve_loops_lvl = None
         outer_cl_slab = self._build_curveloop_from_rhino_curve(outer_crv, target_z=slab_top_z, is_outer=True)
         if outer_cl_slab:
             curve_loops_slab.Add(outer_cl_slab)
@@ -1147,8 +1486,9 @@ class ConversionRouter(object):
         if not floor and hasattr(self.doc.Create, "NewFloor"):
             try:
                 cl_for_legacy = curve_loops_slab if (curve_loops_slab and curve_loops_slab.Count > 0) else curve_loops_lvl
-                curve_array = self._curve_loops_to_curve_array(cl_for_legacy)
-                floor = self.doc.Create.NewFloor(curve_array, False)
+                if cl_for_legacy:
+                    curve_array = self._curve_loops_to_curve_array(cl_for_legacy)
+                    floor = self.doc.Create.NewFloor(curve_array, False)
             except Exception as ex_c:
                 res.warnings.append("Legacy NewFloor notice: {}.".format(ex_c))
 
@@ -1182,25 +1522,179 @@ class ConversionRouter(object):
     # PIPELINE 2: Floor by Host
     # =========================================================================
     def _pipeline_2_floor_by_host(self, scanned_obj, geom_feet, level_id, profile_rule, res):
-        """Creates floor hosted on sloped/stepped geometry or as DirectShape with Floor category."""
+        """Creates native Floor when planar/sloped, or DirectShape with OST_Floors for curved shells."""
+        if getattr(scanned_obj, "is_horizontal", False) or getattr(scanned_obj, "is_planar_sloped", False):
+            return self._pipeline_1_native_floor(scanned_obj, geom_feet, level_id, profile_rule, res)
+        res.strategy_used = "DirectShape"
         return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=DB.ElementId(DB.BuiltInCategory.OST_Floors))
 
     # =========================================================================
-    # PIPELINE 3: Walls by Curve
+    # PIPELINE 3: Walls by Curve (Orthogonal, Diagonal & Curved Centerline)
     # =========================================================================
+    def _extract_wall_centerline_and_thickness(self, geom_feet, target_z=0.0):
+        """Extracts exact wall centerline DB.Curve and perpendicular thickness (diagonal & curved safe).
+
+        Returns: (base_curve_or_None, thickness_feet, requires_profile_pipeline)
+        """
+        bbox = geom_feet.GetBoundingBox(True)
+        dx = float(bbox.Max.X - bbox.Min.X)
+        dy = float(bbox.Max.Y - bbox.Min.Y)
+        fallback_thk = min(dx, dy) if (0.08 <= min(dx, dy) <= 5.0) else (0.2 * 3.28084)
+
+        if RHINO_AVAILABLE and isinstance(geom_feet, rg.Curve):
+            p0 = DB.XYZ(float(geom_feet.PointAtStart.X), float(geom_feet.PointAtStart.Y), target_z)
+            p1 = DB.XYZ(float(geom_feet.PointAtEnd.X), float(geom_feet.PointAtEnd.Y), target_z)
+            if p0.DistanceTo(p1) > 0.05:
+                if geom_feet.IsLinear(0.01):
+                    return (DB.Line.CreateBound(p0, p1), fallback_thk, False)
+                ok_arc, _ = self._try_extract_rhino_arc(geom_feet, 0.01)
+                if ok_arc:
+                    pm_rh = geom_feet.PointAt(0.5 * (geom_feet.Domain.Min + geom_feet.Domain.Max))
+                    pm = DB.XYZ(float(pm_rh.X), float(pm_rh.Y), target_z)
+                    try:
+                        return (DB.Arc.Create(p0, p1, pm), fallback_thk, False)
+                    except Exception:
+                        pass
+                return (DB.Line.CreateBound(p0, p1), fallback_thk, False)
+            return (None, fallback_thk, False)
+
+        working_brep = None
+        if RHINO_AVAILABLE:
+            if isinstance(geom_feet, rg.Brep):
+                working_brep = geom_feet
+            elif hasattr(geom_feet, "ToBrep"):
+                try:
+                    working_brep = geom_feet.ToBrep()
+                except Exception:
+                    working_brep = None
+
+        if working_brep and hasattr(working_brep, "Faces"):
+            vert_faces = []
+            for face in working_brep.Faces:
+                ok_pl, plane = face.TryGetPlane(0.02) if hasattr(face, "TryGetPlane") else (False, None)
+                if ok_pl and plane and plane.Normal.Length > 1e-6:
+                    n = rg.Vector3d(plane.Normal)
+                    n.Unitize()
+                else:
+                    d0 = face.Domain(0)
+                    d1 = face.Domain(1)
+                    if d0.Length <= 0 or d1.Length <= 0:
+                        continue
+                    n = face.NormalAt(0.5 * (d0.Min + d0.Max), 0.5 * (d1.Min + d1.Max))
+                    if n.Length <= 1e-6:
+                        continue
+                    n.Unitize()
+                if abs(n.Z) < 0.12:
+                    fb = face.GetBoundingBox(True)
+                    span_xy = math.hypot(fb.Max.X - fb.Min.X, fb.Max.Y - fb.Min.Y)
+                    span_z = max(0.05, fb.Max.Z - fb.Min.Z)
+                    vert_faces.append((span_xy * span_z, face, ok_pl, plane, n))
+
+            if vert_faces:
+                vert_faces.sort(key=lambda item: item[0], reverse=True)
+                _, best_vface, is_planar, best_plane, best_n = vert_faces[0]
+
+                # Delegate walls with window/door cutouts or sloped/arched tops directly to WallByProfile
+                if hasattr(best_vface, "Loops"):
+                    for lp in best_vface.Loops:
+                        if lp.LoopType == rg.BrepLoopType.Inner:
+                            return (None, fallback_thk, True)
+
+                if is_planar and getattr(best_vface, "OuterLoop", None):
+                    outer_c = best_vface.OuterLoop.To3dCurve()
+                    if outer_c:
+                        segs = outer_c.DuplicateSegments() or [outer_c]
+                        for s in segs:
+                            s_dz = abs(float(s.PointAtEnd.Z) - float(s.PointAtStart.Z))
+                            s_dxy = math.hypot(
+                                float(s.PointAtEnd.X) - float(s.PointAtStart.X),
+                                float(s.PointAtEnd.Y) - float(s.PointAtStart.Y)
+                            )
+                            if (not s.IsLinear(0.02) and s_dxy > 0.08 and s_dz > 0.08) or (s_dxy > 0.25 and s_dz > 0.15):
+                                return (None, fallback_thk, True)
+
+                # Project all Brep vertices onto planar orthonormal basis (n_xy, t_xy) for ANY wall rotation angle!
+                if is_planar and best_plane:
+                    n_len = math.hypot(best_n.X, best_n.Y)
+                    if n_len > 1e-6:
+                        nx = float(best_n.X) / n_len
+                        ny = float(best_n.Y) / n_len
+                        tx = -ny
+                        ty = nx
+                        ox = float(best_plane.Origin.X)
+                        oy = float(best_plane.Origin.Y)
+                        p_min = float("inf")
+                        p_max = float("-inf")
+                        t_min = float("inf")
+                        t_max = float("-inf")
+                        for v in working_brep.Vertices:
+                            vx = float(v.Location.X) - ox
+                            vy = float(v.Location.Y) - oy
+                            pn = vx * nx + vy * ny
+                            pt = vx * tx + vy * ty
+                            if pn < p_min: p_min = pn
+                            if pn > p_max: p_max = pn
+                            if pt < t_min: t_min = pt
+                            if pt > t_max: t_max = pt
+
+                        if t_max > t_min + 0.1 and p_max >= p_min:
+                            thk = (p_max - p_min) if (0.05 <= (p_max - p_min) <= 5.0) else fallback_thk
+                            mid_p = 0.5 * (p_min + p_max)
+                            sx = ox + mid_p * nx + t_min * tx
+                            sy = oy + mid_p * ny + t_min * ty
+                            ex = ox + mid_p * nx + t_max * tx
+                            ey = oy + mid_p * ny + t_max * ty
+                            pt_start = DB.XYZ(sx, sy, target_z)
+                            pt_end = DB.XYZ(ex, ey, target_z)
+                            if pt_start.DistanceTo(pt_end) > 0.1:
+                                return (DB.Line.CreateBound(pt_start, pt_end), thk, False)
+
+                # Curved / Arc cylindrical wall support
+                for edge in working_brep.Edges:
+                    e_crv = edge.DuplicateCurve()
+                    if not e_crv or e_crv.IsLinear(0.01):
+                        continue
+                    if abs(edge.PointAtStart.Z - bbox.Min.Z) < 0.15 and abs(edge.PointAtEnd.Z - bbox.Min.Z) < 0.15:
+                        ok_arc, _ = self._try_extract_rhino_arc(e_crv, 0.01)
+                        if ok_arc:
+                            p0 = DB.XYZ(float(e_crv.PointAtStart.X), float(e_crv.PointAtStart.Y), target_z)
+                            p1 = DB.XYZ(float(e_crv.PointAtEnd.X), float(e_crv.PointAtEnd.Y), target_z)
+                            pm_rh = e_crv.PointAt(0.5 * (e_crv.Domain.Min + e_crv.Domain.Max))
+                            pm = DB.XYZ(float(pm_rh.X), float(pm_rh.Y), target_z)
+                            if p0.DistanceTo(p1) > 0.1 and p0.DistanceTo(pm) > 0.05:
+                                try:
+                                    return (DB.Arc.Create(p0, p1, pm), fallback_thk, False)
+                                except Exception:
+                                    pass
+
+        # Bounding box centerline fallback
+        if dy >= dx:
+            pt_start = DB.XYZ(0.5 * (bbox.Min.X + bbox.Max.X), bbox.Min.Y, target_z)
+            pt_end = DB.XYZ(0.5 * (bbox.Min.X + bbox.Max.X), bbox.Max.Y, target_z)
+        else:
+            pt_start = DB.XYZ(bbox.Min.X, 0.5 * (bbox.Min.Y + bbox.Max.Y), target_z)
+            pt_end = DB.XYZ(bbox.Max.X, 0.5 * (bbox.Min.Y + bbox.Max.Y), target_z)
+        base_curve = DB.Line.CreateBound(pt_start, pt_end) if pt_start.DistanceTo(pt_end) > 0.1 else None
+        return (base_curve, fallback_thk, False)
+
     def _pipeline_3_wall_by_curve(self, scanned_obj, geom_feet, level_id, profile_rule, res):
-        """Creates native vertical wall from baseline curve, height, and wall type."""
+        """Creates native vertical wall from true diagonal/curved centerline, base offset, and wall type."""
         if not level_id or level_id == DB.ElementId.InvalidElementId:
             level_id = self._resolve_level_id(scanned_obj)
+        level_elem = self.doc.GetElement(level_id) if level_id and level_id != DB.ElementId.InvalidElementId else None
+        level_elev = float(level_elem.Elevation) if level_elem else 0.0
 
         bbox = geom_feet.GetBoundingBox(True)
-        wall_height = max(1.0, bbox.Max.Z - bbox.Min.Z)
-        dx = bbox.Max.X - bbox.Min.X
-        dy = bbox.Max.Y - bbox.Min.Y
-        horiz_min = min(dx, dy)
-        wall_thickness_feet = horiz_min if (0.1 <= horiz_min <= 4.0) else (0.2 * 3.28084)
-        mat_name = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
+        wall_height = max(0.5, float(bbox.Max.Z - bbox.Min.Z))
+        base_offset = float(bbox.Min.Z) - level_elev
 
+        base_curve, wall_thickness_feet, needs_profile = self._extract_wall_centerline_and_thickness(
+            geom_feet, target_z=level_elev
+        )
+        if needs_profile:
+            return self._pipeline_4_wall_by_profile(scanned_obj, geom_feet, level_id, profile_rule, res)
+
+        mat_name = self._resolve_effective_material_name(scanned_obj, profile_rule)
         wall_type_id = self._get_or_create_matching_wall_type(wall_thickness_feet, mat_name)
         if not wall_type_id or wall_type_id == DB.ElementId.InvalidElementId:
             wall_type_id = self.default_wall_type
@@ -1210,39 +1704,9 @@ class ConversionRouter(object):
             if wt:
                 wall_type_id = wt.Id
 
-        base_curve = None
-        if isinstance(geom_feet, rg.Curve):
-            p0 = DB.XYZ(geom_feet.PointAtStart.X, geom_feet.PointAtStart.Y, bbox.Min.Z)
-            p1 = DB.XYZ(geom_feet.PointAtEnd.X, geom_feet.PointAtEnd.Y, bbox.Min.Z)
-            if p0.DistanceTo(p1) > 0.05:
-                if geom_feet.IsLinear(0.01):
-                    base_curve = DB.Line.CreateBound(p0, p1)
-                else:
-                    pm = DB.XYZ(geom_feet.PointAt(0.5 * (geom_feet.Domain.Min + geom_feet.Domain.Max)).X,
-                                geom_feet.PointAt(0.5 * (geom_feet.Domain.Min + geom_feet.Domain.Max)).Y,
-                                bbox.Min.Z)
-                    try:
-                        base_curve = DB.Arc.Create(p0, p1, pm)
-                    except Exception:
-                        base_curve = DB.Line.CreateBound(p0, p1)
-
-        if not base_curve:
-            base_z = bbox.Min.Z
-            dx = bbox.Max.X - bbox.Min.X
-            dy = bbox.Max.Y - bbox.Min.Y
-            if dy >= dx:
-                pt_start = DB.XYZ(0.5 * (bbox.Min.X + bbox.Max.X), bbox.Min.Y, base_z)
-                pt_end = DB.XYZ(0.5 * (bbox.Min.X + bbox.Max.X), bbox.Max.Y, base_z)
-            else:
-                pt_start = DB.XYZ(bbox.Min.X, 0.5 * (bbox.Min.Y + bbox.Max.Y), base_z)
-                pt_end = DB.XYZ(bbox.Max.X, 0.5 * (bbox.Min.Y + bbox.Max.Y), base_z)
-
-            if pt_start.DistanceTo(pt_end) > 0.1:
-                base_curve = DB.Line.CreateBound(pt_start, pt_end)
-
         if base_curve and wall_type_id and level_id:
             try:
-                wall = DB.Wall.Create(self.doc, base_curve, wall_type_id, level_id, wall_height, 0.0, False, False)
+                wall = DB.Wall.Create(self.doc, base_curve, wall_type_id, level_id, wall_height, base_offset, False, False)
                 if wall:
                     res.strategy_used = "WallByCurve"
                     return wall
@@ -1252,45 +1716,70 @@ class ConversionRouter(object):
         return self._pipeline_4_wall_by_profile(scanned_obj, geom_feet, level_id, profile_rule, res)
 
     # =========================================================================
-    # PIPELINE 4: Walls by Profile (with Fallback)
+    # PIPELINE 4: Walls by Profile (with 3D Centerline Profile & Fallback)
     # =========================================================================
     def _pipeline_4_wall_by_profile(self, scanned_obj, geom_feet, level_id, profile_rule, res):
-        """Creates wall with non-rectangular profile (arches, vaults, sloped tops) or falls back cleanly."""
+        """Creates wall with non-rectangular profile (arches, openings, sloped tops) centered on Rhino wall."""
+        if not level_id or level_id == DB.ElementId.InvalidElementId:
+            level_id = self._resolve_level_id(scanned_obj)
+
         working_brep = geom_feet if isinstance(geom_feet, rg.Brep) else (geom_feet.ToBrep() if hasattr(geom_feet, "ToBrep") else None)
         if not working_brep:
             res.strategy_used = "DirectShape"
             return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=DB.ElementId(DB.BuiltInCategory.OST_Walls))
 
-        # Find largest vertical face for wall profile
+        # Find largest PLANAR vertical face for Revit profile Wall.Create
         best_face = None
+        best_plane = None
+        best_idx = -1
         max_area = float("-inf")
-        for face in working_brep.Faces:
-            u_mid = 0.5 * (face.Domain(0).Min + face.Domain(0).Max)
-            v_mid = 0.5 * (face.Domain(1).Min + face.Domain(1).Max)
-            norm = face.NormalAt(u_mid, v_mid)
+        for f_idx, face in enumerate(working_brep.Faces):
+            ok_pl, pl = face.TryGetPlane(0.05) if hasattr(face, "TryGetPlane") else (False, None)
+            if not ok_pl or not pl or pl.Normal.Length <= 1e-6:
+                continue
+            norm = rg.Vector3d(pl.Normal)
             norm.Unitize()
-            if abs(norm.Z) < 0.1:  # Vertical face
-                mp = rg.MassProperties.Compute(face)
-                area = mp.Area if mp else 0.0
+            if abs(norm.Z) < 0.12:
+                try:
+                    mp = rg.MassProperties.Compute(face)
+                    area = float(mp.Area) if mp else 0.0
+                except Exception:
+                    fb = face.GetBoundingBox(True)
+                    area = max(0.01, math.hypot(fb.Max.X - fb.Min.X, fb.Max.Y - fb.Min.Y) * max(0.1, fb.Max.Z - fb.Min.Z))
                 if area > max_area:
                     max_area = area
                     best_face = face
+                    best_plane = pl
+                    best_idx = f_idx
 
-        if not best_face:
+        if not best_face or not best_plane:
             res.strategy_used = "DirectShape"
-            res.warnings.append("No vertical profile face found. Falling back to DirectShape.")
+            res.warnings.append("No planar vertical profile face found. Falling back to DirectShape.")
             return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=DB.ElementId(DB.BuiltInCategory.OST_Walls))
 
         try:
             wall_thickness_feet = 0.2 * 3.28084
-            if working_brep and max_area > 0.01:
-                try:
-                    mp_brep = rg.MassProperties.Compute(working_brep)
-                    if mp_brep and mp_brep.Volume > 0:
-                        wall_thickness_feet = max(0.1, min(4.0, mp_brep.Volume / max_area))
-                except Exception:
-                    pass
-            mat_name = getattr(scanned_obj, "material_name", "") or getattr(scanned_obj, "layer_name", "")
+            shift_x, shift_y = 0.0, 0.0
+            n_vec = rg.Vector3d(best_plane.Normal)
+            n_len = math.hypot(n_vec.X, n_vec.Y)
+            if n_len > 1e-6:
+                nx = float(n_vec.X) / n_len
+                ny = float(n_vec.Y) / n_len
+                ox = float(best_plane.Origin.X)
+                oy = float(best_plane.Origin.Y)
+                p_min = float("inf")
+                p_max = float("-inf")
+                for v in working_brep.Vertices:
+                    pn = (float(v.Location.X) - ox) * nx + (float(v.Location.Y) - oy) * ny
+                    if pn < p_min: p_min = pn
+                    if pn > p_max: p_max = pn
+                if p_max > p_min + 0.05 and (p_max - p_min) <= 5.0:
+                    wall_thickness_feet = float(p_max - p_min)
+                    mid_p = 0.5 * (p_min + p_max)
+                    shift_x = mid_p * nx
+                    shift_y = mid_p * ny
+
+            mat_name = self._resolve_effective_material_name(scanned_obj, profile_rule)
             wall_type_id = self._get_or_create_matching_wall_type(wall_thickness_feet, mat_name)
             if not wall_type_id or wall_type_id == DB.ElementId.InvalidElementId:
                 wall_type_id = self.default_wall_type
@@ -1300,13 +1789,23 @@ class ConversionRouter(object):
                 if wt:
                     wall_type_id = wt.Id
 
+            # Shift a clone of working_brep onto the wall centerline plane before converting 3D CurveLoops
+            centered_brep = working_brep
+            centered_face = best_face
+            if (abs(shift_x) > 1e-4 or abs(shift_y) > 1e-4) and hasattr(working_brep, "DuplicateBrep"):
+                b_copy = working_brep.DuplicateBrep()
+                if b_copy:
+                    b_copy.Translate(shift_x, shift_y, 0.0)
+                    centered_brep = b_copy
+                    if 0 <= best_idx < centered_brep.Faces.Count:
+                        centered_face = centered_brep.Faces[best_idx]
+
             profile_loops = List[DB.CurveLoop]()
-            outer_cl = self._rg_loop_to_revit_curveloop(best_face.OuterLoop)
+            outer_cl = self._rg_loop_to_revit_curveloop(centered_face.OuterLoop)
             if outer_cl and not outer_cl.IsOpen():
                 profile_loops.Add(outer_cl)
 
-                # Inner openings / cutouts
-                for loop in best_face.Loops:
+                for loop in centered_face.Loops:
                     if loop.LoopType == rg.BrepLoopType.Inner:
                         inner_cl = self._rg_loop_to_revit_curveloop(loop)
                         if inner_cl and not inner_cl.IsOpen():
@@ -1319,7 +1818,6 @@ class ConversionRouter(object):
         except Exception as ex:
             res.warnings.append("Wall profile creation notice: {}. Falling back to DirectShape.".format(ex))
 
-        # Clean fallback to DirectShape
         res.strategy_used = "DirectShape"
         return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=DB.ElementId(DB.BuiltInCategory.OST_Walls))
 
@@ -1327,13 +1825,21 @@ class ConversionRouter(object):
     # PIPELINE 5: Native Ceilings
     # =========================================================================
     def _pipeline_5_ceiling_native(self, scanned_obj, geom_feet, level_id, profile_rule, res):
-        """Creates native ceiling using true boundary curves."""
+        """Creates native ceiling using true boundary curves and matching CeilingType."""
         if not level_id or level_id == DB.ElementId.InvalidElementId:
             level_id = self._resolve_level_id(scanned_obj)
         level_elem = self.doc.GetElement(level_id) if level_id and level_id != DB.ElementId.InvalidElementId else None
-        level_elev = level_elem.Elevation if level_elem else 0.0
+        level_elev = float(level_elem.Elevation) if level_elem else 0.0
 
-        ceiling_type_id = self.default_ceiling_type
+        bbox = geom_feet.GetBoundingBox(True) if hasattr(geom_feet, "GetBoundingBox") else None
+        ceiling_thk_feet = (bbox.Max.Z - bbox.Min.Z) if bbox else 0.0
+        if ceiling_thk_feet < 0.03:
+            ceiling_thk_feet = max(0.05, float(getattr(scanned_obj, "dz", 0.05) or 0.05) * self.unit_scale)
+
+        mat_name = self._resolve_effective_material_name(scanned_obj, profile_rule)
+        ceiling_type_id = self._get_or_create_matching_ceiling_type(ceiling_thk_feet, mat_name)
+        if not ceiling_type_id or ceiling_type_id == DB.ElementId.InvalidElementId:
+            ceiling_type_id = self.default_ceiling_type
         if not ceiling_type_id or ceiling_type_id == DB.ElementId.InvalidElementId:
             col_ct = DB.FilteredElementCollector(self.doc).OfClass(DB.CeilingType)
             ct = col_ct.FirstElement()
@@ -1355,8 +1861,7 @@ class ConversionRouter(object):
                 if hasattr(DB, "Ceiling") and hasattr(DB.Ceiling, "Create"):
                     try:
                         ceiling = DB.Ceiling.Create(self.doc, loops, ceiling_type_id, level_id)
-                    except Exception as ex:
-                        # Try on level plane
+                    except Exception:
                         try:
                             loops_lvl = List[DB.CurveLoop]()
                             outer_cl_lvl = self._build_curveloop_from_rhino_curve(outer_crv, target_z=level_elev, is_outer=True)
@@ -1386,22 +1891,191 @@ class ConversionRouter(object):
         return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=DB.ElementId(DB.BuiltInCategory.OST_Ceilings))
 
     # =========================================================================
-    # PIPELINE 6: Native Footprint Roof
+    # PIPELINE 6: Native Footprint / Sloped / Extrusion Roof
     # =========================================================================
+    def _set_roof_curve_slope(self, roof, model_curve, defines_slope, slope_angle=None):
+        """Sets DefinesSlope and SlopeAngle across Revit .NET method/indexer conventions."""
+        if not roof or not model_curve:
+            return False
+        try:
+            if hasattr(roof, "set_DefinesSlope"):
+                roof.set_DefinesSlope(model_curve, bool(defines_slope))
+            else:
+                roof.DefinesSlope[model_curve] = bool(defines_slope)
+            if defines_slope and slope_angle is not None:
+                if hasattr(roof, "set_SlopeAngle"):
+                    roof.set_SlopeAngle(model_curve, float(slope_angle))
+                else:
+                    roof.SlopeAngle[model_curve] = float(slope_angle)
+            return True
+        except Exception:
+            return False
+
+    def _try_create_extrusion_roof(self, scanned_obj, geom_feet, level_elem, roof_type, res):
+        """Attempts native NewExtrusionRoof for horizontal barrel/vaulted extrusions."""
+        if not RHINO_AVAILABLE or not roof_type or not level_elem:
+            return None
+        if not hasattr(self.doc.Create, "NewExtrusionRoof"):
+            return None
+
+        temp_ref_plane = None
+        try:
+            ext_dir = None
+            prof_crv = None
+            if isinstance(geom_feet, rg.Extrusion):
+                pv = geom_feet.PathEnd - geom_feet.PathStart
+                if pv.Length > 1e-4:
+                    pv.Unitize()
+                    if abs(pv.Z) < 0.15:
+                        ext_dir = pv
+                        prof_crv = geom_feet.Profile3d(0, 0)
+            elif isinstance(geom_feet, rg.Brep) and geom_feet.Faces.Count >= 1:
+                for f in geom_feet.Faces:
+                    ok_pl, _ = f.TryGetPlane(0.01) if hasattr(f, "TryGetPlane") else (False, None)
+                    if ok_pl:
+                        continue
+                    d0 = f.Domain(0)
+                    d1 = f.Domain(1)
+                    if d0.Length <= 0 or d1.Length <= 0:
+                        continue
+                    iso_u = f.IsoCurve(1, 0.5 * (d0.Min + d0.Max)) if hasattr(f, "IsoCurve") else None
+                    iso_v = f.IsoCurve(0, 0.5 * (d1.Min + d1.Max)) if hasattr(f, "IsoCurve") else None
+                    if iso_u and iso_v:
+                        u_lin = bool(iso_u.IsLinear(0.01))
+                        v_lin = bool(iso_v.IsLinear(0.01))
+                        if u_lin != v_lin:
+                            lin_c = iso_u if u_lin else iso_v
+                            prof_c = iso_v if u_lin else iso_u
+                            vec = lin_c.PointAtEnd - lin_c.PointAtStart
+                            if vec.Length > 1e-4 and abs(vec.Z) < 0.15 * vec.Length:
+                                vec.Unitize()
+                                ext_dir = vec
+                                prof_crv = prof_c
+                                break
+
+            if not ext_dir or not prof_crv or prof_crv.IsClosed:
+                return None
+
+            bbox = geom_feet.GetBoundingBox(True)
+            cx = 0.5 * (float(bbox.Min.X) + float(bbox.Max.X))
+            cy = 0.5 * (float(bbox.Min.Y) + float(bbox.Max.Y))
+            cz = float(bbox.Min.Z)
+            origin = rg.Point3d(cx, cy, cz)
+
+            s_min = float("inf")
+            s_max = float("-inf")
+            for corner in bbox.GetCorners():
+                proj = ((corner.X - origin.X) * ext_dir.X
+                        + (corner.Y - origin.Y) * ext_dir.Y
+                        + (corner.Z - origin.Z) * ext_dir.Z)
+                if proj < s_min: s_min = proj
+                if proj > s_max: s_max = proj
+            if s_max - s_min < 0.05:
+                return None
+
+            # Create temporary ReferencePlane whose normal == ext_dir
+            in_u = DB.XYZ(-float(ext_dir.Y), float(ext_dir.X), 0.0)
+            p_bub = DB.XYZ(cx - in_u.X * 5.0, cy - in_u.Y * 5.0, cz)
+            p_free = DB.XYZ(cx + in_u.X * 5.0, cy + in_u.Y * 5.0, cz)
+            active_view = getattr(self.doc, "ActiveView", None)
+            if not active_view:
+                for vp in DB.FilteredElementCollector(self.doc).OfClass(DB.ViewPlan):
+                    if not getattr(vp, "IsTemplate", False):
+                        active_view = vp
+                        break
+            if not active_view:
+                return None
+
+            if hasattr(self.doc.Create, "NewReferencePlane"):
+                temp_ref_plane = self.doc.Create.NewReferencePlane(p_bub, p_free, DB.XYZ.BasisZ, active_view)
+            if not temp_ref_plane:
+                return None
+
+            # Project open profile curve points onto ref plane at origin
+            n_div = 16
+            t0 = prof_crv.Domain.Min
+            t1 = prof_crv.Domain.Max
+            plane_pts = []
+            for k in range(n_div + 1):
+                pt = prof_crv.PointAt(t0 + (float(k) / float(n_div)) * (t1 - t0))
+                proj = (pt.X - origin.X) * ext_dir.X + (pt.Y - origin.Y) * ext_dir.Y + (pt.Z - origin.Z) * ext_dir.Z
+                xyz_p = DB.XYZ(
+                    float(pt.X - proj * ext_dir.X),
+                    float(pt.Y - proj * ext_dir.Y),
+                    float(pt.Z - proj * ext_dir.Z)
+                )
+                if not plane_pts or xyz_p.DistanceTo(plane_pts[-1]) >= 0.004:
+                    plane_pts.append(xyz_p)
+
+            if len(plane_pts) < 2:
+                return None
+
+            prof_array = DB.CurveArray()
+            for k in range(len(plane_pts) - 1):
+                if plane_pts[k].DistanceTo(plane_pts[k + 1]) >= 0.003:
+                    prof_array.Append(DB.Line.CreateBound(plane_pts[k], plane_pts[k + 1]))
+
+            if prof_array.Size == 0:
+                return None
+
+            roof = self.doc.Create.NewExtrusionRoof(
+                prof_array, temp_ref_plane, level_elem, roof_type, float(s_min), float(s_max)
+            )
+            if roof:
+                res.strategy_used = "RoofNative"
+                return roof
+        except Exception as ex_ext:
+            res.warnings.append("NewExtrusionRoof notice: {}.".format(ex_ext))
+            if temp_ref_plane is not None:
+                try:
+                    self.doc.Delete(temp_ref_plane.Id)
+                except Exception:
+                    pass
+        return None
+
     def _pipeline_6_roof_native(self, scanned_obj, geom_feet, level_id, profile_rule, res):
-        """Creates native footprint roof from true boundary curves."""
+        """Creates native Footprint/Sloped/Extrusion Roof strictly on level_elem.Elevation with accurate slope & offset."""
         if not level_id or level_id == DB.ElementId.InvalidElementId:
             level_id = self._resolve_level_id(scanned_obj)
         level_elem = self.doc.GetElement(level_id) if level_id and level_id != DB.ElementId.InvalidElementId else None
+        level_elev = float(level_elem.Elevation) if level_elem else 0.0
 
-        roof_type = self.doc.GetElement(self.default_roof_type)
+        mat_name = self._resolve_effective_material_name(scanned_obj, profile_rule)
+
+        # Extract footprint, perpendicular thickness, soffit Z, and slope direction
+        roof_info = None
+        if not isinstance(geom_feet, str):
+            roof_info = self._extract_roof_or_slab_footprint_and_slope(geom_feet, scanned_obj)
+
+        if roof_info:
+            outer_crv = roof_info["outer_crv"]
+            inner_crvs = roof_info["inner_crvs"]
+            roof_bottom_z = roof_info["bottom_z"]
+            thickness_feet = roof_info["thickness_feet"]
+        else:
+            outer_crv, inner_crvs, roof_top_z = self._extract_floor_boundary_loops(geom_feet, scanned_obj)
+            bbox = geom_feet.GetBoundingBox(True) if hasattr(geom_feet, "GetBoundingBox") else None
+            thickness_feet = (bbox.Max.Z - bbox.Min.Z) if (bbox and (bbox.Max.Z - bbox.Min.Z) >= 0.05) else max(
+                0.25, float(getattr(scanned_obj, "dz", 0.3) or 0.3) * self.unit_scale
+            )
+            roof_bottom_z = (bbox.Min.Z if (bbox and (bbox.Max.Z - bbox.Min.Z) >= 0.05) else (roof_top_z - thickness_feet))
+
+        roof_type = self._get_or_create_matching_roof_type(thickness_feet, mat_name)
+        if not roof_type and getattr(self, "default_roof_type", None) and self.default_roof_type != DB.ElementId.InvalidElementId:
+            roof_type = self.doc.GetElement(self.default_roof_type)
         if not roof_type:
             col_rt = DB.FilteredElementCollector(self.doc).OfClass(DB.RoofType)
             roof_type = col_rt.FirstElement()
 
-        outer_crv, inner_crvs, roof_z = self._extract_floor_boundary_loops(geom_feet, scanned_obj)
+        # Pass A: Barrel / Vaulted horizontal Extrusion Roof when detected and no planar footprint exists
+        if getattr(scanned_obj, "is_curved_extrusion", False) and (not roof_info) and roof_type and level_elem:
+            ext_roof = self._try_create_extrusion_roof(scanned_obj, geom_feet, level_elem, roof_type, res)
+            if ext_roof:
+                return ext_roof
+
+        # Pass B: Native FootPrintRoof (curves MUST lie strictly on level_elem.Elevation!)
         if outer_crv and roof_type and level_elem:
-            outer_cl = self._build_curveloop_from_rhino_curve(outer_crv, target_z=roof_z, is_outer=True)
+            outer_cl = self._build_curveloop_from_rhino_curve(outer_crv, target_z=level_elev, is_outer=True)
             if outer_cl:
                 crv_array = DB.CurveArray()
                 for c in outer_cl:
@@ -1410,19 +2084,95 @@ class ConversionRouter(object):
                     footprint_map = DB.ModelCurveArray()
                     roof = self.doc.Create.NewFootPrintRoof(crv_array, level_elem, roof_type, footprint_map)
                     if roof:
+                        # 1. Disable Revit's default 30-deg hip slope on every boundary edge
+                        model_curves = []
+                        for mc in footprint_map:
+                            self._set_roof_curve_slope(roof, mc, False)
+                            model_curves.append(mc)
+
+                        # 2. If sloped planar roof, find downhill eave edge perpendicular to slope vector
+                        if roof_info and roof_info.get("is_sloped") and roof_info.get("rise_over_run", 0.0) >= 0.01:
+                            dx, dy = roof_info["slope_dir_xy"]
+                            rise_over_run = float(roof_info["rise_over_run"])
+                            best_eave_mc = None
+                            best_proj = float("-inf")
+                            for mc in model_curves:
+                                try:
+                                    gc = mc.GeometryCurve
+                                    p0 = gc.GetEndPoint(0)
+                                    p1 = gc.GetEndPoint(1)
+                                    seg_len = math.hypot(p1.X - p0.X, p1.Y - p0.Y)
+                                    if seg_len < 0.05:
+                                        continue
+                                    tx = (p1.X - p0.X) / seg_len
+                                    ty = (p1.Y - p0.Y) / seg_len
+                                    # Perpendicular to downhill slope vector AND linear
+                                    if abs(tx * dx + ty * dy) < 0.20:
+                                        mx = 0.5 * (p0.X + p1.X)
+                                        my = 0.5 * (p0.Y + p1.Y)
+                                        proj = mx * dx + my * dy
+                                        if proj > best_proj:
+                                            best_proj = proj
+                                            best_eave_mc = mc
+                                except Exception:
+                                    continue
+
+                            if best_eave_mc is not None:
+                                ok_sl = self._set_roof_curve_slope(roof, best_eave_mc, True, rise_over_run)
+                                if not ok_sl:
+                                    self._set_roof_curve_slope(roof, best_eave_mc, False)
+                                    res.warnings.append("Could not apply roof pitch angle on eave edge; created flat footprint roof.")
+                            else:
+                                res.warnings.append("Skew sloped roof has no orthogonal eave edge; created flat roof at eave elevation.")
+
+                        # 3. Set exact base level offset (FootPrintRoof extrudes UPWARD from Base Offset)
+                        base_offset_val = float(roof_bottom_z) - level_elev
+                        p_off = roof.get_Parameter(DB.BuiltInParameter.ROOF_LEVEL_OFFSET_PARAM) if hasattr(DB, "BuiltInParameter") and hasattr(DB.BuiltInParameter, "ROOF_LEVEL_OFFSET_PARAM") else None
+                        if p_off and not p_off.IsReadOnly:
+                            try:
+                                p_off.Set(base_offset_val)
+                            except Exception:
+                                pass
+
+                        p_rb = roof.get_Parameter(DB.BuiltInParameter.WALL_ATTR_ROOM_BOUNDING) if hasattr(DB, "BuiltInParameter") and hasattr(DB.BuiltInParameter, "WALL_ATTR_ROOM_BOUNDING") else None
+                        if p_rb and not p_rb.IsReadOnly:
+                            try:
+                                p_rb.Set(1)
+                            except Exception:
+                                pass
+
+                        # 4. Cut courtyard / skylight openings cleanly via doc.Create.NewOpening
+                        if inner_crvs and hasattr(self.doc.Create, "NewOpening"):
+                            for ic in inner_crvs:
+                                inner_cl = self._build_curveloop_from_rhino_curve(ic, target_z=level_elev, is_outer=False)
+                                if inner_cl:
+                                    in_arr = DB.CurveArray()
+                                    for c_in in inner_cl:
+                                        in_arr.Append(c_in)
+                                    try:
+                                        self.doc.Create.NewOpening(roof, in_arr, True)
+                                    except Exception as ex_op:
+                                        res.warnings.append("Roof inner opening cut notice: {}.".format(ex_op))
+
                         res.strategy_used = "RoofNative"
                         return roof
                 except Exception as ex:
-                    res.warnings.append("NewFootPrintRoof failed: {}. Cleanly falling back to DirectShape.".format(ex))
+                    res.warnings.append("NewFootPrintRoof failed: {}. Falling back to exact OST_Roofs DirectShape.".format(ex))
 
         res.strategy_used = "DirectShape"
+        res.warnings.append("Roof footprint extraction failed or non-sketchable shell. Placed as OST_Roofs DirectShape.")
         return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=DB.ElementId(DB.BuiltInCategory.OST_Roofs))
 
     # =========================================================================
     # PIPELINE 7: Roofs by Host / Face
     # =========================================================================
     def _pipeline_7_roof_by_host(self, scanned_obj, geom_feet, level_id, profile_rule, res):
-        """Creates freeform roof as DirectShape with OST_Roofs."""
+        """Creates native planar/extruded Roof when compatible, or exact OST_Roofs DirectShape for double-curved shells."""
+        if (getattr(scanned_obj, "is_horizontal", False)
+                or getattr(scanned_obj, "is_planar_sloped", False)
+                or getattr(scanned_obj, "is_curved_extrusion", False)):
+            return self._pipeline_6_roof_native(scanned_obj, geom_feet, level_id, profile_rule, res)
+        res.strategy_used = "DirectShape"
         return self._pipeline_9_direct_shape(scanned_obj, geom_feet, None, profile_rule, res, category_id=DB.ElementId(DB.BuiltInCategory.OST_Roofs))
 
     # =========================================================================
@@ -1992,43 +2742,102 @@ class ConversionRouter(object):
     def _pipeline_11_toposolid(self, scanned_obj, geom_feet, level_id, profile_rule, res):
         """Creates a native Revit Toposolid element (Revit 2024+) or OST_Toposolid DirectShape."""
         target_cat_id = self._category_str_to_id("OST_Toposolid")
+        if not level_id or level_id == DB.ElementId.InvalidElementId:
+            level_id = self._resolve_level_id(scanned_obj)
 
         if hasattr(DB, "Toposolid"):
             try:
-                working_brep = geom_feet if isinstance(geom_feet, rg.Brep) else (geom_feet.ToBrep() if hasattr(geom_feet, "ToBrep") else None)
+                working_brep = None
+                working_mesh = None
+                if RHINO_AVAILABLE:
+                    if isinstance(geom_feet, rg.Mesh):
+                        working_mesh = geom_feet
+                    elif isinstance(geom_feet, rg.Brep):
+                        working_brep = geom_feet
+                    elif hasattr(geom_feet, "ToBrep"):
+                        working_brep = geom_feet.ToBrep()
+
                 curve_loops = List[DB.CurveLoop]()
 
+                # Toposolid profile loops MUST be strictly horizontal planar loops
                 if working_brep:
                     top_face = None
                     max_z = float("-inf")
                     for face in working_brep.Faces:
-                        u_mid = 0.5 * (face.Domain(0).Min + face.Domain(0).Max)
-                        v_mid = 0.5 * (face.Domain(1).Min + face.Domain(1).Max)
+                        d0 = face.Domain(0)
+                        d1 = face.Domain(1)
+                        u_mid = 0.5 * (d0.Min + d0.Max)
+                        v_mid = 0.5 * (d1.Min + d1.Max)
                         norm = face.NormalAt(u_mid, v_mid)
-                        norm.Unitize()
-                        if norm.Z > 0.60:
+                        if norm.Length > 1e-6:
+                            norm.Unitize()
+                        if norm.Z > 0.35:
                             fz = face.GetBoundingBox(True).Center.Z
                             if fz > max_z:
                                 max_z = fz
                                 top_face = face
                     if top_face and top_face.OuterLoop:
-                        cl = self._rg_loop_to_revit_curveloop(top_face.OuterLoop)
+                        cl = self._rg_loop_to_revit_curveloop(top_face.OuterLoop, force_horizontal_z=0.0)
                         if cl and not cl.IsOpen():
                             curve_loops.Add(cl)
+                elif working_mesh:
+                    try:
+                        outlines = working_mesh.GetOutlines(rg.Plane.WorldXY)
+                        if outlines and len(outlines) > 0:
+                            cl = self._build_curveloop_from_rhino_curve(outlines[0], target_z=0.0, is_outer=True)
+                            if cl and not cl.IsOpen():
+                                curve_loops.Add(cl)
+                    except Exception:
+                        pass
 
-                if curve_loops.Count == 0:
+                if curve_loops.Count == 0 and hasattr(geom_feet, "GetBoundingBox"):
                     bbox = geom_feet.GetBoundingBox(True)
-                    p0 = DB.XYZ(bbox.Min.X, bbox.Min.Y, bbox.Min.Z)
-                    p1 = DB.XYZ(bbox.Max.X, bbox.Min.Y, bbox.Min.Z)
-                    p2 = DB.XYZ(bbox.Max.X, bbox.Max.Y, bbox.Min.Z)
-                    p3 = DB.XYZ(bbox.Min.X, bbox.Max.Y, bbox.Min.Z)
+                    if (bbox.Max.X - bbox.Min.X) > 0.01 and (bbox.Max.Y - bbox.Min.Y) > 0.01:
+                        p0 = DB.XYZ(bbox.Min.X, bbox.Min.Y, 0.0)
+                        p1 = DB.XYZ(bbox.Max.X, bbox.Min.Y, 0.0)
+                        p2 = DB.XYZ(bbox.Max.X, bbox.Max.Y, 0.0)
+                        p3 = DB.XYZ(bbox.Min.X, bbox.Max.Y, 0.0)
 
-                    bbox_cl = DB.CurveLoop()
-                    bbox_cl.Append(DB.Line.CreateBound(p0, p1))
-                    bbox_cl.Append(DB.Line.CreateBound(p1, p2))
-                    bbox_cl.Append(DB.Line.CreateBound(p2, p3))
-                    bbox_cl.Append(DB.Line.CreateBound(p3, p0))
-                    curve_loops.Add(bbox_cl)
+                        bbox_cl = DB.CurveLoop()
+                        bbox_cl.Append(DB.Line.CreateBound(p0, p1))
+                        bbox_cl.Append(DB.Line.CreateBound(p1, p2))
+                        bbox_cl.Append(DB.Line.CreateBound(p2, p3))
+                        bbox_cl.Append(DB.Line.CreateBound(p3, p0))
+                        curve_loops.Add(bbox_cl)
+
+                # Extract 3D terrain elevation points for 5-arg Toposolid.Create(doc, profiles, points, typeId, levelId)
+                topo_points = List[DB.XYZ]()
+                seen_xy = set()
+                max_topo_pts = 2500
+
+                def _add_topo_pt(x, y, z):
+                    if len(topo_points) >= max_topo_pts:
+                        return
+                    key = (int(round(float(x) * 10.0)), int(round(float(y) * 10.0)))
+                    if key not in seen_xy:
+                        seen_xy.add(key)
+                        topo_points.Add(DB.XYZ(float(x), float(y), float(z)))
+
+                if working_mesh and hasattr(working_mesh, "Vertices"):
+                    step = max(1, working_mesh.Vertices.Count // max_topo_pts)
+                    for idx in range(0, working_mesh.Vertices.Count, step):
+                        v = working_mesh.Vertices[idx]
+                        _add_topo_pt(v.X, v.Y, v.Z)
+                elif working_brep:
+                    for v in getattr(working_brep, "Vertices", []):
+                        loc = v.Location
+                        _add_topo_pt(loc.X, loc.Y, loc.Z)
+                    for face in working_brep.Faces:
+                        d0 = face.Domain(0)
+                        d1 = face.Domain(1)
+                        if d0.Length > 0 and d1.Length > 0:
+                            for iu in range(5):
+                                u = d0.Min + (iu / 4.0) * d0.Length
+                                for iv in range(5):
+                                    v = d1.Min + (iv / 4.0) * d1.Length
+                                    if face.IsPointOnFace(u, v) != rg.PointFaceRelation.Exterior:
+                                        pt = face.PointAt(u, v)
+                                        _add_topo_pt(pt.X, pt.Y, pt.Z)
 
                 topo_type_id = getattr(self, "default_toposolid_type", None)
                 if not topo_type_id or topo_type_id == DB.ElementId.InvalidElementId:
@@ -2036,9 +2845,17 @@ class ConversionRouter(object):
                     first_type = collector.FirstElement()
                     topo_type_id = first_type.Id if first_type else DB.ElementId.InvalidElementId
 
-                if topo_type_id and topo_type_id != DB.ElementId.InvalidElementId:
-                    toposolid = DB.Toposolid.Create(self.doc, curve_loops, topo_type_id, level_id)
+                if topo_type_id and topo_type_id != DB.ElementId.InvalidElementId and curve_loops.Count > 0:
+                    toposolid = None
+                    if len(topo_points) >= 3:
+                        try:
+                            toposolid = DB.Toposolid.Create(self.doc, curve_loops, topo_points, topo_type_id, level_id)
+                        except Exception:
+                            toposolid = None
+                    if not toposolid:
+                        toposolid = DB.Toposolid.Create(self.doc, curve_loops, topo_type_id, level_id)
                     if toposolid:
+                        res.strategy_used = "Toposolid"
                         return toposolid
             except Exception as ex:
                 res.warnings.append("Toposolid native generation notice: {}. Falling back to DirectShape.".format(ex))
@@ -2051,11 +2868,13 @@ class ConversionRouter(object):
     def _convert_rhino_to_revit_geometry(self, rh_geom, geom_feet=None, material_id=None):
         """Converts Rhino Brep, Extrusion, Surface, SubD, Mesh, or Curve into IList of Revit DB.GeometryObject.
 
-        Prevents double-scaling:
+        Preserves exact NURBS solids/surfaces and 100% of mesh faces:
         - Passes native unscaled Rhino geometry to Rhino.Inside GeometryEncoder
           (which handles active RhinoDoc units -> Revit internal feet conversion automatically).
-        - Applies manual scale override ratio if user overrode document units in the UI.
-        - Uses geom_feet (scaled by unit_scale) for native TessellatedShapeBuilder fallback.
+        - Uses GeometryEncoder.ToSolid (closed Brep) and ToBrep/ToGeometryBase (open NURBS surfaces).
+        - Uses Two-Pass TessellatedShapeBuilder: Pass 1 requires closed input with Fallback.Abort
+          (never Salvage, which shreds open shells); Pass 2 uses OpenConnectedFaceSet(False) +
+          AnyGeometry/Mesh so open roof shells and meshes retain all faces intact.
         """
         geom_list = List[DB.GeometryObject]()
         if not rh_geom:
@@ -2068,19 +2887,25 @@ class ConversionRouter(object):
 
         working_geom = rh_geom
         if abs(scale_ratio - 1.0) > 0.001:
-            working_geom = rh_geom.Duplicate()
+            working_geom = rh_geom.Duplicate() if hasattr(rh_geom, "Duplicate") else rh_geom
             if hasattr(working_geom, "Scale"):
                 working_geom.Scale(scale_ratio)
 
         # Apply origin shift to native Rhino geometry if translating to Revit (0,0,0)
         if self.has_origin_shift:
-            if working_geom is rh_geom:
+            if working_geom is rh_geom and hasattr(rh_geom, "Duplicate"):
                 working_geom = rh_geom.Duplicate()
             if hasattr(working_geom, "Translate"):
                 working_geom.Translate(self.origin_shift_rhino[0], self.origin_shift_rhino[1], self.origin_shift_rhino[2])
 
-        # Normalize Extrusions, Surfaces, SubDs to Brep if needed
-        if not isinstance(working_geom, (rg.Brep, rg.Mesh)) and hasattr(working_geom, "ToBrep"):
+        # Normalize Extrusions, Surfaces, SubDs to Brep if possible (never smooth meshes via SubD!)
+        brep_cls = getattr(rg, "Brep", None) if RHINO_AVAILABLE else None
+        mesh_cls = getattr(rg, "Mesh", None) if RHINO_AVAILABLE else None
+        is_brep_or_mesh = bool(
+            (brep_cls and isinstance(working_geom, brep_cls))
+            or (mesh_cls and isinstance(working_geom, mesh_cls))
+        )
+        if not is_brep_or_mesh and hasattr(working_geom, "ToBrep"):
             try:
                 brep_conv = working_geom.ToBrep()
                 if brep_conv:
@@ -2088,129 +2913,234 @@ class ConversionRouter(object):
             except Exception:
                 pass
 
-        # 1. Try Brep ToSolid or SubD-to-Solid first (produces clean DB.Solid with NO wire lines)
+        # 1. Try Exact NURBS Brep -> Revit Solid / Brep via Rhino.Inside GeometryEncoder
         try:
-            if isinstance(working_geom, rg.Brep):
+            if brep_cls and isinstance(working_geom, brep_cls):
+                is_closed_brep = bool(getattr(working_geom, "IsSolid", getattr(working_geom, "IsClosed", False)))
                 if hasattr(GeometryEncoder, "ToSolid"):
-                    solid = GeometryEncoder.ToSolid(working_geom)
-                    if solid:
-                        geom_list.Add(solid)
-                        return geom_list
-            elif isinstance(working_geom, rg.Mesh):
-                # Attempt smooth SubD -> Brep -> Solid conversion (100% clean NURBS, zero wire lines)
-                if hasattr(rg, "SubD") and hasattr(rg.SubD, "CreateFromMesh"):
+                    comps = []
                     try:
-                        subd = rg.SubD.CreateFromMesh(working_geom)
-                        if subd and getattr(subd, "IsValid", False):
-                            b_subd = subd.ToBrep()
-                            if b_subd and getattr(b_subd, "IsValid", False) and hasattr(GeometryEncoder, "ToSolid"):
-                                s = GeometryEncoder.ToSolid(b_subd)
-                                if s and getattr(s, "Volume", 0.0) > 0.00001:
-                                    geom_list.Add(s)
-                                    return geom_list
+                        if hasattr(working_geom, "GetConnectedComponents"):
+                            comps = list(working_geom.GetConnectedComponents() or [])
                     except Exception:
-                        pass
+                        comps = []
+
+                    if comps and len(comps) > 1:
+                        comp_solids = []
+                        all_closed = True
+                        for comp in comps:
+                            if not bool(getattr(comp, "IsSolid", getattr(comp, "IsClosed", False))):
+                                all_closed = False
+                                break
+                            s_c = GeometryEncoder.ToSolid(comp)
+                            if s_c and getattr(s_c, "Volume", 1.0) > 1e-6:
+                                comp_solids.append(s_c)
+                            else:
+                                all_closed = False
+                                break
+                        if all_closed and len(comp_solids) == len(comps):
+                            for s_c in comp_solids:
+                                geom_list.Add(s_c)
+                            return geom_list
+
+                    if is_closed_brep:
+                        solid = GeometryEncoder.ToSolid(working_geom)
+                        if solid and getattr(solid, "Volume", 1.0) > 1e-6:
+                            geom_list.Add(solid)
+                            return geom_list
+
+                # Open NURBS surfaces or unclosed Breps: preserve smooth NURBS surfaces via ToBrep / ToGeometryBase
+                for enc_name in ("ToBrep", "ToGeometryBase"):
+                    if hasattr(GeometryEncoder, enc_name):
+                        try:
+                            enc_fn = getattr(GeometryEncoder, enc_name)
+                            rvt_b = enc_fn(working_geom)
+                            if rvt_b is not None:
+                                if isinstance(rvt_b, DB.GeometryObject):
+                                    geom_list.Add(rvt_b)
+                                else:
+                                    try:
+                                        for item in rvt_b:
+                                            if isinstance(item, DB.GeometryObject):
+                                                geom_list.Add(item)
+                                    except Exception:
+                                        pass
+                                if len(geom_list) > 0:
+                                    return geom_list
+                        except Exception:
+                            pass
         except Exception:
             pass
 
-        # 2. Native Revit TessellatedShapeBuilder (Target = Solid for clean solid body with NO wire lines, real Volume & Area)
+        # 2. Native Revit TessellatedShapeBuilder (Exact faces in Revit feet, NO Salvage tearing)
         try:
             working_feet = geom_feet
             if not working_feet:
                 working_feet = working_geom.Duplicate() if hasattr(working_geom, "Duplicate") else working_geom
-                if hasattr(working_feet, "Scale"):
+                if hasattr(working_feet, "Scale") and abs(float(self.unit_scale or 1.0) - 1.0) > 1e-5:
                     working_feet.Scale(self.unit_scale)
 
+            is_feet_bm = bool(
+                (brep_cls and isinstance(working_feet, brep_cls))
+                or (mesh_cls and isinstance(working_feet, mesh_cls))
+            )
+            if not is_feet_bm and hasattr(working_feet, "ToBrep"):
+                try:
+                    b_feet = working_feet.ToBrep()
+                    if b_feet:
+                        working_feet = b_feet
+                except Exception:
+                    pass
+
+            input_closed = bool(getattr(working_feet, "IsSolid", getattr(working_feet, "IsClosed", False)))
             meshes = []
-            if isinstance(working_feet, rg.Mesh):
+            if mesh_cls and isinstance(working_feet, mesh_cls):
                 meshes = [working_feet]
-            elif isinstance(working_feet, rg.Brep):
-                mp = rg.MeshingParameters.Default
-                brep_meshes = rg.Mesh.CreateFromBrep(working_feet, mp)
+            elif brep_cls and isinstance(working_feet, brep_cls):
+                mp_cls = getattr(rg, "MeshingParameters", None)
+                mp = (getattr(mp_cls, "QualityRenderMesh", None) or getattr(mp_cls, "Default", None)) if mp_cls else None
+                brep_meshes = mesh_cls.CreateFromBrep(working_feet, mp) if mp is not None else None
+                if (not brep_meshes) and mp_cls and getattr(mp_cls, "Default", None) is not None:
+                    brep_meshes = mesh_cls.CreateFromBrep(working_feet, mp_cls.Default)
                 if brep_meshes:
                     meshes = list(brep_meshes)
 
-            if meshes:
-                tsb = DB.TessellatedShapeBuilder()
-                tsb.OpenConnectedFaceSet(True)
-                face_added = False
-                for m in meshes:
-                    m_copy = m.Duplicate() if hasattr(m, "Duplicate") else m
-                    if hasattr(m_copy.Faces, "ConvertQuadsToTriangles"):
-                        m_copy.Faces.ConvertQuadsToTriangles()
-                    verts = m_copy.Vertices
-                    for i in range(m_copy.Faces.Count):
-                        f = m_copy.Faces[i]
-                        p0 = verts[f.A]
-                        p1 = verts[f.B]
-                        p2 = verts[f.C]
-                        v0 = DB.XYZ(float(p0.X), float(p0.Y), float(p0.Z))
-                        v1 = DB.XYZ(float(p1.X), float(p1.Y), float(p1.Z))
-                        v2 = DB.XYZ(float(p2.X), float(p2.Y), float(p2.Z))
-                        if v0.DistanceTo(v1) > 0.0001 and v1.DistanceTo(v2) > 0.0001 and v2.DistanceTo(v0) > 0.0001:
-                            loop_pts = List[DB.XYZ]()
-                            loop_pts.Add(v0)
-                            loop_pts.Add(v1)
-                            loop_pts.Add(v2)
-                            face_mat_id = material_id if (material_id and material_id != DB.ElementId.InvalidElementId) else DB.ElementId.InvalidElementId
-                            tsb.AddFace(DB.TessellatedFace(loop_pts, face_mat_id))
-                            face_added = True
-                        if hasattr(f, "IsQuad") and f.IsQuad:
-                            p3 = verts[f.D]
-                            v3 = DB.XYZ(float(p3.X), float(p3.Y), float(p3.Z))
-                            if v0.DistanceTo(v2) > 0.0001 and v2.DistanceTo(v3) > 0.0001 and v3.DistanceTo(v0) > 0.0001:
-                                loop_pts2 = List[DB.XYZ]()
-                                loop_pts2.Add(v0)
-                                loop_pts2.Add(v2)
-                                loop_pts2.Add(v3)
-                                tsb.AddFace(DB.TessellatedFace(loop_pts2, face_mat_id))
-                                face_added = True
-                tsb.CloseConnectedFaceSet()
-                if face_added:
-                    # Primary attempt: Target = Solid (Clean, NO WIRE LINES, ASM Solid with Volume)
-                    tsb.Target = DB.TessellatedShapeBuilderTarget.Solid
-                    tsb.Fallback = DB.TessellatedShapeBuilderFallback.Salvage
+            if meshes and hasattr(DB, "TessellatedShapeBuilder"):
+                face_mat_id = material_id if (material_id and material_id != DB.ElementId.InvalidElementId) else DB.ElementId.InvalidElementId
+
+                def _non_degenerate_tri(v0, v1, v2):
+                    if v0.DistanceTo(v1) <= 0.0001 or v1.DistanceTo(v2) <= 0.0001 or v2.DistanceTo(v0) <= 0.0001:
+                        return False
                     try:
-                        tsb.Build()
-                        b_res = tsb.GetBuildResult()
-                        if b_res:
-                            res_objs = b_res.GetGeometricalObjects()
-                            if res_objs:
-                                for go in res_objs:
-                                    if isinstance(go, DB.Solid) and getattr(go, "Volume", 0.0) > 0.00001:
-                                        geom_list.Add(go)
-                                if len(geom_list) > 0:
-                                    return geom_list
+                        d1 = v1 - v0
+                        d2 = v2 - v0
+                        if hasattr(d1, "CrossProduct"):
+                            cp = d1.CrossProduct(d2)
+                            if cp.GetLength() <= 1e-8:
+                                return False
                     except Exception:
                         pass
+                    return True
+
+                def _run_tsb(target_mode, fallback_mode, is_closed_set):
+                    tsb = DB.TessellatedShapeBuilder()
+                    tsb.OpenConnectedFaceSet(bool(is_closed_set))
+                    added = False
+                    for m in meshes:
+                        m_copy = m.Duplicate() if hasattr(m, "Duplicate") else m
+                        if hasattr(m_copy.Faces, "ConvertQuadsToTriangles"):
+                            m_copy.Faces.ConvertQuadsToTriangles()
+                        verts = m_copy.Vertices
+                        for i in range(m_copy.Faces.Count):
+                            f = m_copy.Faces[i]
+                            p0 = verts[f.A]
+                            p1 = verts[f.B]
+                            p2 = verts[f.C]
+                            v0 = DB.XYZ(float(p0.X), float(p0.Y), float(p0.Z))
+                            v1 = DB.XYZ(float(p1.X), float(p1.Y), float(p1.Z))
+                            v2 = DB.XYZ(float(p2.X), float(p2.Y), float(p2.Z))
+                            if _non_degenerate_tri(v0, v1, v2):
+                                loop_pts = List[DB.XYZ]()
+                                loop_pts.Add(v0)
+                                loop_pts.Add(v1)
+                                loop_pts.Add(v2)
+                                tsb.AddFace(DB.TessellatedFace(loop_pts, face_mat_id))
+                                added = True
+                            if hasattr(f, "IsQuad") and f.IsQuad:
+                                p3 = verts[f.D]
+                                v3 = DB.XYZ(float(p3.X), float(p3.Y), float(p3.Z))
+                                if _non_degenerate_tri(v0, v2, v3):
+                                    loop_pts2 = List[DB.XYZ]()
+                                    loop_pts2.Add(v0)
+                                    loop_pts2.Add(v2)
+                                    loop_pts2.Add(v3)
+                                    tsb.AddFace(DB.TessellatedFace(loop_pts2, face_mat_id))
+                                    added = True
+                    tsb.CloseConnectedFaceSet()
+                    if not added:
+                        return []
+                    tsb.Target = target_mode
+                    tsb.Fallback = fallback_mode
+                    tsb.Build()
+                    b_res = tsb.GetBuildResult()
+                    if b_res:
+                        res_objs = b_res.GetGeometricalObjects()
+                        if res_objs:
+                            return list(res_objs)
+                    return []
+
+                # Pass 1: Watertight Solid ONLY when input is closed, using Abort (never Salvage!)
+                if input_closed:
+                    try:
+                        abort_fb = DB.TessellatedShapeBuilderFallback.Abort
+                        solid_objs = _run_tsb(DB.TessellatedShapeBuilderTarget.Solid, abort_fb, True)
+                        for go in solid_objs:
+                            if isinstance(go, DB.Solid) and getattr(go, "Volume", 0.0) > 0.00001:
+                                geom_list.Add(go)
+                        if len(geom_list) > 0:
+                            return geom_list
+                    except Exception:
+                        pass
+
+                # Pass 2: AnyGeometry + Fallback.Mesh with OpenConnectedFaceSet(False) keeps 100% of faces
+                try:
+                    any_tgt = getattr(DB.TessellatedShapeBuilderTarget, "AnyGeometry", DB.TessellatedShapeBuilderTarget.Mesh)
+                    mesh_fb = getattr(DB.TessellatedShapeBuilderFallback, "Mesh", DB.TessellatedShapeBuilderFallback.Salvage)
+                    mesh_objs = _run_tsb(any_tgt, mesh_fb, False)
+                    for go in mesh_objs:
+                        if go is not None:
+                            geom_list.Add(go)
+                    if len(geom_list) > 0:
+                        return geom_list
+                except Exception:
+                    pass
         except Exception:
             pass
 
-        # 3. Fallback for open / non-manifold meshes: Target = Mesh
+        # 3. Last-resort GeometryEncoder.ToMesh fallback
         try:
-            if hasattr(GeometryEncoder, "ToMesh") and isinstance(working_geom, rg.Mesh):
+            if hasattr(GeometryEncoder, "ToMesh") and mesh_cls and isinstance(working_geom, mesh_cls):
                 rvt_mesh = GeometryEncoder.ToMesh(working_geom)
                 if rvt_mesh:
                     geom_list.Add(rvt_mesh)
-                    return geom_list
-            elif hasattr(GeometryEncoder, "ToGeometryObject"):
-                rvt_obj = GeometryEncoder.ToGeometryObject(working_geom)
-                if rvt_obj:
-                    geom_list.Add(rvt_obj)
                     return geom_list
         except Exception:
             pass
 
         return geom_list
 
-    def _rg_loop_to_revit_curveloop(self, rg_loop):
-        """Converts a Rhino BrepLoop to a valid Revit DB.CurveLoop using the robust builder."""
+    def _rg_loop_to_revit_curveloop(self, rg_loop, force_horizontal_z=None):
+        """Converts a Rhino BrepLoop to a valid Revit DB.CurveLoop, preserving 3D Z on vertical/sloped faces."""
         if not rg_loop:
             return None
         crv = rg_loop.To3dCurve()
         if not crv:
             return None
         is_outer = (rg_loop.LoopType == rg.BrepLoopType.Outer) if hasattr(rg_loop, "LoopType") else True
+        if force_horizontal_z is not None:
+            return self._build_curveloop_from_rhino_curve(crv, target_z=force_horizontal_z, is_outer=is_outer)
+
+        # Preserve 3D coordinates when loop spans vertically (e.g. WallByProfile with arched tops/openings)
+        try:
+            bbox = crv.GetBoundingBox(True)
+            z_span = float(bbox.Max.Z) - float(bbox.Min.Z)
+        except Exception:
+            z_span = 0.0
+
+        if z_span > 0.02:
+            plane_normal = None
+            try:
+                face = getattr(rg_loop, "Face", None)
+                if face and hasattr(face, "TryGetPlane"):
+                    ok_pl, pl = face.TryGetPlane(0.02)
+                    if ok_pl and pl and pl.Normal.Length > 1e-6:
+                        n = pl.Normal
+                        n.Unitize()
+                        plane_normal = DB.XYZ(float(n.X), float(n.Y), float(n.Z))
+            except Exception:
+                plane_normal = None
+            return self._build_3d_curveloop_from_rhino_curve(crv, plane_normal=plane_normal, is_outer=is_outer)
+
         target_z = crv.PointAtStart.Z
         return self._build_curveloop_from_rhino_curve(crv, target_z=target_z, is_outer=is_outer)
 
@@ -2255,57 +3185,56 @@ class ConversionRouter(object):
             pass
         return None
 
-    def _get_or_create_matching_floor_type(self, thickness_feet, material_name=None):
-        """
-        Finds or creates a Revit FloorType matching the specified thickness and material.
-        Guarantees that Revit's CompoundStructure matches the Rhino geometry thickness exactly,
-        resulting in 100% accurate HOST_VOLUME_COMPUTED and GetMaterialVolume() calculations.
-        """
-        if not REVIT_AVAILABLE or not self.doc:
-            return getattr(self, "default_floor_type", None)
+    def _get_or_create_compound_type(self, type_cls, prefix, thickness_feet, material_name=None,
+                                     default_id=None, min_thickness=0.01, filter_fn=None, return_element=False):
+        """Shared matcher/creator for compound Revit system types (FloorType, WallType, RoofType, CeilingType)."""
+        if not REVIT_AVAILABLE or not self.doc or not type_cls:
+            return self.doc.GetElement(default_id) if (return_element and self.doc and default_id) else default_id
 
         try:
-            thickness_feet = max(0.01, float(thickness_feet))
+            thickness_feet = max(float(min_thickness), float(thickness_feet))
             thk_mm = int(round(thickness_feet * 304.8))
 
-            col = DB.FilteredElementCollector(self.doc).OfClass(DB.FloorType)
+            col = DB.FilteredElementCollector(self.doc).OfClass(type_cls)
             first_type = None
-            for ft in col:
+            for et in col:
+                if filter_fn and not filter_fn(et):
+                    continue
                 if not first_type:
-                    first_type = ft
+                    first_type = et
                 try:
-                    cs = ft.GetCompoundStructure() if hasattr(ft, "GetCompoundStructure") else None
+                    cs = et.GetCompoundStructure() if hasattr(et, "GetCompoundStructure") else None
                     if cs:
                         tot_thk = cs.GetTotalThickness()
-                        if abs(tot_thk - thickness_feet) < 0.006:  # ~1.8mm tolerance
-                            if material_name and material_name.lower() not in ("bylayer", "default", "none"):
+                        if abs(tot_thk - thickness_feet) < 0.006:
+                            if material_name and str(material_name).lower() not in ("bylayer", "default", "none"):
                                 layers = cs.GetLayers()
                                 for lyr in layers:
                                     if lyr.MaterialId != DB.ElementId.InvalidElementId:
                                         m = self.doc.GetElement(lyr.MaterialId)
-                                        if m and material_name.lower() in m.Name.lower():
-                                            return ft.Id
-                            return ft.Id
+                                        if m and str(material_name).lower() in m.Name.lower():
+                                            return et if return_element else et.Id
+                            return et if return_element else et.Id
                 except Exception:
                     continue
 
             base_type = first_type
             if not base_type:
-                return getattr(self, "default_floor_type", None)
+                return self.doc.GetElement(default_id) if (return_element and default_id) else default_id
 
             mat_suffix = ""
-            if material_name and material_name.lower() not in ("bylayer", "default", "none"):
+            if material_name and str(material_name).lower() not in ("bylayer", "default", "none"):
                 clean_mat = re.sub(r'[^a-zA-Z0-9_]', '_', str(material_name)).strip('_')
                 if clean_mat:
                     mat_suffix = "_" + clean_mat[:18]
 
-            type_name = "R2R_Floor{}_{}mm".format(mat_suffix, thk_mm)
+            type_name = "{}{}_{}mm".format(prefix, mat_suffix, thk_mm)
 
-            for ft in DB.FilteredElementCollector(self.doc).OfClass(DB.FloorType):
+            for et in DB.FilteredElementCollector(self.doc).OfClass(type_cls):
                 try:
-                    p_name = ft.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM)
+                    p_name = et.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM)
                     if p_name and p_name.AsString() == type_name:
-                        return ft.Id
+                        return et if return_element else et.Id
                 except Exception:
                     pass
 
@@ -2326,89 +3255,68 @@ class ConversionRouter(object):
                         cs.SetMaterialId(target_idx, mat_id)
 
                     new_type.SetCompoundStructure(cs)
-                return new_type.Id
+                return new_type if return_element else new_type.Id
         except Exception:
             pass
 
-        return getattr(self, "default_floor_type", None)
+        return self.doc.GetElement(default_id) if (return_element and default_id) else default_id
+
+    def _get_or_create_matching_floor_type(self, thickness_feet, material_name=None):
+        """Finds or creates a Revit FloorType matching thickness and material."""
+        return self._get_or_create_compound_type(
+            getattr(DB, "FloorType", None),
+            "R2R_Floor",
+            thickness_feet,
+            material_name=material_name,
+            default_id=getattr(self, "default_floor_type", None),
+            min_thickness=0.01
+        )
 
     def _get_or_create_matching_wall_type(self, thickness_feet, material_name=None):
-        """
-        Finds or creates a Revit WallType matching the specified wall thickness and material.
-        Guarantees native Revit volume and material volume match Rhino dimensions.
-        """
-        if not REVIT_AVAILABLE or not self.doc:
-            return getattr(self, "default_wall_type", None)
+        """Finds or creates a Revit Basic WallType matching thickness and material."""
+        def _is_basic_wall(wt):
+            return not (hasattr(wt, "Kind") and wt.Kind != DB.WallKind.Basic)
 
-        try:
-            thickness_feet = max(0.05, float(thickness_feet))
-            thk_mm = int(round(thickness_feet * 304.8))
+        return self._get_or_create_compound_type(
+            getattr(DB, "WallType", None),
+            "R2R_Wall",
+            thickness_feet,
+            material_name=material_name,
+            default_id=getattr(self, "default_wall_type", None),
+            min_thickness=0.05,
+            filter_fn=_is_basic_wall
+        )
 
-            col = DB.FilteredElementCollector(self.doc).OfClass(DB.WallType)
-            first_basic_type = None
-            for wt in col:
-                if hasattr(wt, "Kind") and wt.Kind != DB.WallKind.Basic:
-                    continue
-                if not first_basic_type:
-                    first_basic_type = wt
-                try:
-                    cs = wt.GetCompoundStructure() if hasattr(wt, "GetCompoundStructure") else None
-                    if cs:
-                        tot_thk = cs.GetTotalThickness()
-                        if abs(tot_thk - thickness_feet) < 0.006:
-                            if material_name and material_name.lower() not in ("bylayer", "default", "none"):
-                                layers = cs.GetLayers()
-                                for lyr in layers:
-                                    if lyr.MaterialId != DB.ElementId.InvalidElementId:
-                                        m = self.doc.GetElement(lyr.MaterialId)
-                                        if m and material_name.lower() in m.Name.lower():
-                                            return wt.Id
-                            return wt.Id
-                except Exception:
-                    continue
+    def _get_or_create_matching_roof_type(self, thickness_feet, material_name=None):
+        """Finds or creates a Basic RoofType Element matching thickness and material."""
+        def _is_basic_roof(rt):
+            if hasattr(rt, "FamilyName") and "sloped glazing" in str(rt.FamilyName or "").lower():
+                return False
+            if hasattr(rt, "GetCompoundStructure") and rt.GetCompoundStructure() is None:
+                return False
+            return True
 
-            base_type = first_basic_type
-            if not base_type:
-                return getattr(self, "default_wall_type", None)
+        return self._get_or_create_compound_type(
+            getattr(DB, "RoofType", None),
+            "R2R_Roof",
+            thickness_feet,
+            material_name=material_name,
+            default_id=getattr(self, "default_roof_type", None),
+            min_thickness=0.05,
+            filter_fn=_is_basic_roof,
+            return_element=True
+        )
 
-            mat_suffix = ""
-            if material_name and material_name.lower() not in ("bylayer", "default", "none"):
-                clean_mat = re.sub(r'[^a-zA-Z0-9_]', '_', str(material_name)).strip('_')
-                if clean_mat:
-                    mat_suffix = "_" + clean_mat[:18]
-
-            type_name = "R2R_Wall{}_{}mm".format(mat_suffix, thk_mm)
-
-            for wt in DB.FilteredElementCollector(self.doc).OfClass(DB.WallType):
-                try:
-                    p_name = wt.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM)
-                    if p_name and p_name.AsString() == type_name:
-                        return wt.Id
-                except Exception:
-                    pass
-
-            if hasattr(base_type, "Duplicate"):
-                new_type = base_type.Duplicate(type_name)
-                cs = new_type.GetCompoundStructure() if hasattr(new_type, "GetCompoundStructure") else None
-                if cs and hasattr(cs, "GetLayers") and hasattr(cs, "SetLayerWidth"):
-                    mat_id = self._get_or_create_material(material_name)
-                    layers = cs.GetLayers()
-                    target_idx = 0
-                    for idx, lyr in enumerate(layers):
-                        if hasattr(lyr, "Function") and lyr.Function == DB.MaterialFunctionAssignment.Structure:
-                            target_idx = idx
-                            break
-
-                    cs.SetLayerWidth(target_idx, thickness_feet)
-                    if mat_id and mat_id != DB.ElementId.InvalidElementId and hasattr(cs, "SetMaterialId"):
-                        cs.SetMaterialId(target_idx, mat_id)
-
-                    new_type.SetCompoundStructure(cs)
-                return new_type.Id
-        except Exception:
-            pass
-
-        return getattr(self, "default_wall_type", None)
+    def _get_or_create_matching_ceiling_type(self, thickness_feet, material_name=None):
+        """Finds or creates a Revit CeilingType matching thickness and material."""
+        return self._get_or_create_compound_type(
+            getattr(DB, "CeilingType", None),
+            "R2R_Ceiling",
+            thickness_feet,
+            material_name=material_name,
+            default_id=getattr(self, "default_ceiling_type", None),
+            min_thickness=0.02
+        )
 
     def _extract_element_quantities(self, created_elem, scanned_obj, res, profile_rule=None):
         """

@@ -10,6 +10,25 @@ virtual sub-layers.
 """
 
 
+SYSTEM_ONLY_CATEGORIES = set([
+    "OST_Roofs", "OST_Floors", "OST_Walls", "OST_Ceilings", "OST_Toposolid",
+    "roofs", "roof", "floors", "floor", "walls", "wall", "ceilings", "ceiling", "toposolid"
+])
+
+
+def _is_system_only_category(category_name):
+    """Returns True if category_name refers to a Revit System-only category unsuitable for .rfa families."""
+    low = str(category_name or "").strip().lower()
+    if not low or "curtain" in low:
+        return False
+    if low in ("ost_roofs", "ost_floors", "ost_walls", "ost_ceilings", "ost_toposolid"):
+        return True
+    for tok in ("roof", "floor", "wall", "ceiling", "toposolid"):
+        if tok in low:
+            return True
+    return False
+
+
 STRATEGY_METADATA = {
     "DirectShape": {
         "display_name": "DirectShape (Any 3D Geometry)",
@@ -203,6 +222,7 @@ class StrategyRuleEngine(object):
         otype = getattr(obj, "object_type", "Unknown") or "Unknown"
         is_closed = bool(getattr(obj, "is_closed", False))
         is_horiz = bool(getattr(obj, "is_horizontal", False))
+        is_sloped = bool(getattr(obj, "is_planar_sloped", False))
         is_vert = bool(getattr(obj, "is_vertical", False))
         is_planar = bool(getattr(obj, "is_planar", False))
         pts = int(getattr(obj, "adaptive_point_count", 0) or 0)
@@ -216,7 +236,7 @@ class StrategyRuleEngine(object):
             return ("ADAPTIVE", "Adaptive Panel (2-4 Pt)")
         if prim in ("Box", "Cylinder", "ProfileExtrusion") or is_prismatic:
             return ("PARAMETRIC_SOLID", "Parametric Primitive (Box/Cyl/Extrusion)")
-        if is_horiz and not is_vert and (is_planar or is_closed or prim != "OpenMesh"):
+        if (is_horiz or is_sloped) and not is_vert and prim != "OpenMesh" and (is_planar or is_closed or otype != "Mesh"):
             return ("HORIZ_SLAB", "Horizontal Slab / Planar")
         if is_vert and not is_horiz:
             return ("VERT_WALL", "Vertical Wall / Surface")
@@ -227,7 +247,7 @@ class StrategyRuleEngine(object):
         return ("GENERIC_3D", "3D Geometry")
 
     @classmethod
-    def evaluate_object(cls, obj, strategy):
+    def evaluate_object(cls, obj, strategy, current_category=None):
         """Evaluates a single ScannedObject against a conversion strategy.
 
         :return: (passed, hard_failures, warnings, fallback)
@@ -236,6 +256,8 @@ class StrategyRuleEngine(object):
         prim = getattr(obj, "geometry_primitive_type", "Unknown") or "Unknown"
         otype = getattr(obj, "object_type", "Unknown") or "Unknown"
         is_horiz = bool(getattr(obj, "is_horizontal", False))
+        is_sloped = bool(getattr(obj, "is_planar_sloped", False))
+        is_curved_ext = bool(getattr(obj, "is_curved_extrusion", False))
         is_vert = bool(getattr(obj, "is_vertical", False))
         is_closed_attr = getattr(obj, "is_closed", None)
         is_closed = bool(is_closed_attr)
@@ -244,6 +266,7 @@ class StrategyRuleEngine(object):
         rep_cnt = int(getattr(obj, "repetition_count", 1) or 1)
         dims = getattr(obj, "parametric_dims", {}) or {}
         vol = float(getattr(obj, "volume", 0.0) or 0.0)
+        loop_cnt = int(getattr(obj, "loop_count", 0) or 0)
 
         hard_failures = []
         warnings = []
@@ -254,8 +277,10 @@ class StrategyRuleEngine(object):
                 hard_failures.append("Open curves cannot form a closed Floor boundary")
             elif prim == "Curve" and not is_closed:
                 hard_failures.append("Open curves cannot form a closed Floor boundary")
-            if not is_horiz:
-                hard_failures.append("Geometry is not horizontal planar slab")
+            if prim == "OpenMesh" or (otype == "Mesh" and not is_closed):
+                hard_failures.append("Open mesh cannot form a closed native Floor boundary")
+            if not (is_horiz or is_sloped):
+                hard_failures.append("Geometry is not a horizontal or planar-sloped slab")
             if has_open_loops:
                 hard_failures.append("Has non-closed boundary loops")
 
@@ -264,12 +289,26 @@ class StrategyRuleEngine(object):
                 hard_failures.append("Geometry is not vertical wall/profile")
             if prim == "OpenMesh" or (otype == "Mesh" and not is_closed):
                 hard_failures.append("Open organic mesh cannot form a system Wall")
+            if strat == "WallByCurve" and loop_cnt > 6:
+                warnings.append("Wall has openings/cutouts; conversion will use WallByProfile")
 
-        elif strat in ("RoofNative", "RoofByHost", "CeilingNative"):
+        elif strat in ("RoofNative", "RoofByHost"):
             if otype == "Curve" or prim == "Curve":
-                hard_failures.append("1D curve cannot form a Roof/Ceiling surface")
-            if not is_horiz:
-                hard_failures.append("Geometry is not horizontal/sloped roof or ceiling")
+                hard_failures.append("1D curve cannot form a Roof surface")
+            if prim == "OpenMesh" or (otype == "Mesh" and not is_closed):
+                hard_failures.append("Open or triangulated mesh shell cannot form a sketch-based native Roof; use DirectShape")
+            if not (is_horiz or is_sloped or is_curved_ext):
+                hard_failures.append("Double-curved or vertical freeform geometry cannot form a native Footprint/Extrusion Roof")
+            if has_open_loops and (is_horiz or is_sloped or is_curved_ext):
+                warnings.append("Open Brep edge flags present; footprint will extract top boundary loops")
+
+        elif strat == "CeilingNative":
+            if otype == "Curve" or prim == "Curve":
+                hard_failures.append("1D curve cannot form a Ceiling surface")
+            if prim == "OpenMesh" or (otype == "Mesh" and not is_closed):
+                hard_failures.append("Open mesh cannot form a native Ceiling")
+            if not (is_horiz or is_sloped):
+                hard_failures.append("Geometry is not horizontal or planar-sloped ceiling")
 
         elif strat == "Toposolid":
             if otype == "Curve" or prim == "Curve":
@@ -344,6 +383,12 @@ class StrategyRuleEngine(object):
             # Unknown custom strategy defaults to universal compatibility
             pass
 
+        if strat in ("ParametricFamily", "FreeFormFamily", "FamilyInstance", "RepetitiveFamily"):
+            if _is_system_only_category(current_category):
+                warnings.append(
+                    "System category '{}' cannot host loadable .rfa families; Revit maps to Generic Models unless Native or DirectShape is used".format(current_category)
+                )
+
         passed = (len(hard_failures) == 0)
         return passed, hard_failures, warnings, fallback
 
@@ -389,7 +434,7 @@ class StrategyRuleEngine(object):
         return "DirectShape"
 
     @classmethod
-    def evaluate_layer(cls, objects, strategy):
+    def evaluate_layer(cls, objects, strategy, current_category=None):
         """Evaluates all objects in a layer or group against a strategy.
 
         :return: StrategyEvaluation
@@ -424,7 +469,7 @@ class StrategyRuleEngine(object):
             _, b_label = cls.classify_geometry_bucket(obj)
             bucket_counts[b_label] = bucket_counts.get(b_label, 0) + 1
 
-            ok, fails, warns, fb = cls.evaluate_object(obj, strat)
+            ok, fails, warns, fb = cls.evaluate_object(obj, strat, current_category=current_category)
             guid = getattr(obj, "rhino_guid", "")
             checks.append(ObjectRuleCheck(guid, ok, fails, warns, fb))
 
@@ -459,7 +504,7 @@ class StrategyRuleEngine(object):
                 rep_cnt = max([int(getattr(o, "repetition_count", 1) or 1) for o in objects] + [1])
                 is_blk = any(getattr(o, "object_type", "") == "InstanceReference" for o in objects)
                 comp_score = 98.0 if (rep_cnt >= 2 or is_blk) else 75.0
-            elif strat in ("FloorNative", "FloorByHost", "WallByCurve", "WallByProfile"):
+            elif strat in ("FloorNative", "FloorByHost", "RoofNative", "RoofByHost", "CeilingNative", "WallByCurve", "WallByProfile"):
                 comp_score = 96.0
             elif strat == "Toposolid":
                 horiz_cnt = sum(1 for o in objects if getattr(o, "is_horizontal", False))
@@ -483,7 +528,7 @@ class StrategyRuleEngine(object):
         if fallback_counts:
             rec_fallback = max(fallback_counts.items(), key=lambda kv: kv[1])[0]
 
-        rec_strat = cls.recommend_best_strategy(objects)
+        rec_strat = cls.recommend_best_strategy(objects, current_category=current_category)
 
         return StrategyEvaluation(
             strategy=strat,

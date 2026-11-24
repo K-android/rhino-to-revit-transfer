@@ -245,13 +245,20 @@ class AecClassifier(object):
                 scores["Floors"] = 0.4
             return scores
 
-        # 3. Horizontal elements (Slabs, Ceilings, Roofs)
+        # 3. Horizontal, Planar-Sloped & Vaulted Roof / Slab elements
         # Typically dz < 1.0m, horizontal face normal, dx/dy > 1.5m
-        if obj.is_horizontal or (obj.dz < 1.0 and max(obj.dx, obj.dy) > 1.5):
+        if obj.is_horizontal or (obj.dz < 1.0 and max(obj.dx, obj.dy) > 1.5 and not getattr(obj, "is_planar_sloped", False)):
             scores["Floors"] = 1.0 if (obj.is_closed or obj.is_horizontal) else 0.90
             scores["Ceilings"] = 0.80
             scores["Roofs"] = 0.70
             scores["Walls"] = 0.05
+        elif getattr(obj, "is_planar_sloped", False):
+            scores["Roofs"] = 0.92
+            scores["Floors"] = 0.45
+            scores["Walls"] = 0.05
+        elif getattr(obj, "is_curved_extrusion", False):
+            scores["Roofs"] = 0.90
+            scores["DirectShape"] = 0.50
 
         # 4. Vertical elements (Walls, Partitions, Columns)
         # Typically dz >= 1.5m
@@ -341,6 +348,9 @@ class AecClassifier(object):
             scores["Floors"] = 0.8
             scores["Ceilings"] = 0.5
             scores["Roofs"] = 0.5
+        elif getattr(obj, "is_planar_sloped", False) or getattr(obj, "is_curved_extrusion", False):
+            scores["Roofs"] = 0.9
+            scores["Floors"] = 0.3
         elif obj.is_vertical:
             min_horizontal_dim = min(obj.dx, obj.dy)
             max_horizontal_dim = max(obj.dx, obj.dy)
@@ -442,11 +452,17 @@ class AecClassifier(object):
                 return "FloorNative"  # Native floors retained for room bounding
             return "DirectShape"
 
+        prim = getattr(obj, "geometry_primitive_type", "Unknown") or "Unknown"
+        is_open_mesh = (prim == "OpenMesh" or (obj.object_type == "Mesh" and not obj.is_closed))
+
         if category == "Floors":
-            if obj.is_horizontal and (obj.is_closed or obj.object_type == "Curve"):
+            if is_open_mesh:
+                return "DirectShape"
+            if (obj.is_horizontal or getattr(obj, "is_planar_sloped", False)) and (
+                obj.is_closed or obj.object_type in ("Curve", "Brep", "Extrusion", "Surface")
+            ):
                 return "FloorNative"
-            else:
-                return "FloorByHost"
+            return "FloorByHost"
 
         elif category == "Walls":
             if self.mode == "Native BIM":
@@ -460,13 +476,18 @@ class AecClassifier(object):
                 return "DirectShape"
 
         elif category == "Roofs":
-            return "RoofNative" if obj.is_horizontal else "RoofByHost"
+            if is_open_mesh:
+                return "DirectShape"
+            if obj.is_horizontal or getattr(obj, "is_planar_sloped", False) or getattr(obj, "is_curved_extrusion", False):
+                return "RoofNative"
+            return "DirectShape"
 
         elif category == "Ceilings":
+            if is_open_mesh:
+                return "DirectShape"
             return "CeilingNative"
 
         elif category == "Family":
-            prim = getattr(obj, "geometry_primitive_type", "Unknown") or "Unknown"
             if prim == "FreeFormSolid":
                 return "RepetitiveFamily" if rep_count >= 2 else "FreeFormFamily"
             if prim in ("OpenMesh", "OpenSurface"):

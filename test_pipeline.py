@@ -3386,5 +3386,931 @@ class TestAccurateFamilyGeometry(unittest.TestCase):
             cr.FamilyFactory = orig_ff
 
 
+class TestNativeElementAndGeometryFixes(unittest.TestCase):
+    """Regression tests for RoofNative, DirectShape exact meshes, CurveLoop spline/3D handling, and StrategyRuleEngine."""
+
+    def _make_xyz_db_env(self):
+        """Creates rich mock Revit DB with XYZ math, Line, Arc, CurveLoop, CurveArray, and Roof APIs."""
+        import math
+
+        class MockXYZ(object):
+            def __init__(self, x=0.0, y=0.0, z=0.0):
+                self.X = float(x)
+                self.Y = float(y)
+                self.Z = float(z)
+            def DistanceTo(self, other):
+                return math.sqrt((self.X - other.X) ** 2 + (self.Y - other.Y) ** 2 + (self.Z - other.Z) ** 2)
+            def __sub__(self, other):
+                return MockXYZ(self.X - other.X, self.Y - other.Y, self.Z - other.Z)
+            def CrossProduct(self, other):
+                return MockXYZ(
+                    self.Y * other.Z - self.Z * other.Y,
+                    self.Z * other.X - self.X * other.Z,
+                    self.X * other.Y - self.Y * other.X
+                )
+            def GetLength(self):
+                return math.sqrt(self.X ** 2 + self.Y ** 2 + self.Z ** 2)
+
+        MockXYZ.BasisZ = MockXYZ(0.0, 0.0, 1.0)
+
+        class MockLineObj(object):
+            def __init__(self, p0, p1):
+                self.p0 = p0
+                self.p1 = p1
+            def GetEndPoint(self, idx):
+                return self.p0 if idx == 0 else self.p1
+
+        class MockLineAPI(object):
+            @staticmethod
+            def CreateBound(p0, p1):
+                return MockLineObj(p0, p1)
+
+        class MockCurveLoop(list):
+            def Append(self, c):
+                self.append(c)
+            def IsOpen(self):
+                if len(self) < 2:
+                    return True
+                return self[0].GetEndPoint(0).DistanceTo(self[-1].GetEndPoint(1)) > 0.01
+            def IsCounterClockwise(self, norm):
+                return True
+            def Reverse(self):
+                list.reverse(self)
+
+        class MockCurveArray(list):
+            @property
+            def Size(self):
+                return len(self)
+            def Append(self, c):
+                self.append(c)
+
+        class MockModelCurve(object):
+            def __init__(self, geom_crv):
+                self.GeometryCurve = geom_crv
+
+        class MockModelCurveArray(list):
+            def Append(self, mc):
+                self.append(mc)
+
+        class MockElementId(object):
+            InvalidElementId = -1
+            def __init__(self, val=1):
+                self.val = int(val)
+            def __eq__(self, other):
+                return int(getattr(other, "val", other if isinstance(other, int) else -999)) == self.val
+            def __ne__(self, other):
+                return not self.__eq__(other)
+
+        class MockParam(object):
+            def __init__(self, v=None):
+                self.val = v
+                self.IsReadOnly = False
+            def Set(self, v):
+                self.val = v
+
+        class MockBIP(object):
+            ROOF_LEVEL_OFFSET_PARAM = 101
+            WALL_ATTR_ROOM_BOUNDING = 102
+            FLOOR_HEIGHTABOVELEVEL_PARAM = 103
+            CEILING_HEIGHTABOVELEVEL_PARAM = 104
+            SYMBOL_NAME_PARAM = 105
+
+        class MockBIC(object):
+            OST_Roofs = 201
+            OST_Floors = 202
+            OST_Walls = 203
+            OST_Ceilings = 204
+            OST_GenericModel = 205
+            OST_Toposolid = 206
+
+        class MockETG(object):
+            FloorType = 1
+            WallType = 2
+            RoofType = 3
+            CeilingType = 4
+
+        class MockCol(object):
+            def __init__(self, doc):
+                self.doc = doc
+                self.cls = None
+            def OfClass(self, cls):
+                self.cls = cls
+                return self
+            def FirstElement(self):
+                items = list(self)
+                return items[0] if items else None
+            def __iter__(self):
+                if self.cls is MockLevel:
+                    return iter(getattr(self.doc, "levels", []))
+                if self.cls is MockRoofType:
+                    return iter(getattr(self.doc, "roof_types", []))
+                return iter([])
+
+        class MockLevel(object):
+            def __init__(self, name, elev, lid):
+                self.Name = name
+                self.Elevation = elev
+                self.Id = MockElementId(lid)
+
+        class MockRoofType(object):
+            def __init__(self, rid=301):
+                self.Id = MockElementId(rid)
+                self.FamilyName = "Basic Roof"
+            def GetCompoundStructure(self):
+                return None
+
+        class MockTSBTarget(object):
+            Solid = "Solid"
+            Mesh = "Mesh"
+            AnyGeometry = "AnyGeometry"
+
+        class MockTSBFallback(object):
+            Abort = "Abort"
+            Salvage = "Salvage"
+            Mesh = "Mesh"
+
+        class MockSolid(object):
+            def __init__(self, vol=10.0):
+                self.Volume = vol
+
+        class MockMesh(object):
+            def __init__(self, faces=2):
+                self.NumTriangles = faces
+
+        class MockGeometryObject(object):
+            pass
+
+        return locals()
+
+    def test_roof_native_uses_level_plane_disables_default_slope_and_sets_offset(self):
+        """RoofNative builds curves strictly at level.Elevation, clears default 30-deg slope, sets ROOF_LEVEL_OFFSET_PARAM, and cuts inner openings."""
+        import conversion_router as cr
+        from profile_manager import MappingRule
+
+        env = self._make_xyz_db_env()
+        MockXYZ = env["MockXYZ"]
+        MockLineAPI = env["MockLineAPI"]
+        MockCurveLoop = env["MockCurveLoop"]
+        MockCurveArray = env["MockCurveArray"]
+        MockModelCurve = env["MockModelCurve"]
+        MockModelCurveArray = env["MockModelCurveArray"]
+        MockElementId = env["MockElementId"]
+        MockParam = env["MockParam"]
+        MockLevel = env["MockLevel"]
+        MockRoofType = env["MockRoofType"]
+
+        recorded = {
+            "footprint_z": [],
+            "slope_calls": [],
+            "openings": [],
+        }
+
+        class MockRoof(object):
+            def __init__(self):
+                self.Id = MockElementId(9001)
+                self.UniqueId = "roof-9001"
+                self.Category = type("Cat", (), {"Name": "Roofs"})()
+                self.params = {
+                    env["MockBIP"].ROOF_LEVEL_OFFSET_PARAM: MockParam(),
+                    env["MockBIP"].WALL_ATTR_ROOM_BOUNDING: MockParam(),
+                }
+            def get_Parameter(self, bip):
+                return self.params.get(bip)
+            def set_DefinesSlope(self, mc, flag):
+                recorded["slope_calls"].append((mc, bool(flag)))
+            def set_SlopeAngle(self, mc, ang):
+                recorded["slope_calls"].append(("angle", ang))
+
+        class MockCreate(object):
+            @staticmethod
+            def NewFootPrintRoof(crv_array, level_elem, roof_type, footprint_map):
+                for c in crv_array:
+                    recorded["footprint_z"].append(c.GetEndPoint(0).Z)
+                    recorded["footprint_z"].append(c.GetEndPoint(1).Z)
+                    footprint_map.Append(MockModelCurve(c))
+                return MockRoof()
+            @staticmethod
+            def NewOpening(roof_elem, inner_arr, flag):
+                recorded["openings"].append((roof_elem.UniqueId, len(inner_arr), flag))
+
+        class MockDoc(object):
+            levels = [MockLevel("Level 2", 10.0, 102)]
+            roof_types = [MockRoofType(301)]
+            Create = MockCreate()
+            def GetDefaultElementTypeId(self, grp):
+                return MockElementId(301)
+            def GetElement(self, eid):
+                if eid == 102:
+                    return self.levels[0]
+                if eid == 301:
+                    return self.roof_types[0]
+                return None
+
+        class MockDB(object):
+            XYZ = MockXYZ
+            Line = MockLineAPI
+            CurveLoop = MockCurveLoop
+            CurveArray = MockCurveArray
+            ModelCurveArray = MockModelCurveArray
+            ElementId = MockElementId
+            BuiltInParameter = env["MockBIP"]
+            BuiltInCategory = env["MockBIC"]
+            ElementTypeGroup = env["MockETG"]
+            Level = MockLevel
+            RoofType = MockRoofType
+            FloorType = type("FT", (), {})
+            WallType = type("WT", (), {})
+            CeilingType = type("CT", (), {})
+            Solid = env["MockSolid"]
+            Mesh = env["MockMesh"]
+            GeometryObject = env["MockGeometryObject"]
+            @staticmethod
+            def FilteredElementCollector(d):
+                return env["MockCol"](d)
+
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        try:
+            cr.REVIT_AVAILABLE = True
+            cr.DB = MockDB
+            router = cr.ConversionRouter(MockDoc())
+            router._extract_floor_boundary_loops = lambda g, o: ("outer_crv", ["skylight_crv"], 25.0)
+
+            def fake_cl(c, target_z=None, is_outer=True):
+                tz = float(target_z or 0.0)
+                cl = MockCurveLoop()
+                pts = [MockXYZ(0, 0, tz), MockXYZ(20, 0, tz), MockXYZ(20, 15, tz), MockXYZ(0, 15, tz)]
+                for i in range(4):
+                    cl.Append(MockLineAPI.CreateBound(pts[i], pts[(i + 1) % 4]))
+                return cl
+
+            router._build_curveloop_from_rhino_curve = fake_cl
+
+            geom_feet = type("MockGeom", (), {
+                "GetBoundingBox": lambda s, b: type("BB", (), {
+                    "Min": MockXYZ(0, 0, 24.0),
+                    "Max": MockXYZ(20, 15, 25.0)
+                })()
+            })()
+            scanned = ScannedObject("roof-guid-1")
+            scanned.layer_name = "A-ROOF"
+            res = cr.ConversionResult("roof-guid-1")
+
+            roof = router._pipeline_6_roof_native(
+                scanned, geom_feet, MockElementId(102), MappingRule("A-ROOF", strategy="RoofNative"), res
+            )
+            self.assertIsNotNone(roof)
+            self.assertEqual(res.strategy_used, "RoofNative")
+            # Curves passed to NewFootPrintRoof must all lie strictly at level.Elevation (10.0), NOT roof_z (25.0)
+            self.assertTrue(len(recorded["footprint_z"]) == 8)
+            for z in recorded["footprint_z"]:
+                self.assertAlmostEqual(z, 10.0, places=4)
+            # Default 30-deg hip slope disabled on all 4 footprint edges
+            self.assertEqual(len(recorded["slope_calls"]), 4)
+            for _, flag in recorded["slope_calls"]:
+                self.assertFalse(flag)
+            # Base offset = roof_bottom_z (24.0) - level_elev (10.0) = 14.0
+            self.assertAlmostEqual(roof.params[env["MockBIP"].ROOF_LEVEL_OFFSET_PARAM].val, 14.0, places=3)
+            # Inner skylight opening was cut
+            self.assertEqual(len(recorded["openings"]), 1)
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            cr.DB = orig_db
+
+    def test_roof_native_sloped_planar_applies_single_eave_slope(self):
+        """Sloped planar roof enables slope ONLY on its orthogonal downhill eave edge and applies rise/run."""
+        import conversion_router as cr
+
+        env = self._make_xyz_db_env()
+        MockXYZ = env["MockXYZ"]
+        MockLineAPI = env["MockLineAPI"]
+        MockCurveLoop = env["MockCurveLoop"]
+        MockCurveArray = env["MockCurveArray"]
+        MockModelCurve = env["MockModelCurve"]
+        MockModelCurveArray = env["MockModelCurveArray"]
+        MockElementId = env["MockElementId"]
+        MockParam = env["MockParam"]
+        MockLevel = env["MockLevel"]
+        MockRoofType = env["MockRoofType"]
+
+        defines_history = []
+        angles_history = []
+
+        class MockRoof(object):
+            def __init__(self):
+                self.Id = MockElementId(9002)
+                self.UniqueId = "roof-9002"
+                self.params = {
+                    env["MockBIP"].ROOF_LEVEL_OFFSET_PARAM: MockParam(),
+                    env["MockBIP"].WALL_ATTR_ROOM_BOUNDING: MockParam(),
+                }
+            def get_Parameter(self, bip):
+                return self.params.get(bip)
+            def set_DefinesSlope(self, mc, flag):
+                p0 = mc.GeometryCurve.GetEndPoint(0)
+                p1 = mc.GeometryCurve.GetEndPoint(1)
+                defines_history.append(((p0.X, p0.Y, p1.X, p1.Y), bool(flag)))
+            def set_SlopeAngle(self, mc, ang):
+                angles_history.append(float(ang))
+
+        class MockCreate(object):
+            @staticmethod
+            def NewFootPrintRoof(crv_array, level_elem, roof_type, footprint_map):
+                for c in crv_array:
+                    footprint_map.Append(MockModelCurve(c))
+                return MockRoof()
+
+        class MockDoc(object):
+            levels = [MockLevel("Level 1", 10.0, 101)]
+            roof_types = [MockRoofType(301)]
+            Create = MockCreate()
+            def GetDefaultElementTypeId(self, grp):
+                return MockElementId(301)
+            def GetElement(self, eid):
+                if eid == 101:
+                    return self.levels[0]
+                if eid == 301:
+                    return self.roof_types[0]
+                return None
+
+        class MockDB(object):
+            XYZ = MockXYZ
+            Line = MockLineAPI
+            CurveLoop = MockCurveLoop
+            CurveArray = MockCurveArray
+            ModelCurveArray = MockModelCurveArray
+            ElementId = MockElementId
+            BuiltInParameter = env["MockBIP"]
+            BuiltInCategory = env["MockBIC"]
+            ElementTypeGroup = env["MockETG"]
+            Level = MockLevel
+            RoofType = MockRoofType
+            FloorType = type("FT", (), {})
+            WallType = type("WT", (), {})
+            CeilingType = type("CT", (), {})
+            Solid = env["MockSolid"]
+            Mesh = env["MockMesh"]
+            GeometryObject = env["MockGeometryObject"]
+            @staticmethod
+            def FilteredElementCollector(d):
+                return env["MockCol"](d)
+
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        try:
+            cr.REVIT_AVAILABLE = True
+            cr.DB = MockDB
+            router = cr.ConversionRouter(MockDoc())
+            router._extract_roof_or_slab_footprint_and_slope = lambda g, o: {
+                "outer_crv": "sloped_outer",
+                "inner_crvs": [],
+                "top_z": 18.75,
+                "bottom_z": 18.0,
+                "thickness_feet": 0.75,
+                "is_sloped": True,
+                "rise_over_run": 0.5,
+                "slope_dir_xy": (1.0, 0.0),  # Downhill toward X = 20 edge
+                "uphill_dir_xy": (-1.0, 0.0),
+                "tail_pt_xy": (20.0, 7.5),
+                "head_pt_xy": (0.0, 7.5),
+            }
+
+            def fake_cl(c, target_z=None, is_outer=True):
+                tz = float(target_z or 0.0)
+                cl = MockCurveLoop()
+                pts = [MockXYZ(0, 0, tz), MockXYZ(20, 0, tz), MockXYZ(20, 15, tz), MockXYZ(0, 15, tz)]
+                for i in range(4):
+                    cl.Append(MockLineAPI.CreateBound(pts[i], pts[(i + 1) % 4]))
+                return cl
+
+            router._build_curveloop_from_rhino_curve = fake_cl
+            scanned = ScannedObject("roof-slope-1")
+            scanned.is_planar_sloped = True
+            res = cr.ConversionResult("roof-slope-1")
+
+            roof = router._pipeline_6_roof_native(scanned, object(), MockElementId(101), None, res)
+            self.assertIsNotNone(roof)
+            self.assertEqual(res.strategy_used, "RoofNative")
+            # First 4 calls set False, 5th call enables slope ONLY on X=20 downhill edge ((20,0)->(20,15))
+            self.assertEqual(len(defines_history), 5)
+            self.assertTrue(defines_history[-1][1])
+            self.assertEqual(defines_history[-1][0], (20.0, 0.0, 20.0, 15.0))
+            self.assertEqual(angles_history, [0.5])
+            self.assertAlmostEqual(roof.params[env["MockBIP"].ROOF_LEVEL_OFFSET_PARAM].val, 8.0, places=3)
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            cr.DB = orig_db
+
+    def test_directshape_geometry_no_subd_and_abort_not_salvage(self):
+        """_convert_rhino_to_revit_geometry never calls SubD.CreateFromMesh, never uses Salvage, and keeps open meshes intact."""
+        import conversion_router as cr
+
+        env = self._make_xyz_db_env()
+        tsb_runs = []
+        subd_calls = []
+
+        class MockPt(object):
+            def __init__(self, x, y, z):
+                self.X, self.Y, self.Z = x, y, z
+
+        class MockFace(object):
+            A, B, C, IsQuad = 0, 1, 2, False
+
+        class MockFaces(list):
+            @property
+            def Count(self):
+                return len(self)
+            def ConvertQuadsToTriangles(self):
+                pass
+
+        class MockRhMesh(object):
+            def __init__(self, is_closed):
+                self.IsClosed = is_closed
+                self.Vertices = [MockPt(0, 0, 0), MockPt(5, 0, 0), MockPt(0, 5, 0)]
+                self.Faces = MockFaces([MockFace()])
+            def Duplicate(self):
+                return self
+            def Scale(self, s):
+                pass
+
+        class MockSubD(object):
+            @staticmethod
+            def CreateFromMesh(m):
+                subd_calls.append(m)
+                return None
+
+        class FakeRG(object):
+            Brep = type("FakeBrep", (), {})
+            Mesh = MockRhMesh
+            SubD = MockSubD
+            MeshingParameters = type("MP", (), {"Default": object(), "QualityRenderMesh": object()})
+
+        class FakeTSB(object):
+            def __init__(self):
+                self.Target = None
+                self.Fallback = None
+                self.open_closed_flag = None
+                self.faces = []
+            def OpenConnectedFaceSet(self, flag):
+                self.open_closed_flag = flag
+            def AddFace(self, face):
+                self.faces.append(face)
+            def CloseConnectedFaceSet(self):
+                pass
+            def Build(self):
+                tsb_runs.append((self.open_closed_flag, self.Target, self.Fallback, len(self.faces)))
+            def GetBuildResult(self):
+                if self.Fallback == "Abort":
+                    return type("EmptyRes", (), {"GetGeometricalObjects": lambda s: []})()
+                return type("MeshRes", (), {"GetGeometricalObjects": lambda s: [env["MockMesh"](len(self.faces))]})()
+
+        class MockDB(object):
+            XYZ = env["MockXYZ"]
+            ElementId = env["MockElementId"]
+            TessellatedShapeBuilder = FakeTSB
+            TessellatedShapeBuilderTarget = env["MockTSBTarget"]
+            TessellatedShapeBuilderFallback = env["MockTSBFallback"]
+            TessellatedFace = lambda pts, mid: ("Face", len(pts))
+            Solid = env["MockSolid"]
+            Mesh = env["MockMesh"]
+            GeometryObject = env["MockGeometryObject"]
+            Level = env["MockLevel"]
+            RoofType = env["MockRoofType"]
+            FloorType = type("FT", (), {})
+            WallType = type("WT", (), {})
+            CeilingType = type("CT", (), {})
+            ElementTypeGroup = env["MockETG"]
+            @staticmethod
+            def FilteredElementCollector(d):
+                return env["MockCol"](d)
+
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_rhino = cr.RHINO_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        orig_rg = getattr(cr, "rg", None)
+        orig_rh = getattr(cr, "Rhino", None)
+        orig_enc = getattr(cr, "GeometryEncoder", None)
+        try:
+            cr.REVIT_AVAILABLE = True
+            cr.RHINO_AVAILABLE = True
+            cr.DB = MockDB
+            cr.rg = FakeRG
+            cr.Rhino = type("RhinoMod", (), {"RhinoDoc": type("RD", (), {"ActiveDoc": None})})
+            cr.GeometryEncoder = object()
+
+            doc = type("Doc", (), {
+                "GetDefaultElementTypeId": lambda s, g: env["MockElementId"](1),
+                "levels": [], "roof_types": []
+            })()
+            router = cr.ConversionRouter(doc, unit_scale=1.0)
+
+            # 1. Open Mesh: skips Pass 1 entirely, goes straight to OpenConnectedFaceSet(False) + AnyGeometry + Mesh
+            open_mesh = MockRhMesh(is_closed=False)
+            out_open = router._convert_rhino_to_revit_geometry(open_mesh, geom_feet=open_mesh)
+            self.assertEqual(len(subd_calls), 0)
+            self.assertEqual(len(tsb_runs), 1)
+            self.assertEqual(tsb_runs[0], (False, "AnyGeometry", "Mesh", 1))
+            self.assertEqual(len(out_open), 1)
+            self.assertIsInstance(out_open[0], env["MockMesh"])
+
+            # 2. Closed leaky mesh: Pass 1 MUST use Fallback.Abort (never Salvage), then falls through to Pass 2
+            tsb_runs.clear()
+            closed_leaky = MockRhMesh(is_closed=True)
+            out_closed = router._convert_rhino_to_revit_geometry(closed_leaky, geom_feet=closed_leaky)
+            self.assertEqual(len(subd_calls), 0)
+            self.assertEqual(len(tsb_runs), 2)
+            self.assertEqual(tsb_runs[0], (True, "Solid", "Abort", 1))
+            self.assertEqual(tsb_runs[1], (False, "AnyGeometry", "Mesh", 1))
+            self.assertEqual(len(out_closed), 1)
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            cr.RHINO_AVAILABLE = orig_rhino
+            cr.DB = orig_db
+            cr.rg = orig_rg
+            if orig_rh is None and hasattr(cr, "Rhino"):
+                delattr(cr, "Rhino")
+            elif orig_rh is not None:
+                cr.Rhino = orig_rh
+            cr.GeometryEncoder = orig_enc
+
+    def test_nurbs_spline_and_3d_curveloop_builders(self):
+        """Spline segments tessellate to contiguous Lines (never 3-pt Arc); vertical wall loops retain full 3D Z."""
+        import conversion_router as cr
+
+        env = self._make_xyz_db_env()
+        arc_calls = []
+
+        class MockArcAPI(object):
+            @staticmethod
+            def Create(*args):
+                arc_calls.append(args)
+                raise AssertionError("Arc.Create should not be called on non-arc NURBS spline or linear loop!")
+
+        class MockPt3(object):
+            def __init__(self, x, y, z):
+                self.X, self.Y, self.Z = float(x), float(y), float(z)
+            def DistanceTo(self, o):
+                return ((self.X - o.X) ** 2 + (self.Y - o.Y) ** 2 + (self.Z - o.Z) ** 2) ** 0.5
+
+        class MockPolyline(list):
+            @property
+            def Count(self):
+                return len(self)
+
+        class MockSeg(object):
+            def __init__(self, pts, is_lin=True):
+                self._pts = [MockPt3(*p) for p in pts]
+                self._lin = is_lin
+                self.IsClosed = False
+                self.Domain = type("D", (), {"Min": 0.0, "Max": 1.0})()
+            @property
+            def PointAtStart(self):
+                return self._pts[0]
+            @property
+            def PointAtEnd(self):
+                return self._pts[-1]
+            def DuplicateCurve(self):
+                return self
+            def IsLinear(self, tol=0.01):
+                return self._lin
+            def TryGetArc(self, tol=0.01):
+                return (False, None)
+            def ToPolyline(self, *a):
+                pts_ref = self._pts
+                return type("PC", (), {"ToPolyline": lambda s: MockPolyline(pts_ref)})()
+
+        class MockCompoundCurve(object):
+            def __init__(self, segs, bbox_min, bbox_max):
+                self._segs = segs
+                self._bmin = MockPt3(*bbox_min)
+                self._bmax = MockPt3(*bbox_max)
+                self.IsClosed = True
+            @property
+            def PointAtStart(self):
+                return self._segs[0].PointAtStart
+            def DuplicateSegments(self):
+                return list(self._segs)
+            def GetBoundingBox(self, flag):
+                return type("BB", (), {"Min": self._bmin, "Max": self._bmax})()
+
+        class FakeRG(object):
+            ArcCurve = type("AC", (), {})
+            Arc = type("Arc", (), {})
+            BrepLoopType = type("BLT", (), {"Outer": 0, "Inner": 1})
+
+        class MockDB(object):
+            XYZ = env["MockXYZ"]
+            Line = env["MockLineAPI"]
+            Arc = MockArcAPI
+            CurveLoop = env["MockCurveLoop"]
+            ElementId = env["MockElementId"]
+            Level = env["MockLevel"]
+            RoofType = env["MockRoofType"]
+            FloorType = type("FT", (), {})
+            WallType = type("WT", (), {})
+            CeilingType = type("CT", (), {})
+            ElementTypeGroup = env["MockETG"]
+            @staticmethod
+            def FilteredElementCollector(d):
+                return env["MockCol"](d)
+
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_rhino = cr.RHINO_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        orig_rg = getattr(cr, "rg", None)
+        orig_rh = getattr(cr, "Rhino", None)
+        try:
+            cr.REVIT_AVAILABLE = True
+            cr.RHINO_AVAILABLE = True
+            cr.DB = MockDB
+            cr.rg = FakeRG
+            cr.Rhino = type("RhinoMod", (), {"RhinoDoc": type("RD", (), {"ActiveDoc": None})})
+
+            doc = type("Doc", (), {
+                "GetDefaultElementTypeId": lambda s, g: env["MockElementId"](1),
+                "levels": [], "roof_types": []
+            })()
+            router = cr.ConversionRouter(doc)
+
+            # 1. Spline loop: chordal tessellation without calling Arc.Create
+            spline_seg = MockSeg([(0, 0, 5), (3, 2, 5), (7, -1, 5), (10, 0, 5)], is_lin=False)
+            back_seg = MockSeg([(10, 0, 5), (0, 0, 5)], is_lin=True)
+            rh_spline_loop = MockCompoundCurve([spline_seg, back_seg], (0, -1, 5), (10, 2, 5))
+            cl_spline = router._build_curveloop_from_rhino_curve(rh_spline_loop, target_z=12.0, is_outer=True)
+            self.assertIsNotNone(cl_spline)
+            self.assertFalse(cl_spline.IsOpen())
+            self.assertEqual(len(cl_spline), 4)  # 3 chords from spline + 1 closing chord
+            self.assertEqual(len(arc_calls), 0)
+
+            # 2. Vertical 3D wall profile loop (Z spans 0.0 -> 12.0) preserves true Z coordinates
+            s0 = MockSeg([(0, 5, 0), (10, 5, 0)], is_lin=True)
+            s1 = MockSeg([(10, 5, 0), (10, 5, 12)], is_lin=True)
+            s2 = MockSeg([(10, 5, 12), (0, 5, 12)], is_lin=True)
+            s3 = MockSeg([(0, 5, 12), (0, 5, 0)], is_lin=True)
+            vert_crv = MockCompoundCurve([s0, s1, s2, s3], (0, 5, 0), (10, 5, 12))
+            mock_loop = type("MockLoop", (), {
+                "LoopType": FakeRG.BrepLoopType.Outer,
+                "To3dCurve": lambda s: vert_crv,
+                "Face": None,
+            })()
+            cl_3d = router._rg_loop_to_revit_curveloop(mock_loop)
+            self.assertIsNotNone(cl_3d)
+            self.assertFalse(cl_3d.IsOpen())
+            z_vals = [c.GetEndPoint(0).Z for c in cl_3d] + [c.GetEndPoint(1).Z for c in cl_3d]
+            self.assertAlmostEqual(min(z_vals), 0.0, places=4)
+            self.assertAlmostEqual(max(z_vals), 12.0, places=4)
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            cr.RHINO_AVAILABLE = orig_rhino
+            cr.DB = orig_db
+            cr.rg = orig_rg
+            if orig_rh is None and hasattr(cr, "Rhino"):
+                delattr(cr, "Rhino")
+            elif orig_rh is not None:
+                cr.Rhino = orig_rh
+
+    def test_strategy_rules_roof_category_and_open_mesh_blocking(self):
+        """Roof category recommends RoofNative; sloped planar passes; OpenMesh & double-curved shells are blocked on RoofNative/FloorNative."""
+        from strategy_rules import StrategyRuleEngine
+        from ui_dialog import LayerRowItem
+
+        horiz_slab = ScannedObject("r-horiz")
+        horiz_slab.object_type = "Brep"
+        horiz_slab.is_horizontal = True
+        horiz_slab.is_closed = True
+
+        ev_roof = StrategyRuleEngine.evaluate_layer([horiz_slab], "FloorNative", current_category="Roofs")
+        self.assertEqual(ev_roof.recommended_strategy, "RoofNative")
+
+        sloped_roof = ScannedObject("r-sloped")
+        sloped_roof.object_type = "Brep"
+        sloped_roof.is_horizontal = False
+        sloped_roof.is_planar_sloped = True
+        sloped_roof.is_closed = True
+        self.assertTrue(StrategyRuleEngine.evaluate_object(sloped_roof, "RoofNative")[0])
+        self.assertTrue(StrategyRuleEngine.evaluate_object(sloped_roof, "FloorNative")[0])
+
+        open_mesh = ScannedObject("r-omesh")
+        open_mesh.object_type = "Mesh"
+        open_mesh.geometry_primitive_type = "OpenMesh"
+        open_mesh.is_horizontal = True
+        open_mesh.is_closed = False
+        self.assertFalse(StrategyRuleEngine.evaluate_object(open_mesh, "RoofNative")[0])
+        self.assertFalse(StrategyRuleEngine.evaluate_object(open_mesh, "FloorNative")[0])
+        self.assertFalse(StrategyRuleEngine.evaluate_object(open_mesh, "CeilingNative")[0])
+        ev_om = StrategyRuleEngine.evaluate_layer([open_mesh], "RoofNative", current_category="Roofs")
+        self.assertEqual(ev_om.status, "INCOMPATIBLE")
+        self.assertEqual(ev_om.recommended_strategy, "DirectShape")
+
+        curved_shell = ScannedObject("r-curved")
+        curved_shell.object_type = "Brep"
+        curved_shell.geometry_primitive_type = "OpenSurface"
+        curved_shell.is_horizontal = False
+        curved_shell.is_planar_sloped = False
+        curved_shell.is_curved_extrusion = False
+        curved_shell.is_closed = False
+        self.assertFalse(StrategyRuleEngine.evaluate_object(curved_shell, "RoofNative")[0])
+        self.assertFalse(StrategyRuleEngine.evaluate_object(curved_shell, "FloorNative")[0])
+
+        # Family on System category adds warning
+        box_on_roof = ScannedObject("r-fam-warn")
+        box_on_roof.object_type = "Brep"
+        box_on_roof.geometry_primitive_type = "Box"
+        box_on_roof.is_prismatic = True
+        box_on_roof.is_closed = True
+        box_on_roof.dx, box_on_roof.dy, box_on_roof.dz = 2.0, 2.0, 1.0
+        ok_f, _, warns_f, _ = StrategyRuleEngine.evaluate_object(box_on_roof, "FreeFormFamily", current_category="Roofs")
+        self.assertTrue(ok_f)
+        self.assertTrue(any("Generic Models" in w for w in warns_f))
+
+        # LayerRowItem switches FloorNative -> RoofNative when category becomes Roofs
+        cls_f = ClassificationResult("r-horiz")
+        cls_f.inferred_category = "Floors"
+        cls_f.proposed_strategy = "FloorNative"
+        row = LayerRowItem("Test_Roof_Layer", [horiz_slab], cls_f, None)
+        row.update_category("Roofs")
+        self.assertEqual(row.proposed_strategy, "RoofNative")
+        self.assertEqual(row.rule_eval.recommended_strategy, "RoofNative")
+
+        # Classifier infers sloped planar elements on neutral layer as Roofs -> RoofNative,
+        # and prevents OpenMesh from selecting RoofNative/RoofByHost
+        sloped_neutral = ScannedObject("r-sloped-neutral")
+        sloped_neutral.layer_full_path = "Layer_01"
+        sloped_neutral.layer_name = "Layer_01"
+        sloped_neutral.object_type = "Brep"
+        sloped_neutral.is_planar_sloped = True
+        sloped_neutral.is_closed = True
+        sloped_neutral.dx, sloped_neutral.dy, sloped_neutral.dz = 8.0, 6.0, 2.5
+        clf = AecClassifier(mode="Hybrid")
+        res_sl = clf.classify_object(sloped_neutral)
+        self.assertEqual(res_sl.inferred_category, "Roofs")
+        self.assertEqual(res_sl.proposed_strategy, "RoofNative")
+        self.assertEqual(clf._select_strategy(open_mesh, "Roofs"), "DirectShape")
+
+    def test_diagonal_wall_centerline_and_opening_delegation(self):
+        """WallByCurve computes rotated diagonal centerline, exact perpendicular thickness, base_offset, and delegates openings to WallByProfile."""
+        import math
+        import conversion_router as cr
+
+        env = self._make_xyz_db_env()
+
+        class MockVec(object):
+            def __init__(self, x, y=None, z=None):
+                if y is None and z is None and hasattr(x, "X"):
+                    self.X, self.Y, self.Z = float(x.X), float(x.Y), float(x.Z)
+                else:
+                    self.X, self.Y, self.Z = float(x), float(y or 0.0), float(z or 0.0)
+            @property
+            def Length(self):
+                return math.sqrt(self.X ** 2 + self.Y ** 2 + self.Z ** 2)
+            def Unitize(self):
+                L = self.Length
+                if L > 1e-9:
+                    self.X /= L; self.Y /= L; self.Z /= L
+
+        class MockVert(object):
+            def __init__(self, x, y, z):
+                self.Location = MockVec(x, y, z)
+
+        class MockFace(object):
+            def __init__(self, origin, normal, loops):
+                self._origin = MockVec(*origin)
+                self._normal = MockVec(*normal)
+                self.Loops = loops
+                self.OuterLoop = loops[0]
+            def TryGetPlane(self, tol=0.02):
+                pl = type("Pl", (), {"Origin": self._origin, "Normal": self._normal})()
+                return (True, pl)
+            def GetBoundingBox(self, f):
+                return type("BB", (), {"Min": MockVec(0, 0, 12), "Max": MockVec(10, 10, 22)})()
+
+        class MockEdgeCrv(object):
+            def __init__(self, p0, p1):
+                self.PointAtStart = MockVec(*p0)
+                self.PointAtEnd = MockVec(*p1)
+            def IsLinear(self, tol=0.02):
+                return True
+            def DuplicateSegments(self):
+                return [self]
+
+        class MockBrep(object):
+            def __init__(self, verts, faces):
+                self.Vertices = [MockVert(*v) for v in verts]
+                self.Faces = faces
+                self.Edges = []
+            def GetBoundingBox(self, f):
+                xs = [v.Location.X for v in self.Vertices]
+                ys = [v.Location.Y for v in self.Vertices]
+                zs = [v.Location.Z for v in self.Vertices]
+                return type("BB", (), {
+                    "Min": MockVec(min(xs), min(ys), min(zs)),
+                    "Max": MockVec(max(xs), max(ys), max(zs))
+                })()
+
+        class FakeRG(object):
+            Brep = MockBrep
+            Curve = type("C", (), {})
+            Vector3d = MockVec
+            BrepLoopType = type("BLT", (), {"Outer": 0, "Inner": 1})
+
+        wall_creates = []
+
+        class MockWallAPI(object):
+            @staticmethod
+            def Create(doc, crv, wtid, lid, height, offset, flip, struct):
+                wall_creates.append((crv.GetEndPoint(0), crv.GetEndPoint(1), height, offset))
+                return type("MockWall", (), {"Id": env["MockElementId"](801), "UniqueId": "w-801"})()
+
+        class MockDoc(object):
+            levels = [env["MockLevel"]("Level 2", 10.0, 102)]
+            roof_types = []
+            def GetDefaultElementTypeId(self, grp):
+                return env["MockElementId"](201)
+            def GetElement(self, eid):
+                return self.levels[0] if eid == 102 else None
+
+        class MockDB(object):
+            XYZ = env["MockXYZ"]
+            Line = env["MockLineAPI"]
+            Wall = MockWallAPI
+            WallType = type("WT", (), {})
+            WallKind = type("WK", (), {"Basic": 0})
+            FloorType = type("FT", (), {})
+            RoofType = type("RT", (), {})
+            CeilingType = type("CT", (), {})
+            Level = env["MockLevel"]
+            ElementId = env["MockElementId"]
+            BuiltInCategory = env["MockBIC"]
+            BuiltInParameter = env["MockBIP"]
+            ElementTypeGroup = env["MockETG"]
+            @staticmethod
+            def FilteredElementCollector(d):
+                return env["MockCol"](d)
+
+        orig_revit = cr.REVIT_AVAILABLE
+        orig_rhino = cr.RHINO_AVAILABLE
+        orig_db = getattr(cr, "DB", None)
+        orig_rg = getattr(cr, "rg", None)
+        orig_rh = getattr(cr, "Rhino", None)
+        try:
+            cr.REVIT_AVAILABLE = True
+            cr.RHINO_AVAILABLE = True
+            cr.DB = MockDB
+            cr.rg = FakeRG
+            cr.Rhino = type("RhinoMod", (), {"RhinoDoc": type("RD", (), {"ActiveDoc": None})})
+
+            router = cr.ConversionRouter(MockDoc())
+
+            # 1. 45-degree rotated diagonal wall from (0,0) to (10,10), thickness=1.0, base Z=12.0 (offset +2.0 above Level 2 @ 10.0)
+            s = math.sqrt(0.5)
+            nx, ny = -s, s
+            tx, ty = s, s
+            L = 10.0 * math.sqrt(2.0)
+            half_t = 0.5
+            verts = []
+            for u in (0.0, L):
+                for v in (-half_t, half_t):
+                    for z in (12.0, 22.0):
+                        verts.append((u * tx + v * nx, u * ty + v * ny, z))
+            outer_lp = type("LP", (), {
+                "LoopType": FakeRG.BrepLoopType.Outer,
+                "To3dCurve": lambda s: MockEdgeCrv((half_t * nx, half_t * ny, 12), (L * tx + half_t * nx, L * ty + half_t * ny, 12))
+            })()
+            diag_face = MockFace((half_t * nx, half_t * ny, 12.0), (nx, ny, 0.0), [outer_lp])
+            diag_brep = MockBrep(verts, [diag_face])
+
+            res = cr.ConversionResult("wall-diag-1")
+            w = router._pipeline_3_wall_by_curve(ScannedObject("wall-diag-1"), diag_brep, env["MockElementId"](102), None, res)
+            self.assertIsNotNone(w)
+            self.assertEqual(res.strategy_used, "WallByCurve")
+            p0, p1, h, base_off = wall_creates[0]
+            # Base offset must equal bbox.Min.Z (12.0) - level.Elevation (10.0) = 2.0
+            self.assertAlmostEqual(base_off, 2.0, places=3)
+            self.assertAlmostEqual(h, 10.0, places=3)
+            # Centerline endpoints lie on diagonal y == x (0,0) -> (10,10)
+            self.assertAlmostEqual(p0.X, p0.Y, places=3)
+            self.assertAlmostEqual(p1.X, p1.Y, places=3)
+            self.assertAlmostEqual(p0.DistanceTo(p1), L, places=2)
+
+            # 2. Wall with inner window opening automatically delegates to _pipeline_4_wall_by_profile
+            inner_lp = type("LPIn", (), {"LoopType": FakeRG.BrepLoopType.Inner})()
+            win_face = MockFace((0, 0, 12.0), (0.0, 1.0, 0.0), [outer_lp, inner_lp])
+            win_brep = MockBrep(verts, [win_face])
+            prof_calls = []
+            router._pipeline_4_wall_by_profile = lambda so, gf, lid, pr, r: prof_calls.append(so.rhino_guid) or "delegated_profile"
+            out_win = router._pipeline_3_wall_by_curve(ScannedObject("wall-win-1"), win_brep, env["MockElementId"](102), None, cr.ConversionResult("wall-win-1"))
+            self.assertEqual(out_win, "delegated_profile")
+            self.assertEqual(prof_calls, ["wall-win-1"])
+        finally:
+            cr.REVIT_AVAILABLE = orig_revit
+            cr.RHINO_AVAILABLE = orig_rhino
+            cr.DB = orig_db
+            cr.rg = orig_rg
+            if orig_rh is None and hasattr(cr, "Rhino"):
+                delattr(cr, "Rhino")
+            elif orig_rh is not None:
+                cr.Rhino = orig_rh
+
+
 if __name__ == "__main__":
     unittest.main()

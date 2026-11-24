@@ -378,7 +378,9 @@ class LayerRowItem(object):
 
     def _refresh_rule_eval(self):
         """Evaluates rule compatibility and flags mixed-geometry layers without mutating initial classification."""
-        eval_res = StrategyRuleEngine.evaluate_layer(self.objects, self.proposed_strategy)
+        eval_res = StrategyRuleEngine.evaluate_layer(
+            self.objects, self.proposed_strategy, current_category=self.inferred_category
+        )
         self.rule_eval = eval_res
         if eval_res.status == "COMPATIBLE":
             self.compatibility_tag = "OK ({}/{})".format(eval_res.pass_count, eval_res.total_count)
@@ -440,7 +442,9 @@ class LayerRowItem(object):
     def update_strategy(self, new_strategy):
         """Updates proposed strategy and evaluates compatibility + confidence deterministically."""
         self.proposed_strategy = friendly_to_strategy(new_strategy)
-        eval_res = StrategyRuleEngine.evaluate_layer(self.objects, self.proposed_strategy)
+        eval_res = StrategyRuleEngine.evaluate_layer(
+            self.objects, self.proposed_strategy, current_category=self.inferred_category
+        )
         self.rule_eval = eval_res
         comp_score = eval_res.compatibility_score
 
@@ -809,6 +813,7 @@ class LayerConfigDialog(object):
         for c in STANDARD_REVIT_CATEGORIES:
             self.dd_cat.Items.Add(c)
         _set_combo_value(self.dd_cat, layer_row.inferred_category or "Generic Models")
+        self.dd_cat.SelectionChanged += self._on_strategy_selection_changed
 
         self.dd_strat = win.FindName("dd_strat")
         for _, friendly, _ in STRATEGY_UI_CHOICES:
@@ -852,9 +857,10 @@ class LayerConfigDialog(object):
 
     def _on_strategy_selection_changed(self, sender, e):
         sel_strat = friendly_to_strategy(_get_combo_value(self.dd_strat, "DirectShape"))
+        sel_cat = _get_combo_value(self.dd_cat, getattr(self.layer_row, "inferred_category", "Generic Models"))
         meta = STRATEGY_METADATA.get(sel_strat, {})
         self.lbl_editability.Text = "Revit Mode: {}".format(meta.get("editability", sel_strat))
-        eval_res = StrategyRuleEngine.evaluate_layer(self.layer_row.objects, sel_strat)
+        eval_res = StrategyRuleEngine.evaluate_layer(self.layer_row.objects, sel_strat, current_category=sel_cat)
         self._last_recommended = eval_res.recommended_strategy or "DirectShape"
         self.lbl_compat_banner.Text = eval_res.summary_text()
         if eval_res.status == "COMPATIBLE":
@@ -1727,7 +1733,7 @@ class TransferDashboardDialog(object):
                 self.btn_insp_params.IsEnabled = True
                 self.panel_insp_bulk.Visibility = sw.Visibility.Collapsed
 
-                self._update_inspector_rule_banner(row.objects, row.proposed_strategy)
+                self._update_inspector_rule_banner(row.objects, row.proposed_strategy, current_category=row.inferred_category)
             else:
                 total_objs = sum(r.object_count for r in selected)
                 self.lbl_insp_title.Text = "Bulk Edit ({} layers selected)".format(len(selected))
@@ -1735,7 +1741,9 @@ class TransferDashboardDialog(object):
                 all_objs = []
                 for r in selected:
                     all_objs.extend(r.objects)
-                ev_bulk = StrategyRuleEngine.evaluate_layer(all_objs, selected[0].proposed_strategy)
+                ev_bulk = StrategyRuleEngine.evaluate_layer(
+                    all_objs, selected[0].proposed_strategy, current_category=selected[0].inferred_category
+                )
                 self.lbl_insp_geom.Text = "{} buckets across selection".format(len(ev_bulk.bucket_counts))
                 has_any_mixed = any(r.rule_eval and r.rule_eval.is_mixed_geometry for r in selected)
                 self.btn_insp_split.Visibility = sw.Visibility.Visible if has_any_mixed else sw.Visibility.Collapsed
@@ -1749,16 +1757,18 @@ class TransferDashboardDialog(object):
                 self.btn_insp_params.IsEnabled = False
                 self.panel_insp_bulk.Visibility = sw.Visibility.Visible
 
-                self._update_inspector_rule_banner(all_objs, selected[0].proposed_strategy)
+                self._update_inspector_rule_banner(
+                    all_objs, selected[0].proposed_strategy, current_category=selected[0].inferred_category
+                )
         finally:
             self._updating_inspector = False
 
-    def _update_inspector_rule_banner(self, objects, strategy_key):
+    def _update_inspector_rule_banner(self, objects, strategy_key, current_category=None):
         sel_strat = friendly_to_strategy(strategy_key)
         meta = STRATEGY_METADATA.get(sel_strat, {})
         self.lbl_insp_editability.Text = "Revit Editability: {}".format(meta.get("editability", sel_strat))
 
-        eval_res = StrategyRuleEngine.evaluate_layer(objects, sel_strat)
+        eval_res = StrategyRuleEngine.evaluate_layer(objects, sel_strat, current_category=current_category)
         self._last_recommended = eval_res.recommended_strategy or "DirectShape"
         self.lbl_insp_compat.Text = eval_res.summary_text()
 
@@ -1780,11 +1790,12 @@ class TransferDashboardDialog(object):
             self.btn_insp_use_rec.Content = "Switch to {}".format(strategy_to_short(self._last_recommended))
             self.btn_insp_use_rec.Visibility = sw.Visibility.Visible
 
-    def _apply_row_changes(self, row, cat_name, strat_key, mat_name, is_checked):
+    def _apply_row_changes(self, row, cat_name, strat_key, mat_name, is_checked, auto_adjust_strategy=False):
         """Applies updated Category, Strategy, Material, and Checked state to a LayerRowItem & its objects."""
         row.checked = bool(is_checked)
         row.update_category(cat_name)
-        row.update_strategy(strat_key)
+        if not auto_adjust_strategy:
+            row.update_strategy(strat_key)
         row.update_material(mat_name)
         for obj in row.objects:
             c = getattr(obj, "classification", None) or self.classifications.get(getattr(obj, "rhino_guid", ""))
@@ -1808,11 +1819,21 @@ class TransferDashboardDialog(object):
         mat_name = _get_combo_value(self.cb_insp_material, row.selected_material)
         is_checked = bool(self.chk_insp_include.IsChecked)
 
-        if (cat_name == row.inferred_category and strat_key == row.proposed_strategy
+        cat_changed = (cat_name != row.inferred_category)
+        strat_changed = (strat_key != row.proposed_strategy)
+        if (not cat_changed and not strat_changed
                 and mat_name == row.selected_material and is_checked == bool(row.checked)):
             return
 
-        self._apply_row_changes(row, cat_name, strat_key, mat_name, is_checked)
+        auto_adj = (cat_changed and not strat_changed)
+        self._apply_row_changes(row, cat_name, strat_key, mat_name, is_checked, auto_adjust_strategy=auto_adj)
+        if auto_adj:
+            self._updating_inspector = True
+            try:
+                _set_combo_value(self.cb_insp_strategy, strategy_to_friendly(row.proposed_strategy))
+            finally:
+                self._updating_inspector = False
+        self._update_inspector_rule_banner(row.objects, row.proposed_strategy, current_category=row.inferred_category)
         self._refresh_review_grid_datastore()
         self._update_preview_kpis()
         self.lbl_global_status.Text = "Updated '{}' -> {} ({}), Mat: {}".format(
@@ -1829,7 +1850,10 @@ class TransferDashboardDialog(object):
             all_objs = []
             for r in selected:
                 all_objs.extend(r.objects)
-            self._update_inspector_rule_banner(all_objs, _get_combo_value(self.cb_insp_strategy, "DirectShape"))
+            sel_cat = _get_combo_value(self.cb_insp_category, selected[0].inferred_category)
+            self._update_inspector_rule_banner(
+                all_objs, _get_combo_value(self.cb_insp_strategy, "DirectShape"), current_category=sel_cat
+            )
 
     def _on_insp_use_recommended(self, s, e):
         rec = self._last_recommended or "DirectShape"
