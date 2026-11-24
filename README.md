@@ -1,13 +1,13 @@
 # One-Click Rhino-to-Revit Transfer (RIR)
 ### Production-Grade Computational Design & BIM Geometry Pipeline
 
-The **One-Click Rhino-to-Revit Transfer** plugin runs directly inside **Rhino.Inside.Revit (RIR)**. Rather than performing a blind geometry dump or unintelligent mesh import, it implements a controlled 6-stage pipeline:
+The **One-Click Rhino-to-Revit Transfer (R2R)** plugin runs directly inside **Rhino.Inside.Revit (RIR)**. Rather than performing a blind geometry dump or unintelligent mesh import, it implements a controlled 6-stage pipeline:
 
 ```
 SCAN ➔ CLASSIFY ➔ REVIEW ➔ TRANSFER ➔ VALIDATE ➔ SYNC
 ```
 
-It infers architectural design intent via deterministic geometry fingerprinting and trilingual metadata scoring (English, Spanish, Catalan), provides a responsive **Eto.Forms** dashboard for user confirmation, executes native Revit element creation across 10 specialized translation pipelines with clean DirectShape fallbacks, conducts dual-status view graphics validation, and guarantees persistent revision synchronization using Revit `ExtensibleStorage`.
+It infers architectural design intent via deterministic geometry fingerprinting and trilingual metadata scoring (English, Spanish, Catalan), enforces per-object compatibility via a declarative **Strategy Rule Engine**, presents a responsive **3-step Master–Detail WPF XAML** dashboard, builds native Revit system elements and exact-geometry `.rfa` families across specialized pipelines with clean `DirectShape` fallbacks, conducts dual-status view graphics validation, and tracks persistent revision state in Revit `ExtensibleStorage`.
 
 ---
 
@@ -15,36 +15,39 @@ It infers architectural design intent via deterministic geometry fingerprinting 
 
 ```
 rhino-to-revit-transfer/
-├── installer/                   # 1-Click Revit Add-in Installer & Setup
-│   ├── install.bat             # Double-click Windows batch installer
-│   ├── install.ps1             # PowerShell automated version detector & deployer
-│   ├── uninstall.bat           # 1-click uninstaller batch file
-│   ├── uninstall.ps1           # PowerShell clean removal script
-│   └── README.md               # Installer usage guide
-├── csharp/                      # Native C# .NET Revit Add-in Solution
-│   ├── RhinoToRevitTransfer.csproj  # Multi-targeted .NET SDK project (net48 / net8.0-windows)
-│   ├── RhinoToRevitTransfer.addin   # Revit application manifest file
-│   ├── R2RTransferApp.cs            # Ribbon Tab ("R2R Transfer") & PushButton registration
-│   ├── R2RTransferCommand.cs        # External command & Rhino.Inside binding
-│   ├── TransferDashboardWindow.cs   # Native WPF interactive transfer dashboard
-│   ├── Scanner.cs                   # C# geometry scanner & SHA-256 fingerprinting
-│   ├── Classifier.cs                # C# 5-criteria architectural heuristic engine
-│   ├── ConversionRouter.cs          # C# 10-pipeline transaction dispatcher
-│   └── SyncEngine.cs                # C# ExtensibleStorage schema & sync tracker
-├── __init__.py                  # Package root & exports
-├── main_launcher.py            # Unified entry-point launcher (RIR / pyRevit / Script Editor)
-├── scanner.py                  # Module 1: Rhino Scanner & Geometry Fingerprinter (SHA-256)
-├── classifier.py               # Module 2: Evidence-Based Classification & Confidence Engine
-├── ai_assistant.py             # Module 3: LLM Semantic Interpreter (Catalan / Spanish architectural terms)
-├── profile_manager.py          # Module 4: Persistent JSON Mapping Profile Manager
-├── conversion_router.py        # Module 5: RIR Element Creation Engines (10-Pipeline Dispatcher)
-├── graphics_validator.py       # Module 6: Dual-Status BIM & View Graphics Validator
-├── sync_engine.py              # Module 7: Persistent Identity (GUID + GeoHash) & Revision Tracker
-├── reporting.py                # Module 8: Preflight, BUA/GFA Area Check & QA Exporter (HTML/CSV/JSON)
-├── ui_dialog.py                # Module 9: Eto.Forms 5-Stage Multi-Step Wizard Dashboard UI
-├── Transfer_Profile.json       # Preconfigured mapping profile
-├── test_pipeline.py            # Verification test suite
-└── README.md                   # System architecture & deployment documentation
+├── installer/                     # 1-Click pyRevit & Revit Add-in Installers
+│   ├── install_pyrevit.bat        # 1-click pyRevit deployer (.py, .xaml, templates)
+│   ├── uninstall_pyrevit.bat      # Clean pyRevit extension removal
+│   ├── script.py                  # pyRevit pushbutton entry script
+│   ├── bundle.yaml                # pyRevit ribbon button metadata
+│   ├── install.bat / install.ps1  # Native C# Revit add-in installer
+│   └── uninstall.bat / .ps1       # Native C# Revit add-in uninstaller
+├── templates/                     # Bundled Revit Family (.rfa/.rft) & Shared Parameter files
+│   ├── Generic Model.rfa / .rft
+│   ├── Metric Generic Model.rfa / .rft
+│   ├── Mass.rft / Metric Mass.rft
+│   └── R2R_SharedParameters.txt
+├── csharp/                        # Optional Native C# .NET Revit Add-in Solution
+├── __init__.py                    # Package root & exports
+├── main_launcher.py               # Unified entry-point launcher (pyRevit / RIR / Script Editor)
+├── scanner.py                     # Module 1: Rhino Scanner, Primitive Classifier & SHA-256 Hasher
+├── classifier.py                  # Module 2: Evidence-Based Architectural Classifier
+├── strategy_rules.py              # Module 2B: Compatibility Rule Engine & Mixed-Layer Splitter
+├── ai_assistant.py                # Module 3: Optional LLM Semantic Interpreter
+├── profile_manager.py             # Module 4: JSON Mapping Profiles & Custom Parameter Specs
+├── family_factory.py              # Module 4B: Native .rfa Family Builder (Parametric & FreeForm)
+├── conversion_router.py           # Module 5: RIR Element Creation Pipelines & Geometry Encoders
+├── graphics_validator.py          # Module 6: Dual-Status BIM & 4-View Graphics Validator
+├── sync_engine.py                 # Module 7: Persistent Identity (GUID + GeoHash) & Sync Tracker
+├── reporting.py                   # Module 8: Preflight, BUA/GFA Area Check & HTML/CSV/JSON Reports
+├── ui_dialog.py                   # Module 9: Pure-Python WPF XAML Controller (IronPython 2.7 / .NET 8)
+├── ui_dashboard.xaml              # 3-Step Master–Detail Main Dashboard Layout
+├── ui_layer_config.xaml           # Per-Layer Mapping & Compatibility Modal Layout
+├── ui_custom_params.xaml          # Custom Parameters & Family Constraints Modal Layout
+├── ui_settings.xaml               # Execution Mode, Origin Shift, Units & AI Settings Modal
+├── Transfer_Profile.json          # Preconfigured mapping profile
+├── test_pipeline.py               # Automated unit test suite (60 tests)
+└── README.md                      # System architecture & deployment documentation
 ```
 
 ---
@@ -53,161 +56,83 @@ rhino-to-revit-transfer/
 
 ### Stage 1: SCAN (`scanner.py`)
 - Scans `Rhino.RhinoDoc.ActiveDoc.Objects` (supporting hidden/locked layer filters).
-- Extracts metadata: GUID, full layer hierarchy, user text dictionary, material name, and object color.
+- Extracts metadata: GUID, full layer hierarchy, object name, block name, user text dictionary, material name, and object color.
 - Computes **Deterministic Geometry Fingerprint**:
-  - World `BoundingBox` (`min_pt`, `max_pt`, `centroid`, `dx`, `dy`, `dz` height).
-  - Topological flags: `is_closed`, `is_planar`, `is_horizontal` ($|Normal.Z| > 0.95$), `is_vertical` ($|Normal.Z| < 0.05$), `thickness`, and `loop_count` (outer boundary + inner shaft loops).
-  - SHA-256 `geo_hash`: Deterministic hash generated from quantized vertices, faces, bounding box dimensions, area, and volume.
-- Spatial Context: Finds closest Revit `Level` and computes base offset delta `dz_to_level`. Identifies building zones (`Podium`, `Typical Tower`, `Sky-Pool/Amenity`, `Crown`, `Veil Envelope`).
-- Preflight Validation:
-  - Catches coordinates $>16\text{ km}$ from Rhino origin (Revit's 10-mile geometry limit).
-  - Flags duplicate overlapping geometry with identical hashes.
-  - Identifies non-closed planar loops before Revit transactions begin.
+  - World `BoundingBox` (`bbox_min`, `bbox_max`, `centroid`, `dx`, `dy`, `dz`).
+  - Orientation & slope flags: `is_closed`, `is_planar`, `is_horizontal` ($|\text{Normal}.Z| > 0.95$), `is_vertical` ($|\text{Normal}.Z| < 0.05$), `is_planar_sloped` ($0.20 \le |\text{Normal}.Z| \le 0.95$ with `dominant_normal` and `slope_ratio`), `is_curved_extrusion` (horizontal barrel/vaulted extrusion detection), `thickness`, and `loop_count`.
+  - Strict geometric primitive classification (`Box`, `Cylinder`, `ProfileExtrusion`, `AdaptivePanel`, `FreeFormSolid`, `OpenMesh`, `OpenSurface`, `BlockInstance`, `Curve`).
+  - SHA-256 `geo_hash` and rotation-invariant `repetition_signature`.
+- Spatial & Preflight Context: Resolves nearest Revit `Level` (`dz_to_level`), flags coordinates $>16\text{ km}$ from origin, detects duplicates, and flags open loops.
 
-### Stage 2: CLASSIFY (`classifier.py`)
-Computes an evidence-based classification score ($0\%$ to $100\%$) using weighted architectural scoring:
-1. **Layer & Name Match (35% weight):** Trilingual regex matching English, Spanish, and Catalan architectural vocabulary (e.g. *forjat, losa, muro, paret, cel_ras, falso_techo, gelosia, velo, veil*).
-2. **Geometry Characteristics (30% weight):**
-   - Horizontal closed planar solid/surface ($\Delta Z < 1.0\text{ m}$, $\max(\Delta X, \Delta Y) > 1.5\text{ m}$) $\rightarrow$ Floors / Ceilings / Roofs.
-   - Vertical linear/planar extrusion or solid ($\Delta Z \ge 1.5\text{ m}$, thin thickness) $\rightarrow$ Walls.
-   - `InstanceReference` (Block) $\rightarrow$ Family.
-   - Complex double-curved Brep, Mesh, or SubD $\rightarrow$ DirectShape.
-3. **Spatial / Level Relationship (15% weight):** Base $Z$ within $\pm 300\text{ mm}$ of level boosts Floors/Walls; suspended $2.2\text{ m} - 3.8\text{ m}$ boosts Ceilings.
-4. **Repetition / Block Evidence (10% weight):** Instance counts $>3$ boost Family classification.
-5. **Host / Context Relationship (10% weight):** Zoning and containment logic.
+### Stage 2: CLASSIFY & RULE ENGINE (`classifier.py` & `strategy_rules.py`)
+- **`AecClassifier`:** Weighted architectural scoring across Layer/Name Match (35%, English/Spanish/Catalan), Geometry Characteristics (30%, including planar-sloped and vaulted roof heuristics), Spatial/Level Relationship (15%), Repetition/Blocks (10%), and Context (10%).
+- **`StrategyRuleEngine`:**
+  - Evaluates every object against its target strategy (`FloorNative`, `FloorByHost`, `WallByCurve`, `WallByProfile`, `CeilingNative`, `RoofNative`, `RoofByHost`, `Toposolid`, `ParametricFamily`, `FreeFormFamily`, `RepetitiveFamily`, `AdaptiveComponent`, `DirectShape`).
+  - Blocks physically incompatible geometry (e.g., `OpenMesh` or double-curved shells on sketch-based `RoofNative`/`FloorNative`/`CeilingNative`, or non-prismatic solids on `ParametricFamily`) with clear reasons and safe fallbacks.
+  - Respects target Revit category when recommending strategies (e.g. `Roofs` layers recommend `RoofNative` instead of `FloorNative`) and warns when pairing loadable `.rfa` families with system-only categories.
+  - Supports **Mixed-Layer Splitting** (`split_objects_by_geometry`), dividing heterogeneous Rhino layers into homogeneous virtual sub-layers.
 
-**Confidence Tiers:**
-- $\ge 85\%$: `AUTO_READY` (Green badge, pre-checked for transfer)
-- $60\% - 84\%$: `SUGGESTED_NEEDS_APPROVAL` (Amber badge, user confirmation)
-- $< 60\%$: `MANUAL_OR_EXCLUDED` (Red badge, routed to review queue)
+### Stage 3: REVIEW & CONFIGURE (`ui_dialog.py`, `ui_*.xaml`, `profile_manager.py`)
+Pure-Python WPF XAML Master–Detail UI compatible with **Revit 2020–2024 (.NET Framework 4.8)** and **Revit 2025–2026 (.NET 8)** via pyRevit (`IPY2712PR`):
+- **Step 1 — Review & Map:**
+  - Searchable, filterable layer list with live status badges (`OK`, `MIXED`, `BLOCKED`), target summary, and object counts.
+  - **Right-Side Live Inspector (Single & Bulk Edit):** Edit Revit Category (auto-syncing compatible native strategies), Conversion Strategy, Revit Material, Include toggle, **Split Mixed Layer**, and **Custom Parameters**.
+  - **Custom Parameters (`CustomParametersDialog`):** Deterministic UUIDv5 shared parameters supporting `Data` parameters (`Text`, `Number`, `Integer`, `YesNo`, `Length`, `Material` with `{tokens}` and `@usertext:Key`) and editable family `Constraint` formulas.
+- **Step 2 — Transfer Progress:** Live per-layer/object progress tracking and execution log.
+- **Step 3 — Validate & QA:** Dual-status audit grid, view matrix (`Plan` / `Section`), Revit element selection/isolation, and HTML/CSV/JSON report export.
+- **Settings (`SettingsDialog`):** Global Mode (`Native BIM`, `Hybrid`, `Geometry-First`), Mixed-Geometry Policy (`AutoFallback` vs. `StrictSkip`), Auto-BUA/GFA toggle, Move to Revit Origin `(0,0,0)`, unit override, Repetition Threshold, and `AI Config...` (Gemini, OpenAI, DeepSeek, OpenRouter, local Ollama/LM Studio, or offline architectural lexicon).
 
-### Stage 3: REVIEW & CONFIGURE (`ui_dialog.py` & `profile_manager.py`)
-- Eto.Forms DataGridView with search, multi-criteria filters (Category, Confidence Tier, Sync State), and real-time **Pattern / Points** geometric signatures (`4-Pt Quad`, `3-Pt Tri`, `2-Pt Strut`, `Block: Name`, `Repetitive (Nx)`).
-- **Strategy Override Toolbar:** Allows instant bulk overriding of checked layers to `AdaptiveComponent`, `RepetitiveFamily`, `ParametricFamily`, `FloorNative`, `WallByCurve`, `RoofNative`, `FamilyInstance`, or `DirectShape`.
-  - **Dynamic Compatibility & 0% Confidence Drop:** Selecting a physically incompatible strategy (e.g. `AdaptiveComponent` for geometry without 2, 3, or 4 boundary points, or `FloorNative` for vertical geometry) automatically drops confidence to **0.0%** and unchecks the layer row from execution.
-- **Comprehensive Revit Category Coverage & 4-Tier Resolution:**
-  - **100% Revit Model Category Support:** Covers Architectural (`Floors`, `Walls`, `Roofs`, `Ceilings`, `Columns`, `Doors`, `Windows`, `Curtain Panels`, `Curtain Wall Mullions`, `Stairs`, `Railings`, `Ramps`), FF&E/Casework (`Furniture`, `Furniture Systems`, `Casework`, `Specialty Equipment`), Structure (`Structural Columns`, `Structural Framing`, `Structural Foundation`), MEP Services (`Plumbing Fixtures`, `Mechanical Equipment`, `Electrical Equipment`, `Electrical Fixtures`, `Lighting Fixtures`), Site & Civil (`Toposolid`, `Site`, `Planting`, `Parking`, `Roads`, `Hardscape`), and Context (`Mass`, `Entourage`, `Signage`, `Generic Models`).
-  - **4-Tier Intelligent Dynamic Resolution:** Resolves friendly names, singular/plural variations, auto-prefixes `OST_`, and performs dynamic case-insensitive reflection across all `DB.BuiltInCategory` enum members. Supports custom or version-specific Revit categories with graceful fallback to `OST_GenericModel`.
-  - **DirectShape Category Safety Validation:** Uses `DirectShape.IsValidCategoryId(cat_id, doc)` to ensure chosen categories are valid for DirectShape representation, eliminating Revit API `ArgumentException` crashes.
-- **Repetition Grouping Threshold:** Configurable cluster threshold (`>= 2`, `>= 3`, `>= 5`, `>= 10` identical geometries) to dynamically route repeated components to lightweight shared definitions.
-- **AI Semantic Classifier & Engine Configuration (`AI Config...`):**
-  - Dedicated configuration dialog to input your API key, select LLM providers, change model engines, and test connections.
-  - **Google Gemini:** Pre-configured with `gemini-3.8-flash` (default), `gemini-3.8`, `gemini-3.6-flash`, `gemini-3.6`, `gemini-2.0-flash`, `gemini-1.5-flash`, and `gemini-1.5-pro` using the OpenAI-compatible endpoint (`https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`).
-  - **OpenAI:** `gpt-4o-mini`, `gpt-4o`, `o3-mini`, `gpt-3.5-turbo`.
-  - **DeepSeek:** `deepseek-chat` and `deepseek-reasoner` via `https://api.deepseek.com/v1/chat/completions`.
-  - **OpenRouter:** Multi-model routing including `google/gemini-3.8-flash`, `anthropic/claude-3.5-sonnet`, `meta-llama/llama-3.3-70b-instruct`.
-  - **Local Ollama / LM Studio:** Fully offline, local inference (`http://localhost:11434/v1/chat/completions` with `llama3`, `mistral`, `qwen2.5`, `phi3`) with zero external network or keys.
-  - **Custom / Other:** Connect to any self-hosted or OpenAI-compatible endpoint.
-  - **Live Handshake Testing:** Single-click "Test Connection" button tests endpoints and key credentials in real time.
-  - **Zero Startup Overhead:** Config stored in `%APPDATA%\pyRevit\R2R\ai_config.json`, keeping pyRevit rocket mode assembly caches intact.
-  - **Graceful Offline Fallback:** If no API key is provided or the machine is offline, clicking **Run AI Semantic Assist** automatically uses the curated offline architectural lexicon.
-- Global Execution Mode Selector:
-  - **Native BIM Mode:** Prioritizes native Revit elements (`Floor`, `Wall`, `Ceiling`, `Roof`).
-  - **Hybrid Mode (Recommended):** Native elements for orthogonal walls/floors, Adaptive Components for facade panels, DirectShape for complex organic surfaces.
-  - **Geometry-First Mode:** DirectShape with assigned Category & Material for maximum 3D fidelity.
-- Auto-BUA / GFA Area Boundary Line generator toggle.
-- **Move Model to Revit Origin (0,0,0) & GIS Normalization:**
-  - Auto-centers the model footprint at Revit's Internal Origin `(X=0, Y=0)` and normalizes base elevation to `Z=0.0`.
-  - Automatically activates if geometry in Rhino exceeds Revit's 16 km (10-mile) origin boundary limit or uses real-world GIS/UTM coordinate systems.
-  - Preserves exact relative inter-element spacing, heights, and orientation while preventing Revit coordinate overflow, graphics jitter, and view clipping errors.
-- `Load Profile` and `Save Profile` to synchronize rule changes to `Transfer_Profile.json`.
+### Stage 4: TRANSFER (`conversion_router.py` & `family_factory.py`)
+Executes in two phases: **Phase 1** pre-generates and loads `.rfa` families before opening the project `TransactionGroup`, preventing Revit API nested-transaction deadlocks; **Phase 2** creates all project elements cleanly inside a single `TransactionGroup`:
+1. **Native Floors (`FloorNative` / `FloorByHost`):** Extracts outer perimeter and inner void `CurveLoop`s, tessellates NURBS/splines cleanly into chords (avoiding 3-point arc distortion), creates thickness/material-matched `FloorType`s, supports 7-arg sloped `Floor.Create` for planar ramps/slabs, and enables `Room Bounding`.
+2. **Native Walls (`WallByCurve` / `WallByProfile`):** Computes true diagonal/rotated and curved centerlines, perpendicular thickness, and `base_offset` (`bbox.Min.Z - level_elev`); automatically routes walls with inner window/door openings or sloped/arched tops to `WallByProfile` using full 3D `CurveLoop`s centered on the wall plane.
+3. **Native Ceilings (`CeilingNative`):** Matches `CeilingType` thickness/material and applies dual-elevation `Ceiling.Create` + height offset.
+4. **Native Roofs (`RoofNative` / `RoofByHost`):**
+   - Builds `NewFootPrintRoof` curves strictly on `level_elem.Elevation`, disables Revit's default 30° hip slope on all edges, applies single-eave slope (`Rise/Run`) on planar pitched roofs, sets `ROOF_LEVEL_OFFSET_PARAM` from soffit elevation, matches `RoofType` thickness/material, and cuts inner openings via `NewOpening`.
+   - Supports horizontal barrel/vaulted extrusions via `NewExtrusionRoof`.
+5. **Toposolid (`Toposolid`):** Generates horizontal perimeter `CurveLoop`s and extracts 3D elevation points for 5-arg `DB.Toposolid.Create` (Revit 2024+) with `OST_Toposolid` fallback.
+6. **Families (`ParametricFamily`, `FreeFormFamily`, `RepetitiveFamily`, `AdaptiveComponent`):**
+   - `ParametricFamily` (Mode A): Editable `.rfa` extrusions strictly for verified `Box`, `Cylinder`, and `ProfileExtrusion` primitives (never coerces freeform solids into boxes).
+   - `FreeFormFamily` (Mode B): Non-editable exact-geometry `.rfa` using `DB.FreeFormElement` for closed solids and in-family `DirectShape` for open/non-watertight geometry.
+   - `AdaptiveComponent`: Deterministic CCW point ordering + `AdaptiveComponentInstanceUtils`.
+   - `RepetitiveFamily`: Shared `DirectShapeType` / `FamilySymbol` instancing.
+7. **Exact `DirectShape` Fallback:** Preserves closed and open NURBS Breps via `GeometryEncoder.ToSolid` / `ToBrep` / `ToGeometryBase`, and uses a two-pass `TessellatedShapeBuilder` (`Fallback.Abort` on closed inputs only, followed by `OpenConnectedFaceSet(False)` + `AnyGeometry`/`Mesh`) without `SubD` smoothing or `Salvage` face tearing.
+8. **Auto-BUA / GFA:** Generates Area Plan boundary lines under `BUA / GFA Assessment`.
 
-### Stage 4: TRANSFER (`conversion_router.py`)
-Dispatches across specialized RIR creation pipelines under a single `DB.TransactionGroup`:
-1. **Floors (Native Floor):** Extracts top horizontal face boundary and inner void/shaft loops into `DB.CurveLoop` $\rightarrow$ calls `DB.Floor.Create`. Automatically enables `Room Bounding = True` for BUA/GFA area calculations.
-2. **Floors by Host:** Sloped / faceted slab surfaces hosted or DirectShape with `OST_Floors`.
-3. **Walls by Curve:** Computes bottom centerline curve, height, snaps to base level $\rightarrow$ calls `DB.Wall.Create(doc, line, type, level, height, offset, flip, structural)`.
-4. **Walls by Profile (with Fallback):** Non-rectangular wall elevation profiles (arches, vaults, sloped tops) $\rightarrow$ `DB.Wall.Create(doc, profileCurveLoops, type, level, structural)`. If Revit rejects the profile geometry, it logs a warning and cleanly falls back to DirectShape with `OST_Walls`.
-5. **Ceilings (Native):** Horizontal perimeter curves $\rightarrow$ `DB.Ceiling.Create`.
-6. **Roofs (Native Footprint Roof):** Horizontal boundary curves $\rightarrow$ `doc.Create.NewFootPrintRoof`.
-7. **Roofs by Host / Face:** Freeform canopy DirectShape with `OST_Roofs`.
-8. **Adaptive Components (Multi-Point Panels & Struts):** Extracts planar vertices, performs deterministic counter-clockwise winding ordering (starting bottom-left), and places native adaptive instances via `DB.AdaptiveComponentInstanceUtils.CreateAdaptiveComponentInstance`. Gracefully falls back to shared instancing if matching `.rfa` family is not pre-loaded.
-9. **Repetitive Family Instancing (Shared DirectShapeType):** For repeated geometry or Rhino block references, creates a single canonical definition in `DB.DirectShapeLibrary` as `DB.DirectShapeType` and places lightweight transformed instances via `DB.DirectShape.CreateElementInstance`. Saves over 90% Revit file size and memory.
-10. **Parametric Families (Dimension-Driven):** Places standard loadable `FamilySymbol` (columns, doors, windows, furniture) at centroid and rotation, driving instance parameters (`Width`, `Depth`, `Height`, `Length`, `Thickness`).
-11. **DirectShape Fallback:** Freeform double-curved meshes, SubD, or organic Breps $\rightarrow$ `RhinoInside.Revit.Convert.Geometry.GeometryEncoder.ToGeometryObject` $\rightarrow$ `DB.DirectShape.CreateElement` with mapped Category, Subcategory, and Material.
-12. **Auto-BUA / GFA Area Plan Generator:** Ensures Revit Levels exist $\rightarrow$ locates or creates Area Scheme `BUA / GFA Assessment` $\rightarrow$ generates Area Plan view $\rightarrow$ projects closed outer boundary curves as `doc.Create.NewAreaBoundaryLine`.
-
-**Warning Suppression:** Uses `TransferFailuresPreprocessor` (`IFailuresPreprocessor`) to delete non-fatal warnings (e.g. slightly off-axis lines, overlapping room separation lines) without modal dialog popups blocking execution.
-
-### Stage 5: VALIDATE (`graphics_validator.py`)
-Conducts dual-status evaluation on every transferred Revit element:
-- **BIM STATUS (`PASS` | `FAIL`):**
-  - Valid Revit Category, Subcategory, and Material assigned.
-  - Geometry integrity: non-empty `element.get_Geometry(Options)` with valid faces/solids/meshes.
-- **GRAPHICS STATUS (`PASS` | `REVIEW`):**
-  - Visibility tested across 4 documentation views: **Plan, Section, Elevation, 3D** using `element.get_BoundingBox(view)` and `not element.IsHidden(view)`.
-  - Flags DirectShapes in Plan and Section views with `WARNING` due to cut representation and tagging limitations.
-- **Interactive UI Isolation:** Clicking `"Select / Isolate in Revit"` instantly highlights and isolates elements in the active Revit view.
-
-### Stage 6: SYNC (`sync_engine.py`)
-Uses Revit `ExtensibleStorage` (`Schema GUID: 7B89A3E4-4321-4F29-9EBA-D0F568C8B123`) to store tamper-proof identity tags on every transferred element:
-- `R2R_SourceDocName`, `R2R_RhinoGUID`, `R2R_LayerPath`, `R2R_GeoHash`, `R2R_MappingVersion`, `R2R_Timestamp`, `R2R_Strategy`.
-
-**On Subsequent Re-runs:**
-- `rhino_guid` not in Revit $\rightarrow$ **`CREATE`**
-- `rhino_guid` in Revit and `geo_hash` matches $\rightarrow$ **`SKIP_UNCHANGED`** (zero execution overhead)
-- `rhino_guid` in Revit and `geo_hash` differs $\rightarrow$ **`UPDATE_MODIFIED`** (in-place update or recreate with identity preservation)
-- Revit element has transfer tag missing from Rhino $\rightarrow$ **`FLAG_MISSING`** (flagged in review; never auto-deleted without explicit user confirmation).
+### Stage 5 & 6: VALIDATE & SYNC (`graphics_validator.py` & `sync_engine.py`)
+- **Dual-Status Validation:** Checks `BIM STATUS` (Category, Material, non-empty Geometry) and `GRAPHICS STATUS` across **Plan, Section, Elevation, and 3D** views.
+- **Persistent Revision Sync:** Stores `ExtensibleStorage` tags (`R2R_RhinoGUID`, `R2R_GeoHash`, `R2R_LayerPath`, `R2R_Strategy`) to classify re-runs into `CREATE`, `SKIP_UNCHANGED`, `UPDATE_MODIFIED`, or `FLAG_MISSING`.
 
 ---
 
 ## 3. Installation & Setup
 
-### Method 1: 1-Click C# Revit Add-in Installer (Recommended)
-This method installs the native compiled Revit add-in, adding a dedicated **"R2R Transfer"** tab and **"One-Click Transfer"** push button directly to your Revit ribbon.
+### Method 1: pyRevit Extension Push-Button (Recommended)
+Works across Revit 2020–2026 (including `.NET 8` in Revit 2025/2026) with zero compilation:
+1. Close Revit or prepare to reload pyRevit.
+2. Double-click **`installer/install_pyrevit.bat`** — it deploys all `.py` modules, `.xaml` UI layouts, `templates/`, and `Transfer_Profile.json` into `%APPDATA%\pyRevit\Extensions\R2R.extension\`.
+3. In Revit, start **Rhino.Inside** from the `Rhino.Inside` ribbon tab.
+4. Switch to the **R2R** tab and click **One-Click Transfer** to launch the dashboard.
 
-1. **Close Revit** if currently open.
-2. Navigate to the `installer/` directory and run **`install.bat`** (or right-click and run with PowerShell `install.ps1`).
-3. The installer automatically:
-   - Deploys to Autodesk Revit versions 2024, 2025, 2026, and 2027 (automatically matching .NET Framework 4.8 for Revit 2024 and modern .NET 8.0 for Revit 2025, 2026, and 2027).
-   - Copies and registers `RhinoToRevitTransfer.addin` into `%APPDATA%\Autodesk\Revit\Addins\<Year>\`.
-   - Automatically unblocks all assemblies to prevent Windows Mark-of-the-Web security blocks (0x80131515).
-4. Open **Autodesk Revit**.
-5. Start **Rhino.Inside** from the `Rhino.Inside` ribbon tab.
-6. Click the new **R2R Transfer** ribbon tab and click **One-Click Transfer** to open the dashboard!
+> **To Uninstall:** Run `installer/uninstall_pyrevit.bat`.
 
-> **To Uninstall:** Simply double-click `installer/uninstall.bat` at any time to cleanly remove the add-in and manifest from all Revit versions.
-
----
-
-### Method 2: Python / Rhino.Inside.Revit Script Editor (Zero-Compilation)
-If you prefer running the Python 3 / IronPython version directly without compiling C#:
-1. Open your Revit project and start Rhino from the **Rhino.Inside** ribbon tab.
-2. In Rhino, open your architectural model.
-3. Open the Rhino Python Script Editor (`EditPythonScript` or `ScriptEditor` in Rhino 8).
-4. Run:
+### Method 2: Rhino Python Script Editor
+1. Open Revit and start **Rhino.Inside**.
+2. Open your `.3dm` model in Rhino and run in `EditPythonScript` / `ScriptEditor`:
    ```python
    import main_launcher as launcher
    launcher.launch_transfer()
    ```
 
----
-
-### Method 3: pyRevit Extension Push-Button (1-Click Automated Setup)
-To install the tool as a permanent button on your Revit ribbon via pyRevit:
-1. Double-click `installer/install_pyrevit.bat` to automatically register the `R2R` tab and `One-Click Transfer` pushbutton.
-2. In Revit, click the **Rhino.Inside** tab to launch Rhino.
-3. Switch to the **R2R** tab and click **One-Click Transfer** to launch the dashboard!
-
-*(Manual alternative)*:
-Create `R2R.extension/R2R.tab/Transfer.panel/OneClick.pushbutton/script.py` in `%APPDATA%\pyRevit\Extensions\` and import `main_launcher`.
+### Method 3: Native C# Revit Add-in (Optional)
+Run `installer/install.bat` (or build `csharp/RhinoToRevitTransfer.csproj` via `dotnet build -c Release`).
 
 ---
 
-### Developer Setup: Compiling the C# Solution from Source
-To compile custom modifications to the C# codebase in `csharp/`:
-1. Ensure you have the **.NET SDK** (.NET 8.0 or .NET Framework 4.8) installed.
-2. Open terminal in the `csharp/` folder:
-   ```shell
-   dotnet build RhinoToRevitTransfer.csproj -c Release
-   ```
-3. Run `installer/install.bat` to deploy your newly compiled binary to Revit.
+## 4. Running Tests
 
----
-
-## 4. QA Reporting (`reporting.py`)
-Clicking `"Export QA Report (HTML)"` in the dialog exports a modern, responsive HTML report containing:
-- Executive summary KPI cards (Total Scanned, Created, Updated, Skipped, Review Queue).
-- Built-Up Area (BUA) and Gross Floor Area (GFA) area comparison table with discrepancy percentages.
-- Complete Dual-Status and 4-View Matrix verification audit table.
-- CSV export for integration with PowerBI, BIM Track, or project audits.
+Run the automated test suite (requires Python 3; uses mocked Revit/Rhino APIs):
+```shell
+python test_pipeline.py
+```
+Covers 60 unit tests across scanning, primitive detection, trilingual classification, `StrategyRuleEngine`, mixed-layer splitting, deterministic custom parameters, WPF XAML `FindName` bindings, installer completeness, family geometry accuracy, `RoofNative` / `WallByCurve` / `WallByProfile` / `CurveLoop` builders, and `DirectShape` tessellation.
